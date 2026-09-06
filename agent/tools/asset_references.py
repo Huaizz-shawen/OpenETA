@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from io import BytesIO
@@ -178,6 +178,10 @@ def build_asset_reference_handler(
         environment = str(context.parameters.get("environment") or "").strip()
         target_object = str(context.parameters.get("target_object") or "").strip()
         scene_image = str(context.parameters.get("scene_image") or "").strip()
+        source_observation = context.parameters.get("_source_observation")
+        source_observation = (
+            dict(source_observation) if isinstance(source_observation, Mapping) else {}
+        )
         if not environment or not target_object or not scene_image:
             return make_tool_result(
                 context,
@@ -283,6 +287,10 @@ def build_object_memory_reference_handler(
         environment = str(context.parameters.get("environment") or "").strip()
         target_object = str(context.parameters.get("target_object") or "").strip()
         scene_image = str(context.parameters.get("scene_image") or "").strip()
+        source_observation = context.parameters.get("_source_observation")
+        source_observation = (
+            dict(source_observation) if isinstance(source_observation, Mapping) else {}
+        )
         if not environment or not target_object or not scene_image:
             return make_tool_result(
                 context,
@@ -316,6 +324,70 @@ def build_object_memory_reference_handler(
                     target_object=target_object,
                 )
             )
+        except ObjectMemoryResolutionError as exc:
+            candidates = [candidate.to_dict() for candidate in exc.candidates]
+            return make_tool_result(
+                context,
+                success=False,
+                content=f"Object memory asset resolution failed: {exc}",
+                outputs={
+                    "reason": "object_memory_resolution_failed",
+                    "resolution_code": exc.code,
+                    "search_candidates": candidates,
+                },
+                diagnostics=[
+                    {
+                        "code": "object_memory_resolution_failed",
+                        "resolution_code": exc.code,
+                        "message": str(exc),
+                        "search_candidates": candidates,
+                    }
+                ],
+            )
+        except Exception as exc:  # noqa: BLE001 - service failures stay structured.
+            endpoint = str(getattr(getattr(client, "config", None), "base_url", ""))
+            return make_tool_result(
+                context,
+                success=False,
+                content=(
+                    f"Object memory retrieval failed from {endpoint or 'the configured endpoint'}: "
+                    f"{type(exc).__name__}: {exc}. This is a service/route failure, not "
+                    "evidence that the target object is absent."
+                ),
+                outputs={
+                    "reason": "object_memory_retrieval_failed",
+                    "endpoint": endpoint or None,
+                    "failure_scope": "object_memory_service_or_network",
+                },
+                diagnostics=[
+                    {
+                        "code": "object_memory_retrieval_failed",
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                        "endpoint": endpoint or None,
+                        "failure_scope": "object_memory_service_or_network",
+                    }
+                ],
+                semantic_outcome="reference_service_unavailable",
+                recovery_options=[
+                    {
+                        "action": "continue_with_current_visual_evidence",
+                        "reason": (
+                            "object-memory transport failure does not invalidate current "
+                            "scene observations or other perception tools"
+                        ),
+                    },
+                    {
+                        "action": "inspect_object_memory_preflight",
+                        "reason": (
+                            "verify the reported endpoint and worker-network health before "
+                            "retrying the same request"
+                        ),
+                    },
+                ],
+            )
+
+        try:
             session_root = artifact_session_root(
                 resolved_root,
                 artifact_session_id(context.metadata),
@@ -342,35 +414,15 @@ def build_object_memory_reference_handler(
                 output_path=run_dir / "scene_target_point.png",
                 point=(localized.x, localized.y),
             )
-        except ObjectMemoryResolutionError as exc:
-            candidates = [candidate.to_dict() for candidate in exc.candidates]
-            return make_tool_result(
-                context,
-                success=False,
-                content=f"Object memory asset resolution failed: {exc}",
-                outputs={
-                    "reason": "object_memory_resolution_failed",
-                    "resolution_code": exc.code,
-                    "search_candidates": candidates,
-                },
-                diagnostics=[
-                    {
-                        "code": "object_memory_resolution_failed",
-                        "resolution_code": exc.code,
-                        "message": str(exc),
-                        "search_candidates": candidates,
-                    }
-                ],
-            )
         except Exception as exc:  # noqa: BLE001 - network/VLM failures stay structured.
             return make_tool_result(
                 context,
                 success=False,
-                content=f"Object memory localization failed: {exc}",
-                outputs={"reason": "object_memory_localization_failed"},
+                content=f"Reference localization failed: {exc}",
+                outputs={"reason": "reference_localization_failed"},
                 diagnostics=[
                     {
-                        "code": "object_memory_localization_failed",
+                        "code": "reference_localization_failed",
                         "error_type": type(exc).__name__,
                         "message": str(exc),
                     }
@@ -390,8 +442,14 @@ def build_object_memory_reference_handler(
             if localized.bbox_xyxy is not None
             else None
         )
+        localizer_details = dict(localized.details or {})
+        ranked_candidates = localizer_details.get("ranked_candidates")
+        if not isinstance(ranked_candidates, list):
+            ranked_candidates = []
         localization_bundle = {
             "scene_image_ref": scene_image,
+            "source_packet_id": source_observation.get("packet_id"),
+            "camera_frame_id": source_observation.get("frame_id"),
             "reference_image_refs": references,
             "marked_scene_image_ref": str(marker_path),
             "environment": bundle.namespace,
@@ -401,6 +459,11 @@ def build_object_memory_reference_handler(
             "memory_resolution": resolution,
             "positive_points": positive_points,
             "bbox_xyxy": bbox_xyxy,
+            "candidate_policy": localizer_details.get("candidate_policy"),
+            "ranked_candidates": ranked_candidates,
+            "requires_downstream_confirmation": bool(
+                localizer_details.get("requires_downstream_confirmation")
+            ),
             "point_coordinate_space": "original_image_pixels_top_left_xy",
             "required_sam3_parameter": "positive_points",
         }
@@ -443,6 +506,8 @@ def build_object_memory_reference_handler(
                 "resolved_asset_key": resolved_asset_key,
                 "memory_resolution": resolution,
                 "scene_image": scene_image,
+                "source_packet_id": source_observation.get("packet_id"),
+                "source_observation": source_observation or None,
                 "reference_images": references,
                 "marked_scene_image": str(marker_path),
                 "positive_points": positive_points,
@@ -453,7 +518,7 @@ def build_object_memory_reference_handler(
                     "model": localized.model,
                     "confidence": localized.confidence,
                     "reason": localized.reason,
-                    **dict(localized.details or {}),
+                    **localizer_details,
                 },
             },
             artifacts=artifacts,
@@ -497,6 +562,7 @@ def build_object_memory_configuration_warning_handler(
                 "warning": warning,
             },
             diagnostics=[warning],
+            semantic_outcome="reference_service_unavailable",
         )
 
     return handler

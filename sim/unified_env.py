@@ -727,6 +727,13 @@ class UnifiedEnv(gym.Env):
         jv = raw.get("robot_joint_velocities")
         if jv is not None:
             proprio["joint_velocities"] = self._np(jv)
+        # Names stay a list of str, not self._np: they label joint_positions
+        # positionally and a consumer that must select a subset by name (the
+        # collision checker, on a robot whose arms are interleaved) cannot
+        # recover them from the numeric vector.
+        jn = raw.get("robot_joint_names")
+        if jn:
+            proprio["joint_names"] = [str(n) for n in jn]
         ee = raw.get("end_effector_pose")
         if ee and isinstance(ee, dict):
             xyz = ee.get("xyz")
@@ -1002,17 +1009,139 @@ class UnifiedEnv(gym.Env):
                     qpos_addr = model.jnt_qposadr[jnt_id]
                     pos = qpos[qpos_addr:qpos_addr + 3].tolist()
                     quat = qpos[qpos_addr + 3:qpos_addr + 7].tolist()
+                    bounds = self._mujoco_object_world_bounds(model, data, body_id)
                 except Exception:
-                    pos, quat = None, None
-                objects.append({
+                    pos, quat, bounds = None, None, {}
+                object_state = {
                     "name": getattr(obj, "name", root_body),
                     "category": getattr(obj, "category_name", ""),
                     "position": pos,
                     "orientation": quat,
-                })
+                }
+                object_state.update(bounds)
+                objects.append(object_state)
             return objects
         except Exception:
             return []
+
+    @staticmethod
+    def _mujoco_object_world_bounds(model: Any, data: Any, root_body_id: int) -> dict[str, Any]:
+        """Return a collision-geometry world AABB for one MuJoCo object subtree.
+
+        ``geom_rbound`` is a bounding-sphere radius.  Applying it independently
+        on x/y/z turns a tall thin mesh into a large cube, which is safe but too
+        pessimistic for carried-object routing.  Use live geom transforms and
+        shape-aware extents instead; mesh vertices are already compiler-scaled
+        and centred in MuJoCo's geom frame.
+        """
+
+        body_parent = np.asarray(model.body_parentid).reshape(-1)
+
+        def belongs_to_root(body_id: int) -> bool:
+            current = int(body_id)
+            while current > 0 and current != root_body_id:
+                current = int(body_parent[current])
+            return current == root_body_id
+
+        geom_body = np.asarray(model.geom_bodyid).reshape(-1)
+        subtree_geoms = [
+            geom_id
+            for geom_id, body_id in enumerate(geom_body)
+            if belongs_to_root(int(body_id))
+        ]
+        geom_contype = np.asarray(
+            getattr(model, "geom_contype", np.ones(len(geom_body)))
+        ).reshape(-1)
+        geom_conaffinity = np.asarray(
+            getattr(model, "geom_conaffinity", np.ones(len(geom_body)))
+        ).reshape(-1)
+        collision_geoms = [
+            geom_id
+            for geom_id in subtree_geoms
+            if int(geom_contype[geom_id]) != 0
+            or int(geom_conaffinity[geom_id]) != 0
+        ]
+        # Some imported assets expose only visual geoms.  Preserve a bounded
+        # fallback rather than dropping their geometry entirely.
+        selected_geoms = collision_geoms or subtree_geoms
+
+        minimum = np.full(3, np.inf, dtype=np.float64)
+        maximum = np.full(3, -np.inf, dtype=np.float64)
+        found = False
+        for geom_id in selected_geoms:
+            bounds = UnifiedEnv._mujoco_geom_world_aabb(model, data, geom_id)
+            if bounds is None:
+                continue
+            geom_minimum, geom_maximum = bounds
+            minimum = np.minimum(minimum, geom_minimum)
+            maximum = np.maximum(maximum, geom_maximum)
+            found = True
+        if not found:
+            return {}
+        return {
+            "aabb_min": minimum.tolist(),
+            "aabb_max": maximum.tolist(),
+            "dims": (maximum - minimum).tolist(),
+        }
+
+    @staticmethod
+    def _mujoco_geom_world_aabb(
+        model: Any,
+        data: Any,
+        geom_id: int,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Compute a shape-aware world AABB for one compiled MuJoCo geom."""
+
+        center = np.asarray(data.geom_xpos[geom_id], dtype=np.float64).reshape(-1)[:3]
+        rotation = np.asarray(
+            data.geom_xmat[geom_id],
+            dtype=np.float64,
+        ).reshape(3, 3)
+        geom_type = int(np.asarray(model.geom_type).reshape(-1)[geom_id])
+        size = np.asarray(model.geom_size[geom_id], dtype=np.float64).reshape(-1)[:3]
+
+        # Stable MuJoCo mjtGeom enum values: sphere=2, capsule=3,
+        # ellipsoid=4, cylinder=5, box=6, mesh=7.
+        if geom_type == 2:
+            extent = np.full(3, float(size[0]), dtype=np.float64)
+        elif geom_type == 3:
+            radius = float(size[0])
+            half_length = float(size[1])
+            extent = radius + np.abs(rotation[:, 2]) * half_length
+        elif geom_type == 4:
+            extent = np.sqrt(np.square(rotation * size).sum(axis=1))
+        elif geom_type == 5:
+            radius = float(size[0])
+            half_length = float(size[1])
+            radial = radius * np.sqrt(
+                np.square(rotation[:, 0]) + np.square(rotation[:, 1])
+            )
+            extent = radial + np.abs(rotation[:, 2]) * half_length
+        elif geom_type == 6:
+            extent = np.abs(rotation) @ size
+        elif geom_type == 7:
+            data_id = int(np.asarray(model.geom_dataid).reshape(-1)[geom_id])
+            if data_id < 0:
+                return None
+            vertex_start = int(np.asarray(model.mesh_vertadr).reshape(-1)[data_id])
+            vertex_count = int(np.asarray(model.mesh_vertnum).reshape(-1)[data_id])
+            vertices = np.asarray(
+                model.mesh_vert[vertex_start : vertex_start + vertex_count],
+                dtype=np.float64,
+            )
+            if vertices.size == 0:
+                return None
+            world_vertices = vertices @ rotation.T + center
+            return world_vertices.min(axis=0), world_vertices.max(axis=0)
+        else:
+            radius = float(np.asarray(model.geom_rbound).reshape(-1)[geom_id])
+            if not np.isfinite(radius) or radius <= 0:
+                return None
+            extent = np.full(3, radius, dtype=np.float64)
+
+        if not np.all(np.isfinite(extent)) or np.any(extent < 0):
+            return None
+        return center - extent, center + extent
 
     def _normalise_metaworld(self, raw: dict) -> dict:
         """MetaWorld direct env returns numpy state array, not a dict."""

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import http.client
 import json
 import mimetypes
 import threading
@@ -16,8 +18,24 @@ from typing import Callable
 
 from adapter.protocol import JsonDict
 from agent.runtime.actions import PipelineStatus
-from agent.backends.provider_config import PlannerProviderConfig, ProviderEndpointConfig
+from agent.backends.provider_config import (
+    DEFAULT_PLANNER_PROVIDER_TIMEOUT_S,
+    PlannerProviderConfig,
+    ProviderEndpointConfig,
+)
 from agent.runtime.token_counting import estimate_json_tokens, estimate_text_tokens
+
+
+PLANNER_STATIC_CONTEXT_SCHEMA_VERSION = "openeta.planner_static_context.v1"
+_MAIN_AGENT_CONTEXT_SCHEMA_VERSION = "openeta.agent_context.v2"
+_CACHE_STABLE_AGENT_CONTEXT_KEYS = (
+    "available_tools_schema_version",
+    "available_tools",
+    "tool_references",
+    "relevant_skills",
+    "skill_usage",
+    "task_playbook",
+)
 
 
 @dataclass(slots=True)
@@ -299,6 +317,22 @@ class CommercialApiPlannerBackend(PlannerBackend):
 OpenAICompatibleTransport = Callable[[str, JsonDict, dict[str, str], float], JsonDict]
 
 
+# OpenAI-compatible reasoning models may spend this budget on hidden reasoning
+# before emitting the small JSON object requested by an isolated reviewer.
+# Live DeepSeek V4 attachment-review evidence exhausted the former 2k cap and
+# surfaced as an invalid verdict; 4k succeeded on the identical four images.
+# Keep additional variance headroom because the limit is only a ceiling and
+# normal short reviewer responses still stop early.
+REASONING_SUBAGENT_MAX_OUTPUT_TOKENS = 8192
+
+# Capacity failures usually outlive the ordinary sub-second retry interval. A
+# provider that reports overload/concurrency exhaustion needs a real cooldown;
+# otherwise all configured attempts are consumed while the same hot backend is
+# still rejecting work. Keep ordinary network/protocol retries responsive and
+# apply this floor only to errors explicitly classified as capacity-related.
+PROVIDER_CAPACITY_MIN_RETRY_BACKOFF_S = 15.0
+
+
 @dataclass(slots=True)
 class OpenAICompatiblePlannerBackendConfig:
     """Config for an OpenAI-compatible `/v1/chat/completions` planner backend."""
@@ -307,13 +341,24 @@ class OpenAICompatiblePlannerBackendConfig:
     model: str = ""
     api_base: str = ""
     api_key: str = ""
-    timeout_s: float = 60.0
+    timeout_s: float = DEFAULT_PLANNER_PROVIDER_TIMEOUT_S
     max_attempts: int = 3
     retry_backoff_s: float = 0.5
     temperature: float = 0.0
-    max_tokens: int = 512
+    # Isolated model clients usually return short JSON, but reasoning-capable
+    # providers may count hidden reasoning against this same completion budget.
+    max_tokens: int = REASONING_SUBAGENT_MAX_OUTPUT_TOKENS
     context_window_tokens: int | None = None
+    # Structured JSON mode remains useful for isolated reviewers, which keep
+    # their existing JSON contracts. The main embodied planner uses XML.
     use_json_response_format: bool = True
+    # Optional Qwen-style provider switch. None omits the provider-specific
+    # field; isolated roles such as VDM may explicitly disable hidden thinking.
+    enable_thinking: bool | None = None
+    # Some chat templates permit only one leading system message. Collapsing
+    # retains the exact system -> stable context -> summary byte order, so the
+    # cache-stable prefix stays before all growing conversation history.
+    collapse_leading_system_messages: bool = True
     enable_vision: bool = True
     max_vision_images: int = 2
     max_vision_image_bytes: int = 8 * 1024 * 1024
@@ -334,6 +379,12 @@ class OpenAICompatiblePlannerBackendConfig:
             max_attempts=config.max_attempts,
             retry_backoff_s=config.retry_backoff_s,
             context_window_tokens=config.context_window_tokens,
+            enable_thinking=_metadata_optional_bool(metadata, "enable_thinking"),
+            collapse_leading_system_messages=_metadata_bool(
+                metadata,
+                "collapse_leading_system_messages",
+                default=True,
+            ),
             enable_vision=_metadata_bool(metadata, "enable_vision", default=True),
             max_vision_images=_metadata_positive_int(
                 metadata,
@@ -374,6 +425,8 @@ class OpenAICompatiblePlannerBackendConfig:
             "max_tokens": self.max_tokens,
             "context_window_tokens": self.context_window_tokens,
             "use_json_response_format": self.use_json_response_format,
+            "enable_thinking": self.enable_thinking,
+            "collapse_leading_system_messages": self.collapse_leading_system_messages,
             "enable_vision": self.enable_vision,
             "max_vision_images": self.max_vision_images,
             "max_vision_image_bytes": self.max_vision_image_bytes,
@@ -425,20 +478,43 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
                 details={"missing_fields": missing},
             )
 
-        user_content, vision_attachments = _planner_user_content(request, self.config)
-        messages: list[JsonDict] = [
-            {"role": "system", "content": request.system_prompt},
-        ]
+        stable_context, dynamic_context = _partition_planner_tool_context(request)
+        prompt_dynamic_context = (
+            _planner_visible_main_agent_context(dynamic_context)
+            if request.tool_context.get("schema_version")
+            == _MAIN_AGENT_CONTEXT_SCHEMA_VERSION
+            else dynamic_context
+        )
+        stable_context_prompt = (
+            _stable_planner_context_prompt(stable_context) if stable_context else ""
+        )
+        prompt_layout = _planner_prompt_layout_summary(
+            stable_context=stable_context,
+            stable_context_prompt=stable_context_prompt,
+            dynamic_context=prompt_dynamic_context,
+        )
+        user_content, vision_attachments = _planner_user_content(
+            request,
+            self.config,
+            prompt_tool_context=prompt_dynamic_context,
+        )
+        system_segments: list[str] = [request.system_prompt]
+        if stable_context_prompt:
+            system_segments.append(stable_context_prompt)
         if request.conversation_summary.strip():
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Earlier OpenETA execution summary from the current session:\n"
-                        + request.conversation_summary.strip()
-                    ),
-                }
+            system_segments.append(
+                "Earlier OpenETA execution summary from the current session:\n"
+                + request.conversation_summary.strip()
             )
+        if self.config.collapse_leading_system_messages:
+            messages: list[JsonDict] = [
+                {"role": "system", "content": "\n\n".join(system_segments)}
+            ]
+        else:
+            messages = [
+                {"role": "system", "content": segment}
+                for segment in system_segments
+            ]
         messages.extend(_validated_conversation_messages(request.conversation_messages))
         messages.append({"role": "user", "content": user_content})
         body: JsonDict = {
@@ -447,8 +523,13 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
         }
-        if self.config.use_json_response_format:
+        isolated_role = request.metadata.get("isolated_context") is True
+        if self.config.use_json_response_format and isolated_role:
             body["response_format"] = {"type": "json_object"}
+        if self.config.enable_thinking is not None:
+            body["chat_template_kwargs"] = {
+                "enable_thinking": self.config.enable_thinking
+            }
 
         (
             response,
@@ -465,6 +546,8 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
             bool(error.get("switch_provider_next")) for error in retry_errors
         )
         if final_error is not None:
+            provider_error_code = _provider_failure_code(final_error)
+            provider_error_retryable = _is_transient_provider_error(final_error)
             return PlannerBackendResult(
                 payload={
                     "kind": "response",
@@ -473,6 +556,8 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
                         "message": "Planner provider request failed.",
                         "error_type": type(final_error).__name__,
                         "provider_attempts": provider_attempts,
+                        "provider_error_code": provider_error_code,
+                        "retryable": provider_error_retryable,
                     },
                     "reasoning": f"Planner provider request failed: {final_error}",
                 },
@@ -483,10 +568,13 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
                     "error_type": type(final_error).__name__,
                     "error": str(final_error),
                     "provider_attempts": provider_attempts,
+                    "provider_error_code": provider_error_code,
+                    "retryable": provider_error_retryable,
                     "retry_errors": retry_errors,
                     "provider_role": provider_role,
                     "provider_failover": provider_switch_count > 0,
                     "provider_switch_count": provider_switch_count,
+                    "prompt_layout": prompt_layout,
                 },
                 rollout_exchange={"attempts": provider_exchanges},
             )
@@ -518,6 +606,7 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
                 "provider_role": provider_role,
                 "provider_failover": provider_switch_count > 0,
                 "provider_switch_count": provider_switch_count,
+                "prompt_layout": prompt_layout,
             },
             rollout_exchange={"attempts": provider_exchanges},
         )
@@ -550,7 +639,9 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
         else:
             active_endpoint = primary_endpoint
             provider_role = "primary"
+        attempted_provider_roles: set[str] = set()
         for attempt in range(1, max_attempts + 1):
+            attempted_provider_roles.add(provider_role)
             url = _chat_completions_url(active_endpoint.api_base)
             attempt_body = dict(body)
             attempt_body["model"] = active_endpoint.model
@@ -566,6 +657,11 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
                     headers,
                     active_endpoint.timeout_s,
                 )
+                # A syntactically successful HTTP response can still be unusable
+                # provider output. Validate it inside the retry/failover boundary
+                # so an empty or malformed chat message does not abort the whole
+                # episode before the configured fallback attempts are consumed.
+                _extract_chat_content(response)
                 completed_at_s = time.time()
                 provider_exchanges.append(
                     {
@@ -594,12 +690,23 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
                 )
             except Exception as exc:  # noqa: BLE001 - provider failures stay structured.
                 completed_at_s = time.time()
-                switch_provider_next = (
-                    self.config.fallback is not None and _is_provider_failover_error(exc)
+                protocol_details = (
+                    dict(exc.details) if isinstance(exc, ProviderProtocolError) else None
                 )
                 next_provider_role = None
-                if switch_provider_next:
-                    next_provider_role = "fallback" if provider_role == "primary" else "primary"
+                if self.config.fallback is not None and _is_provider_failover_error(exc):
+                    alternate_role = (
+                        "fallback" if provider_role == "primary" else "primary"
+                    )
+                    # Authentication/access/quota failures are persistent for one
+                    # endpoint configuration. Try the alternate endpoint once, but
+                    # do not cycle back to an endpoint that already returned the
+                    # same class of account failure.
+                    if not _is_provider_account_error(exc) or (
+                        alternate_role not in attempted_provider_roles
+                    ):
+                        next_provider_role = alternate_role
+                switch_provider_next = next_provider_role is not None
                 retryable = _is_transient_provider_error(exc) or switch_provider_next
                 provider_exchanges.append(
                     {
@@ -616,6 +723,11 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
                         "error": {
                             "type": type(exc).__name__,
                             "message": str(exc),
+                            **(
+                                {"provider_response": protocol_details}
+                                if protocol_details is not None
+                                else {}
+                            ),
                         },
                     }
                 )
@@ -629,7 +741,11 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
                         provider_role,
                         provider_exchanges,
                     )
-                delay_s = max(0.0, self.config.retry_backoff_s) * (2 ** (attempt - 1))
+                delay_s = _provider_retry_delay_s(
+                    exc,
+                    configured_backoff_s=self.config.retry_backoff_s,
+                    attempt=attempt,
+                )
                 retry_errors.append(
                     {
                         "attempt": attempt,
@@ -638,6 +754,11 @@ class OpenAICompatiblePlannerBackend(PlannerBackend):
                         "model": active_endpoint.model,
                         "error_type": type(exc).__name__,
                         "error": str(exc),
+                        **(
+                            {"provider_response": protocol_details}
+                            if protocol_details is not None
+                            else {}
+                        ),
                         "retry_delay_s": delay_s,
                         "failover_next": next_provider_role == "fallback",
                         "switch_provider_next": switch_provider_next,
@@ -757,30 +878,215 @@ def extract_context_window_tokens(model_payload: JsonDict) -> int | None:
     return None
 
 
-def _planner_user_prompt(request: PlannerBackendRequest) -> str:
-    instruction = (
-        "Follow the system prompt for this isolated role. Return only the exact "
-        "JSON object requested by that prompt, without markdown."
-        if request.metadata.get("isolated_context") is True
-        else (
-            "Choose exactly one next OpenETA action. Return only JSON with "
-            "fields: kind, name, parameters, reasoning. Do not include markdown."
+def _planner_user_prompt(
+    request: PlannerBackendRequest,
+    *,
+    tool_context: JsonDict | None = None,
+) -> str:
+    isolated = request.metadata.get("isolated_context") is True
+    if request.validation_errors:
+        instruction = (
+            f"Your previous candidate action from attempt {max(1, request.attempt - 1)} "
+            "was rejected by the host validator. The requested first attempt is now "
+            "complete. Return a corrected candidate for the current attempt and do not "
+            "repeat the same rejected kind/name/parameters. Repair every item in "
+            "validation_errors using exact values already present in tool_context; do "
+            "not invent references. Return only the exact JSON object requested by the "
+            "system prompt, without markdown."
+            if isolated
+            else (
+                f"Your previous OpenETA action from attempt "
+                f"{max(1, request.attempt - 1)} was rejected by the host validator. "
+                "The requested first attempt is now complete. Return a corrected next "
+                "action for the current attempt and do not repeat the same rejected "
+                "kind/name/parameters. Repair every item in validation_errors using "
+                "exact values already present in tool_context; do not invent references. "
+                "Return only one XML <decision> element with child elements kind, "
+                "name, parameters, and reasoning. Use plain true/false/null for "
+                "typed scalars and encode arrays as a container with type=\"array\" "
+                "and <item> children. Wrap code, multi-line text, or text containing "
+                "XML punctuation in CDATA. Do not include markdown."
+            )
         )
-    )
+    else:
+        instruction = (
+            "Follow the system prompt for this isolated role. Return only the exact "
+            "JSON object requested by that prompt, without markdown."
+            if isolated
+            else (
+                "Choose exactly one next OpenETA action. Return only one XML <decision> "
+                "element with child elements kind, name, parameters, and reasoning. "
+                "Use plain true/false/null for typed scalars and encode arrays as a "
+                "container with type=\"array\" and <item> children. Wrap code, "
+                "multi-line text, or text containing XML punctuation in CDATA. Do not "
+                "include markdown."
+            )
+        )
     payload = {
         "instruction": instruction,
-        "tool_context": request.tool_context,
+        "tool_context": request.tool_context if tool_context is None else tool_context,
         "attempt": request.attempt,
         "validation_errors": request.validation_errors,
+        "validation_feedback": (
+            {
+                "status": "previous_attempt_rejected",
+                "rejected_attempt": max(1, request.attempt - 1),
+                "must_change_rejected_action": True,
+                "errors": list(request.validation_errors),
+            }
+            if request.validation_errors
+            else {"status": "none"}
+        ),
     }
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _partition_planner_tool_context(
+    request: PlannerBackendRequest,
+) -> tuple[JsonDict, JsonDict]:
+    """Move cache-stable main-agent references ahead of growing chat history.
+
+    The canonical request retains the complete ``tool_context`` for recorders and
+    deterministic backends.  This partition only changes the OpenAI-compatible
+    wire layout.  Isolated sub-agents and non-main context schemas keep their
+    existing single-user-message representation.
+    """
+
+    context = request.tool_context
+    if (
+        request.metadata.get("isolated_context") is True
+        or context.get("schema_version") != _MAIN_AGENT_CONTEXT_SCHEMA_VERSION
+    ):
+        return {}, dict(context)
+
+    dynamic = dict(context)
+    stable: JsonDict = {
+        "schema_version": PLANNER_STATIC_CONTEXT_SCHEMA_VERSION,
+        "agent_context_schema_version": dynamic.pop("schema_version"),
+    }
+    for key in _CACHE_STABLE_AGENT_CONTEXT_KEYS:
+        if key in dynamic:
+            stable[key] = dynamic.pop(key)
+
+    constraints = dynamic.get("operational_constraints")
+    if isinstance(constraints, dict) and "rules" in constraints:
+        stable["operational_constraints"] = {"rules": constraints.get("rules")}
+        dynamic_constraints = {
+            key: value for key, value in constraints.items() if key != "rules"
+        }
+        if dynamic_constraints:
+            dynamic["operational_constraints"] = dynamic_constraints
+        else:
+            dynamic.pop("operational_constraints", None)
+    return stable, dynamic
+
+
+def _stable_planner_context_prompt(stable_context: JsonDict) -> str:
+    """Serialize the stable planner prefix deterministically for radix caching."""
+
+    payload = json.dumps(
+        stable_context,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        "Stable OpenETA contracts and guidance for this session. Tool contracts "
+        "own interfaces, skills own reusable domain advice, and any task playbook "
+        "is an exact-scope prior. "
+        "The final user message supplies the current turn state.\n" + payload
+    )
+
+
+def _planner_visible_main_agent_context(dynamic_context: JsonDict) -> JsonDict:
+    """Hide transport-local visual paths from the main Agent's text prompt.
+
+    The backend still reads the canonical request to attach image bytes.  The
+    Agent reasons with packet/frame identities and short host-resolved bundles,
+    so filesystem paths cannot become accidental tool arguments.
+    """
+
+    visible = dict(dynamic_context)
+    visible.pop("vision_image_paths", None)
+    for key in (
+        "vision_evidence",
+        "visual_history",
+        "current_observation",
+        "decision_state",
+        "pending_target_selection",
+        "selected_sam3_detection",
+        "selected_sam3_detections",
+        "pending_reference_localization",
+    ):
+        if key in visible:
+            visible[key] = _strip_visual_transport_paths(visible[key])
+    return visible
+
+
+_VISUAL_TRANSPORT_PATH_KEYS = {
+    "path",
+    "rgb_path",
+    "depth_path",
+    "image_path",
+    "source_image",
+    "scene_image",
+    "original_image_ref",
+    "contact_sheet_ref",
+    "overlay_ref",
+    "crop_ref",
+    "mask_ref",
+    "marked_scene_image_ref",
+}
+
+
+def _strip_visual_transport_paths(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _strip_visual_transport_paths(item)
+            for key, item in value.items()
+            if key not in _VISUAL_TRANSPORT_PATH_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_visual_transport_paths(item) for item in value]
+    return value
+
+
+def _planner_prompt_layout_summary(
+    *,
+    stable_context: JsonDict,
+    stable_context_prompt: str,
+    dynamic_context: JsonDict,
+) -> JsonDict:
+    """Return compact cache-layout diagnostics without copying prompt content."""
+
+    dynamic_payload = json.dumps(
+        dynamic_context,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return {
+        "schema_version": "openeta.planner_prompt_layout.v1",
+        "cache_stable_prefix_enabled": bool(stable_context_prompt),
+        "static_before_conversation": bool(stable_context_prompt),
+        "stable_context_chars": len(stable_context_prompt),
+        "stable_context_sha256": (
+            hashlib.sha256(stable_context_prompt.encode("utf-8")).hexdigest()
+            if stable_context_prompt
+            else ""
+        ),
+        "stable_context_keys": list(stable_context),
+        "dynamic_context_chars": len(dynamic_payload),
+        "dynamic_context_keys": list(dynamic_context),
+    }
 
 
 def _planner_user_content(
     request: PlannerBackendRequest,
     config: OpenAICompatiblePlannerBackendConfig,
+    *,
+    prompt_tool_context: JsonDict | None = None,
 ) -> tuple[str | list[JsonDict], list[JsonDict]]:
-    text = _planner_user_prompt(request)
+    text = _planner_user_prompt(request, tool_context=prompt_tool_context)
     if not config.enable_vision:
         return text, []
     explicit_paths = request.tool_context.get("vision_image_paths")
@@ -789,7 +1095,7 @@ def _planner_user_content(
         if isinstance(explicit_paths, list)
         else []
     )
-    localization = request.tool_context.get("reference_localization_obligation")
+    localization = request.tool_context.get("pending_reference_localization")
     if isinstance(localization, dict):
         if localization.get("required_parameter") != "positive_points":
             scene_image = localization.get("scene_image")
@@ -803,7 +1109,7 @@ def _planner_user_content(
                     if len(paths) >= config.max_vision_images:
                         break
     else:
-        obligation = request.tool_context.get("selection_obligation")
+        obligation = request.tool_context.get("pending_target_selection")
         if isinstance(obligation, dict):
             bundle = obligation.get("selection_bundle")
             if not isinstance(bundle, dict):
@@ -830,18 +1136,25 @@ def _planner_user_content(
     if not paths:
         return text, []
 
-    content: list[JsonDict] = [{"type": "text", "text": text}]
+    content: list[JsonDict] = [
+        {
+            "type": "text",
+            "text": (
+                "Inspect the labelled visual evidence first. Current-scene images are "
+                "the latest observable state; historical images are context only."
+            ),
+        }
+    ]
     attachments: list[JsonDict] = []
-    evidence_roles: dict[str, str] = {}
+    evidence_by_path: dict[str, JsonDict] = {}
     raw_evidence = request.tool_context.get("vision_evidence")
     if isinstance(raw_evidence, list):
         for item in raw_evidence:
             if not isinstance(item, dict):
                 continue
             evidence_path = item.get("path")
-            evidence_role = item.get("role")
-            if isinstance(evidence_path, str) and isinstance(evidence_role, str):
-                evidence_roles[evidence_path] = evidence_role
+            if isinstance(evidence_path, str):
+                evidence_by_path[evidence_path] = item
     for image_index, path_value in enumerate(paths[: config.max_vision_images], start=1):
         path = Path(path_value)
         try:
@@ -890,9 +1203,23 @@ def _planner_user_content(
             )
             continue
         encoded = base64.b64encode(raw_image).decode("ascii")
-        evidence_role = evidence_roles.get(path_value)
+        evidence = evidence_by_path.get(path_value, {})
+        evidence_role = evidence.get("role")
         if evidence_role:
-            role_note = f"Image #{image_index} role: {evidence_role}."
+            qualifiers = []
+            for field in (
+                "evidence_id",
+                "frame_id",
+                "camera_role",
+                "freshness",
+                "observation_step",
+                "timestamp_s",
+            ):
+                value = evidence.get(field)
+                if value is not None and value != "":
+                    qualifiers.append(f"{field}={value}")
+            suffix = f" ({', '.join(qualifiers)})" if qualifiers else ""
+            role_note = f"Image #{image_index} role: {evidence_role}{suffix}."
             if evidence_role == "current_scene":
                 role_note += " This is the current state used for action review."
             elif evidence_role == "target_source_before_grasp":
@@ -916,7 +1243,8 @@ def _planner_user_content(
                 **({"role": evidence_role} if evidence_role else {}),
             }
         )
-    if len(content) == 1:
+    content.append({"type": "text", "text": text})
+    if not any(item.get("attached") is True for item in attachments):
         return text, attachments
     return content, attachments
 
@@ -953,6 +1281,11 @@ def _metadata_bool(metadata: JsonDict, key: str, *, default: bool) -> bool:
     return value if isinstance(value, bool) else default
 
 
+def _metadata_optional_bool(metadata: JsonDict, key: str) -> bool | None:
+    value = metadata.get(key)
+    return value if isinstance(value, bool) else None
+
+
 def _metadata_positive_int(metadata: JsonDict, key: str, *, default: int) -> int:
     parsed = _coerce_positive_int(metadata.get(key))
     return parsed if parsed is not None else default
@@ -966,17 +1299,38 @@ class ProviderHttpError(RuntimeError):
         self.status_code = status_code
 
 
+class ProviderProtocolError(RuntimeError):
+    """Provider returned a successful HTTP response without usable chat content."""
+
+    def __init__(self, message: str, *, details: JsonDict | None = None) -> None:
+        super().__init__(message)
+        self.details = dict(details or {})
+
+
 def _is_transient_provider_error(exc: Exception) -> bool:
+    if isinstance(exc, ProviderProtocolError):
+        return True
     if isinstance(exc, ProviderHttpError):
         return exc.status_code in {408, 429, 500, 502, 503, 504} or (520 <= exc.status_code <= 527)
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in {408, 429, 500, 502, 503, 504}
-    return isinstance(exc, (TimeoutError, ConnectionError, urllib.error.URLError))
+    return isinstance(
+        exc,
+        (
+            TimeoutError,
+            ConnectionError,
+            urllib.error.URLError,
+            http.client.IncompleteRead,
+            http.client.RemoteDisconnected,
+        ),
+    )
 
 
 def _is_provider_failover_error(exc: Exception) -> bool:
     """Return whether a primary-provider failure should activate fallback."""
 
+    if isinstance(exc, ProviderProtocolError):
+        return True
     if isinstance(exc, ProviderHttpError):
         if exc.status_code == 500 and _provider_error_reports_capacity(exc):
             return True
@@ -985,7 +1339,49 @@ def _is_provider_failover_error(exc: Exception) -> bool:
         )
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in {401, 403, 408, 429, 502, 503, 504} or 520 <= exc.code <= 527
-    return isinstance(exc, (TimeoutError, ConnectionError, urllib.error.URLError))
+    return isinstance(
+        exc,
+        (
+            TimeoutError,
+            ConnectionError,
+            urllib.error.URLError,
+            http.client.IncompleteRead,
+            http.client.RemoteDisconnected,
+        ),
+    )
+
+
+def _is_provider_account_error(exc: Exception) -> bool:
+    """Return whether retrying the same endpoint cannot repair this request."""
+
+    if isinstance(exc, ProviderHttpError):
+        return exc.status_code in {401, 403}
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in {401, 403}
+    return False
+
+
+def _provider_failure_code(exc: Exception) -> str:
+    """Map terminal provider errors to a stable Agent/evaluation-facing code."""
+
+    message = str(exc).lower()
+    if any(
+        marker in message
+        for marker in (
+            "insufficient_user_quota",
+            "insufficient quota",
+            "insufficient balance",
+            "额度失败",
+            "剩余额度",
+            "余额不足",
+        )
+    ):
+        return "insufficient_provider_quota"
+    if _is_provider_account_error(exc):
+        return "provider_credentials_or_access_denied"
+    if _is_transient_provider_error(exc):
+        return "transient_provider_failure"
+    return "provider_request_failed"
 
 
 def _provider_error_reports_capacity(exc: Exception) -> bool:
@@ -997,10 +1393,29 @@ def _provider_error_reports_capacity(exc: Exception) -> bool:
             "overloaded",
             "capacity",
             "concurrency",
+            "temporarily unavailable",
+            "temporary unavailable",
             "负载",
             "并发",
+            "暂时不可用",
         )
     )
+
+
+def _provider_retry_delay_s(
+    exc: Exception,
+    *,
+    configured_backoff_s: float,
+    attempt: int,
+) -> float:
+    """Return exponential retry delay with a capacity-specific cooldown floor."""
+
+    exponent = max(0, int(attempt) - 1)
+    configured_delay_s = max(0.0, float(configured_backoff_s)) * (2**exponent)
+    if not _provider_error_reports_capacity(exc):
+        return configured_delay_s
+    capacity_delay_s = PROVIDER_CAPACITY_MIN_RETRY_BACKOFF_S * (2**exponent)
+    return max(configured_delay_s, capacity_delay_s)
 
 
 def _chat_completions_url(api_base: str) -> str:
@@ -1048,19 +1463,60 @@ def _coerce_positive_int(value: object) -> int | None:
 
 
 def _extract_chat_content(response: JsonDict) -> str:
+    response_diagnostic = _provider_chat_response_diagnostic(response)
     choices = response.get("choices")
     if not isinstance(choices, list) or not choices:
-        raise RuntimeError("Provider response did not include choices.")
+        raise ProviderProtocolError(
+            "Provider response did not include choices.", details=response_diagnostic
+        )
     first = choices[0]
     if not isinstance(first, dict):
-        raise RuntimeError("Provider response choice is not an object.")
+        raise ProviderProtocolError(
+            "Provider response choice is not an object.", details=response_diagnostic
+        )
     message = first.get("message", {})
     if not isinstance(message, dict):
-        raise RuntimeError("Provider response choice did not include message.")
+        raise ProviderProtocolError(
+            "Provider response choice did not include message.", details=response_diagnostic
+        )
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("Provider response message content is empty.")
+        raise ProviderProtocolError(
+            "Provider response message content is empty.", details=response_diagnostic
+        )
     return content
+
+
+def _provider_chat_response_diagnostic(response: JsonDict) -> JsonDict:
+    """Return compact non-content diagnostics for malformed chat responses."""
+
+    diagnostic: JsonDict = {}
+    choices = response.get("choices")
+    if isinstance(choices, list):
+        diagnostic["choice_count"] = len(choices)
+        first = choices[0] if choices else None
+        if isinstance(first, dict):
+            finish_reason = first.get("finish_reason")
+            if isinstance(finish_reason, str):
+                diagnostic["finish_reason"] = finish_reason
+            message = first.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                diagnostic["content_type"] = type(content).__name__
+                diagnostic["content_chars"] = len(content) if isinstance(content, str) else 0
+                diagnostic["refusal_present"] = bool(message.get("refusal"))
+    usage = response.get("usage")
+    if isinstance(usage, dict):
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(key)
+            if isinstance(value, int):
+                diagnostic[key] = value
+        completion_details = usage.get("completion_tokens_details")
+        if isinstance(completion_details, dict):
+            reasoning_tokens = completion_details.get("reasoning_tokens")
+            if isinstance(reasoning_tokens, int):
+                diagnostic["reasoning_tokens"] = reasoning_tokens
+    return diagnostic
 
 
 def _extract_finish_reason(response: JsonDict) -> str | None:

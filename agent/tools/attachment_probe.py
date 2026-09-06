@@ -76,7 +76,10 @@ def build_prepare_attachment_probe_handler() -> ToolHandler:
         return make_tool_result(
             context,
             success=True,
-            content="articulated attachment probe prepared and frozen",
+            content=(
+                "articulated attachment probe geometry frozen; run the returned "
+                "ordered IK preview requests, then execute by receipt id(s)"
+            ),
             outputs=outputs,
         )
 
@@ -127,29 +130,20 @@ def assess_attachment_probe(
     """Assess articulated co-motion from the frozen probe's before/after views."""
 
     memory = _memory_context(context.metadata.get("supervision_context"))
-    execution = _mapping(memory.get("grasp_execution"), "grasp_execution")
-    gate = _mapping(memory.get("attachment_gate"), "attachment_gate")
     probe = _mapping(
         memory.get("articulated_attachment_probe"),
         "articulated_attachment_probe",
     )
-    if (
-        execution.get("status") != "required"
-        or execution.get("stage") != "attachment"
-        or execution.get("attachment_mode") != "articulated_handle"
-        or probe.get("status") != "completed"
-    ):
-        raise AttachmentProbeError("no completed articulated probe is awaiting assessment")
-    if str(gate.get("verdict") or "UNKNOWN").upper() != "UNKNOWN":
-        raise AttachmentProbeError("the articulated attachment gate is already resolved")
-    assessment_count = int(gate.get("assessment_count") or 0)
-    refresh_completed = gate.get("unknown_refresh_completed") is True
-    if assessment_count >= 2:
-        raise AttachmentProbeError(
-            "the articulated attachment assessment budget is exhausted"
-        )
-    if assessment_count >= 1 and not refresh_completed:
-        raise AttachmentProbeError("one fresh observation is required before reassessment")
+    if probe.get("status") != "completed":
+        raise AttachmentProbeError("the referenced probe has not completed")
+    requested_probe_id = str(context.parameters.get("probe_id") or "").strip()
+    if not requested_probe_id or requested_probe_id != str(probe.get("probe_id") or ""):
+        raise AttachmentProbeError("probe_id must reference the completed frozen probe")
+    gripper_evidence = _require_probe_gripper_evidence(
+        memory,
+        context.observation,
+        operation="attachment assessment",
+    )
     before = [
         path
         for path in probe.get("pre_probe_image_paths", [])
@@ -193,6 +187,7 @@ def assess_attachment_probe(
                 "schema_version": ARTICULATED_ATTACHMENT_ASSESSMENT_SCHEMA,
                 "role": "independent_articulated_attachment_reviewer",
                 "task": str(context.metadata.get("task") or ""),
+                "probe_id": probe.get("probe_id"),
                 "candidate_id": probe.get("candidate_id"),
                 "motion_type": probe.get("motion_type"),
                 "distance_m": probe.get("distance_m"),
@@ -217,11 +212,12 @@ def assess_attachment_probe(
     reason = str(payload.get("reason") or "").strip()
     return {
         "schema_version": ARTICULATED_ATTACHMENT_ASSESSMENT_SCHEMA,
+        "probe_id": probe.get("probe_id"),
         "candidate_id": probe.get("candidate_id"),
         "scene_epoch": memory.get("scene_epoch"),
         "verdict": verdict,
         "reason": reason,
-        "assessment_index": assessment_count + 1,
+        "gripper_evidence": gripper_evidence,
         "checked_by": "independent_attachment_reviewer",
         "provider": result.provider,
         "model": result.model,
@@ -237,26 +233,47 @@ def prepare_attachment_probe(
     """Validate an agent proposal and freeze one bounded 5 cm probe action."""
 
     memory = _memory_context(supervision_context)
-    execution = _mapping(memory.get("grasp_execution"), "grasp_execution")
-    policy = _mapping(memory.get("grasp_candidate_policy"), "grasp_candidate_policy")
-    if execution.get("status") != "required" or execution.get("stage") != "prepare_probe":
+    compiled_grasp_id = str(parameters.get("compiled_grasp_id") or "").strip()
+    graph = _mapping(memory.get("provenance_evidence_graph"), "provenance_evidence_graph")
+    nodes = graph.get("nodes")
+    grasp_node = next(
+        (
+            dict(node)
+            for node in nodes
+            if isinstance(node, Mapping)
+            and node.get("kind") == "compiled_targeted_grasp"
+            and str(node.get("compiled_grasp_id") or "") == compiled_grasp_id
+        ),
+        None,
+    ) if isinstance(nodes, Sequence) else None
+    if not compiled_grasp_id or not isinstance(grasp_node, dict):
         raise AttachmentProbeError(
-            "prepare_attachment_probe is allowed only after an articulated handle close"
+            "compiled_grasp_id must name a grasp in provenance_evidence_graph"
         )
-    if policy.get("interaction_family") != "articulated_handle":
-        raise AttachmentProbeError("the active candidate is not an articulated handle")
-    candidate_id = str(execution.get("candidate_id") or "")
-    compiled_grasp_id = str(execution.get("compiled_grasp_id") or "")
-    if not candidate_id or not compiled_grasp_id:
-        raise AttachmentProbeError("active candidate provenance is incomplete")
-    active = _mapping(policy.get("active_candidate"), "active_candidate")
-    if str(active.get("id") or "") != candidate_id:
-        raise AttachmentProbeError("active candidate does not match grasp execution")
+    if grasp_node.get("freshness") == "superseded_target_evidence":
+        raise AttachmentProbeError(
+            "compiled grasp evidence was superseded by a different selected target"
+        )
+    if grasp_node.get("freshness") == "invalidated_contact_geometry":
+        raise AttachmentProbeError(
+            "compiled grasp contact geometry was invalidated after gripper reopen; "
+            "compile and execute a current contact branch before preparing a probe"
+        )
+    candidate_id = str(grasp_node.get("candidate_id") or "")
+    if not candidate_id:
+        raise AttachmentProbeError("compiled grasp candidate provenance is incomplete")
     scene_epoch = _nonnegative_int(memory.get("scene_epoch"), "scene_epoch")
-    if _nonnegative_int(execution.get("scene_epoch"), "grasp_execution.scene_epoch") != scene_epoch:
-        raise AttachmentProbeError("grasp execution is stale for the current scene epoch")
+    robot_motion_epoch = _nonnegative_int(
+        memory.get("robot_motion_epoch", 0),
+        "robot_motion_epoch",
+    )
     if observation is None:
         raise AttachmentProbeError("a current observation is required")
+    gripper_evidence = _require_probe_gripper_evidence(
+        memory,
+        observation,
+        operation="attachment probe preparation",
+    )
     pose = getattr(getattr(observation, "robot", None), "end_effector_pose", None)
     pose = _mapping(pose, "observation.robot.end_effector_pose")
     start_xyz = _vector3(pose.get("xyz"), "observation.robot.end_effector_pose.xyz")
@@ -343,7 +360,35 @@ def prepare_attachment_probe(
     path_sha256 = hashlib.sha256(
         json.dumps(frozen_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    probe_id = f"probe:{path_sha256}"
     _stamp_probe_metadata(tool_parameters, path_sha256=path_sha256)
+    preview_requests = [
+        {
+            "tool": "ik_preview_check",
+            "parameters": {
+                "probe_id": probe_id,
+                "waypoint_index": index,
+                "position_tolerance_m": 0.01,
+                "orientation_tolerance_rad": 0.10,
+                "check_endpoint_collision": True,
+            },
+        }
+        for index, _pose in enumerate(frozen_path)
+    ]
+    execution_parameters = (
+        {
+            "ik_receipt_id": "<receipt id from the single preview above>",
+            "enable_collision_check": True,
+        }
+        if tool_name == "move_to"
+        else {
+            "ik_receipt_ids": [
+                f"<receipt id from preview {index + 1}>"
+                for index in range(len(frozen_path))
+            ],
+            "enable_collision_check": True,
+        }
+    )
     pre_probe_images = _current_rgb_paths(observation)
     if len(pre_probe_images) != 2:
         raise AttachmentProbeError(
@@ -352,9 +397,11 @@ def prepare_attachment_probe(
     return {
         "schema_version": ARTICULATED_ATTACHMENT_PROBE_SCHEMA,
         "status": "prepared",
+        "probe_id": probe_id,
         "candidate_id": candidate_id,
         "compiled_grasp_id": compiled_grasp_id,
         "scene_epoch": scene_epoch,
+        "robot_motion_epoch": robot_motion_epoch,
         "interaction_family": "articulated_handle",
         "motion_type": motion_type,
         "distance_m": ARTICULATED_ATTACHMENT_PROBE_DISTANCE_M,
@@ -362,10 +409,80 @@ def prepare_attachment_probe(
         "direction_world_xyz": _round_vector(direction),
         "frozen_path": frozen_path,
         "path_sha256": path_sha256,
-        "required_action": {"name": tool_name, "parameters": tool_parameters},
+        "frozen_motion": {"name": tool_name, "parameters": tool_parameters},
+        "ik_preview_requests": preview_requests,
+        "execution_handoff": {
+            "tool": tool_name,
+            "parameters": execution_parameters,
+            "instruction": (
+                "Run every IK preview in order, then pass only the returned receipt "
+                "id or ids to the named motion tool. Do not copy the frozen poses."
+            ),
+        },
         "pre_probe_image_paths": pre_probe_images,
         "proposal_reason": reason,
+        "gripper_evidence": gripper_evidence,
         "checked_by": "host_probe_geometry",
+    }
+
+
+def _require_probe_gripper_evidence(
+    memory: Mapping[str, Any],
+    observation: Any,
+    *,
+    operation: str,
+) -> JsonDict:
+    """Reject probes that contradict host command or measured aperture evidence."""
+
+    commanded_value = memory.get("gripper_command_state")
+    commanded = dict(commanded_value) if isinstance(commanded_value, Mapping) else {}
+    if commanded.get("position") != 0 or commanded.get("state") != "closed":
+        raise AttachmentProbeError(
+            f"{operation} requires the latest acknowledged gripper command to be "
+            "closed; execute a valid contact close before preparing or assessing a probe"
+        )
+
+    proxy_value = commanded.get("attachment_proxy_receipt")
+    proxy = dict(proxy_value) if isinstance(proxy_value, Mapping) else {}
+    if proxy.get("status") != "tentative":
+        status = str(proxy.get("status") or "missing")
+        reason = str(proxy.get("reason") or "no tentative close receipt")
+        raise AttachmentProbeError(
+            f"{operation} requires a tentative non-empty close receipt; latest "
+            f"attachment_proxy_status={status!r}, reason={reason!r}. Inspect current "
+            "dual-view evidence, repair contact, close again, then prepare a new probe"
+        )
+
+    robot = getattr(observation, "robot", None)
+    measured_value = getattr(robot, "gripper_state", None)
+    measured = dict(measured_value) if isinstance(measured_value, Mapping) else {}
+    is_open = measured.get("open")
+    openness = measured.get("openness")
+    has_numeric_openness = (
+        isinstance(openness, (int, float))
+        and not isinstance(openness, bool)
+        and math.isfinite(float(openness))
+    )
+    # Continuous aperture is the more informative signal. Some simulator
+    # adapters label a partially obstructed grasp as ``open=True`` even when
+    # the measured aperture is far below fully open. Fall back to the coarse
+    # boolean only when no finite aperture measurement is available.
+    definitely_open = (
+        float(openness) >= 0.8 if has_numeric_openness else is_open is True
+    )
+    if definitely_open:
+        raise AttachmentProbeError(
+            f"{operation} contradicts the current measured gripper state: "
+            f"open={is_open!r}, openness={openness!r}. Re-establish contact and close "
+            "the gripper before using attachment evidence"
+        )
+    return {
+        "commanded_position": 0,
+        "attachment_proxy_status": "tentative",
+        "attachment_proxy_reason": proxy.get("reason"),
+        "measured_open": is_open,
+        "measured_openness": openness,
+        "checked_by": "host_gripper_evidence",
     }
 
 

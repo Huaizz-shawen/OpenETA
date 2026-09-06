@@ -18,6 +18,7 @@ from agent.backends.planner import (
 )
 from agent.backends.provider_config import load_planner_provider_config
 from agent.runtime.episode import OpenEtaEpisodeRunner
+from agent.runtime.grasp_strategy_projection import apply_grasp_strategy_projection
 from agent.runtime.interactions import (
     PausedEpisodeRecord,
     PausedEpisodeStore,
@@ -37,6 +38,7 @@ from agent.runtime.parallel import (
 )
 from agent.runtime.session_workspace import DEFAULT_MEMORY_ROOT, SessionWorkspace
 from agent.runtime.runtime_assembly import (
+    REASONING_SUBAGENT_MAX_OUTPUT_TOKENS,
     RuntimeAssemblyConfig,
     RuntimeMcpEndpoints,
     assemble_runtime,
@@ -48,6 +50,7 @@ from agent.runtime.supervision import (
     SupervisionPolicy,
     SupervisionProfile,
 )
+from agent.runtime.visual_history import VisualHistoryConfig
 from agent.tools.mcp_registry import load_mcp_server_url
 from agent.tools.sim_mcp import (
     SimulatorMcpEpisodeConfig,
@@ -120,7 +123,6 @@ def build_mcp_episode_worker_factory(
     anygrasp_url: str = "",
     anyplace_url: str = "",
     graspgenx_url: str = "",
-    contact_graspnet_url: str = "",
     molmopoint_url: str = "",
     supervision_profile: SupervisionProfile | str = SupervisionProfile.STANDARD,
     provider_concurrency: int = DEFAULT_PROVIDER_CONCURRENCY,
@@ -142,7 +144,6 @@ def build_mcp_episode_worker_factory(
             anygrasp_url=anygrasp_url,
             anyplace_url=anyplace_url,
             graspgenx_url=graspgenx_url,
-            contact_graspnet_url=contact_graspnet_url,
             molmopoint_url=molmopoint_url,
         ),
         loader=load_mcp_server_url,
@@ -160,11 +161,13 @@ def build_mcp_episode_worker_factory(
         *,
         max_tokens: int | None = None,
         max_vision_images: int | None = None,
+        enable_thinking: bool | None = None,
     ) -> PlannerBackend:
         return _new_batch_backend(
             provider,
             max_tokens=max_tokens,
             max_vision_images=max_vision_images,
+            enable_thinking=enable_thinking,
             provider_limiter=provider_limiter,
         )
 
@@ -202,6 +205,33 @@ def build_mcp_episode_worker_factory(
                 else {}
             ),
         )
+        evaluation_runtime = spec.metadata.get("evaluation_runtime")
+        evaluation_runtime = (
+            dict(evaluation_runtime) if isinstance(evaluation_runtime, dict) else {}
+        )
+        visual_history_overrides = evaluation_runtime.get("visual_history")
+        if visual_history_overrides is not None and not isinstance(
+            visual_history_overrides, dict
+        ):
+            raise ValueError("evaluation_runtime.visual_history must be an object")
+        grasp_strategy_overrides = evaluation_runtime.get("grasp_strategies")
+        grasp_strategy_projection = apply_grasp_strategy_projection(
+            workspace.grasp_strategy_root,
+            grasp_strategy_overrides,
+        )
+        visual_history = VisualHistoryConfig.from_mapping(
+            visual_history_overrides,
+            base=VisualHistoryConfig.from_env(),
+        )
+        allowed_runtime = {"visual_history", "grasp_strategies"}
+        unsupported_runtime = sorted(
+            str(key) for key in evaluation_runtime if key not in allowed_runtime
+        )
+        if unsupported_runtime:
+            raise ValueError(
+                "unsupported evaluation runtime section(s): "
+                + ", ".join(unsupported_runtime)
+            )
         staged_grasp_profile = json.loads(workspace.grasp_profile_path.read_text(encoding="utf-8"))
         staged_calibration_id = (
             str(staged_grasp_profile.get("calibration_id") or "")
@@ -249,6 +279,7 @@ def build_mcp_episode_worker_factory(
                 web_access_config=web_access_config,
                 allow_outside_sandbox=False,
                 max_validation_retries=2,
+                visual_history=visual_history,
             )
         )
         runtime = assembly.runtime
@@ -314,7 +345,9 @@ def build_mcp_episode_worker_factory(
                 runtime=runtime,
                 environment=environment,
                 interaction_resolver=(
-                    BackendGuidanceResolver(new_backend())
+                    BackendGuidanceResolver(
+                        new_backend(max_tokens=REASONING_SUBAGENT_MAX_OUTPUT_TOKENS)
+                    )
                     if policy.profile == SupervisionProfile.REVIEWED_AUTONOMY
                     else None
                 ),
@@ -329,6 +362,8 @@ def build_mcp_episode_worker_factory(
                 "calibration_profile_id": staged_calibration_id,
                 "calibration_profile_sha256": workspace.grasp_profile_sha256,
                 "grasp_strategy_tree_sha256": workspace.grasp_strategy_tree_sha256,
+                "grasp_strategy_projection": grasp_strategy_projection,
+                "evaluation_runtime": evaluation_runtime,
             },
         )
 
@@ -341,6 +376,7 @@ def _new_batch_backend(
     *,
     max_tokens: int | None = None,
     max_vision_images: int | None = None,
+    enable_thinking: bool | None = None,
     provider_limiter: ProviderConcurrencyLimiter | None = None,
 ) -> PlannerBackend:
     config = OpenAICompatiblePlannerBackendConfig.from_provider_config(provider)
@@ -348,6 +384,8 @@ def _new_batch_backend(
         config.max_tokens = max_tokens
     if max_vision_images is not None:
         config.max_vision_images = max(config.max_vision_images, max_vision_images)
+    if enable_thinking is not None:
+        config.enable_thinking = enable_thinking
     backend = OpenAICompatiblePlannerBackend(config)
     return provider_limiter.wrap(backend) if provider_limiter is not None else backend
 
@@ -372,7 +410,6 @@ def resume_paused_episode(
     anygrasp_url: str = "",
     anyplace_url: str = "",
     graspgenx_url: str = "",
-    contact_graspnet_url: str = "",
     molmopoint_url: str = "",
     supervision_profile: SupervisionProfile | str | None = None,
 ) -> JsonDict:
@@ -420,7 +457,6 @@ def resume_paused_episode(
         anygrasp_url=anygrasp_url,
         anyplace_url=anyplace_url,
         graspgenx_url=graspgenx_url,
-        contact_graspnet_url=contact_graspnet_url,
         molmopoint_url=molmopoint_url,
         supervision_profile=(supervision_profile or record.supervision_profile),
     )(spec, record.batch_id)
@@ -604,11 +640,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Override GraspGenX MCP SSE URL.",
     )
     parser.add_argument(
-        "--contact-graspnet-url",
-        default="",
-        help="Override Contact-GraspNet MCP SSE URL.",
-    )
-    parser.add_argument(
         "--molmopoint-url",
         default="",
         help="Override MolmoPoint MCP SSE URL.",
@@ -646,7 +677,6 @@ def main(argv: list[str] | None = None) -> int:
                 anygrasp_url=args.anygrasp_url,
                 anyplace_url=args.anyplace_url,
                 graspgenx_url=args.graspgenx_url,
-                contact_graspnet_url=args.contact_graspnet_url,
                 molmopoint_url=args.molmopoint_url,
                 supervision_profile=args.approvement or None,
             )
@@ -675,7 +705,6 @@ def main(argv: list[str] | None = None) -> int:
             anygrasp_url=args.anygrasp_url,
             anyplace_url=args.anyplace_url,
             graspgenx_url=args.graspgenx_url,
-            contact_graspnet_url=args.contact_graspnet_url,
             molmopoint_url=args.molmopoint_url,
             supervision_profile=(args.approvement or SupervisionProfile.STANDARD.value),
             provider_concurrency=args.provider_concurrency,

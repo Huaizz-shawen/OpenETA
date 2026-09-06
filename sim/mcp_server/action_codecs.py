@@ -54,6 +54,136 @@ def _declared_behavior_layout(meta: dict[str, Any]) -> dict[str, Any]:
     return cartesian
 
 
+def require_controller_capability(
+    meta: dict[str, Any],
+    backend: str,
+    *,
+    orientation_requested: bool,
+) -> dict[str, Any]:
+    """Return the declared controller block or fail closed for LIBERO.
+
+    Other backends retain their existing codec contracts.  LIBERO is made
+    strict first because its outer closed-loop executor assumes OSC_POSE; a
+    future JOINT_VELOCITY environment must never be driven as if it were OSC.
+    """
+
+    spec = meta.get("control_spec")
+    controller = spec.get("controller") if isinstance(spec, dict) else None
+    cartesian = spec.get("cartesian_delta") if isinstance(spec, dict) else None
+    if backend != "libero":
+        return dict(controller) if isinstance(controller, dict) else {}
+    if not isinstance(controller, dict) or not isinstance(cartesian, dict):
+        raise ControlCodecError(
+            "controller_capability_missing",
+            backend,
+            "LIBERO worker did not declare openeta.sim_control.v1 controller and "
+            "cartesian_delta capabilities. Restart/redeploy the matching worker; "
+            "move_to will not guess an OSC_POSE action layout.",
+        )
+    controller_id = str(controller.get("controller_id") or "")
+    command_interface = str(controller.get("command_interface") or "")
+    executor = str(controller.get("goal_executor") or "")
+    osc_contract = (
+        controller_id == "robosuite.osc_pose"
+        and command_interface == "normalized_cartesian_delta_pose"
+        and executor == "openeta.outer_closed_loop_cartesian.v1"
+        and cartesian.get("supported") is True
+    )
+    mink_contract = (
+        controller_id == "mink.robosuite_joint_velocity"
+        and command_interface == "joint_velocity"
+        and executor == "openeta.worker_mink_goal.v1"
+        and cartesian.get("supported") is False
+    )
+    if not osc_contract and not mink_contract:
+        raise ControlCodecError(
+            "controller_capability_mismatch",
+            backend,
+            "LIBERO move_to supports only a declared robosuite.osc_pose outer "
+            "executor or mink.robosuite_joint_velocity worker-local executor. "
+            "The environment declared "
+            f"controller_id={controller_id or '<missing>'}, "
+            f"command_interface={command_interface or '<missing>'}, "
+            f"goal_executor={executor or '<missing>'}. Use a matching worker "
+            "deployment; no OSC fallback was attempted.",
+        )
+    if controller.get("supports_position") is not True or (
+        orientation_requested and controller.get("supports_orientation") is not True
+    ):
+        raise ControlCodecError(
+            "controller_goal_unsupported",
+            backend,
+            "The declared LIBERO controller does not support the requested "
+            f"{'full-pose' if orientation_requested else 'position'} goal.",
+        )
+    return dict(controller)
+
+
+def trunk_layout(meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the declared trunk layout, or None when the robot has no trunk.
+
+    Absent is a legitimate answer -- fixed-base and trunk-less robots exist --
+    so this returns None rather than raising, unlike the Cartesian layout whose
+    absence means a caller asked for motion that cannot be encoded.
+    """
+    spec = meta.get("control_spec")
+    trunk = spec.get("trunk") if isinstance(spec, dict) else None
+    if not isinstance(trunk, dict) or not trunk.get("supported"):
+        return None
+    return trunk
+
+
+def trunk_hold_values(meta: dict[str, Any], joint_positions: list[float],
+                      joint_names: list[str]) -> tuple[list[int], list[float]]:
+    """Normalized trunk commands that keep the trunk where it currently is.
+
+    Returns ``(slots, values)`` to write into an action, or ``([], [])`` when the
+    trunk cannot be resolved -- caller then leaves the slots untouched.
+
+    A trunk slot left at 0.0 is not neutral.  ``JointController`` runs in
+    position mode with ``use_delta_commands=False``, and
+    ``Controller._preprocess_command`` scales the [-1,1] input onto the joint
+    limits, so 0.0 resolves to ``(lower+upper)/2``.  For R1Pro's torso_joint1
+    (limits -1.1345..1.8326) that is 0.349 rad, not zero: every action built as
+    ``[0.0] * dim`` silently commands the trunk to a mid-range pose.  Holding
+    position means re-normalising the *current* angle through the inverse of
+    that scaling.
+
+    Joints are located **by name**, never by slicing.  R1Pro reports 28 joints
+    with the two arms interleaved, so a positional guess at where the torso sits
+    picks up base DOF instead -- the same failure mode the collision mapping
+    exists to prevent, and just as silent here.
+    """
+    trunk = trunk_layout(meta)
+    if not trunk:
+        return [], []
+    slots = [int(i) for i in (trunk.get("indices") or [])]
+    names = [str(n) for n in (trunk.get("joint_names") or [])]
+    lower = [float(v) for v in (trunk.get("limits_lower") or [])]
+    upper = [float(v) for v in (trunk.get("limits_upper") or [])]
+    # Without names+limits the current angle cannot be re-normalised, so there
+    # is no honest hold value.  Report nothing rather than a plausible guess.
+    if not (slots and names) or not (len(slots) == len(names) == len(lower) == len(upper)):
+        return [], []
+    if not joint_names or len(joint_names) != len(joint_positions):
+        return [], []
+
+    index_of = {str(n): i for i, n in enumerate(joint_names)}
+    values: list[float] = []
+    for k, name in enumerate(names):
+        i = index_of.get(name)
+        if i is None:
+            return [], []  # a trunk joint the observation does not report
+        span = (upper[k] - lower[k]) / 2.0
+        mid = (upper[k] + lower[k]) / 2.0
+        if not (span > 1e-9):
+            return [], []  # zero-width or inverted limit: not invertible
+        # Inverse of Controller._preprocess_command's input->output scaling.
+        v = (float(joint_positions[i]) - mid) / span
+        values.append(max(-1.0, min(1.0, v)))
+    return slots, values
+
+
 def cartesian_scales(meta: dict[str, Any], backend: str) -> tuple[float, float]:
     """Return metres/radians represented by a normalized action of 1.0."""
     if backend == "behavior":
@@ -62,13 +192,19 @@ def cartesian_scales(meta: dict[str, Any], backend: str) -> tuple[float, float]:
             float(layout.get("position_scale_m", 0.05)),
             float(layout.get("rotation_scale_rad", 0.25)),
         )
-    return ({
-        "metaworld": 0.005,
-        "libero": 0.009,
-        "maniskill": 0.003,
-        "robocasa": 0.05,
-        "dummy": 0.005,
-    }.get(backend, 0.0), 0.05)
+    # These are controller command scales, not the empirically observed EEF
+    # displacement after one physics step. LIBERO uses robosuite OSC_POSE;
+    # its shipped controller config maps normalized XYZ to +/-0.05 m and
+    # axis-angle rotation to +/-0.5 rad. The old 0.009/0.05 values were motion
+    # hints accidentally reused as codec scales, overdriving the closed-loop
+    # controller (especially orientation by 10x).
+    return {
+        "metaworld": (0.005, 0.05),
+        "libero": (0.05, 0.5),
+        "maniskill": (0.003, 0.05),
+        "robocasa": (0.05, 0.05),
+        "dummy": (0.005, 0.05),
+    }.get(backend, (0.0, 0.0))
 
 
 def cartesian_command_frame(meta: dict[str, Any], backend: str) -> str:

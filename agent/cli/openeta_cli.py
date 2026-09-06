@@ -52,6 +52,7 @@ from agent.runtime.mcp_catalog import discover_mcp_tool_catalog
 from agent.runtime.promoted_memory import PromotedMemoryStore
 from agent.runtime.runtime import OpenEtaAgentRuntime
 from agent.runtime.runtime_assembly import (
+    REASONING_SUBAGENT_MAX_OUTPUT_TOKENS,
     RuntimeAssemblyConfig,
     RuntimeMcpEndpoints,
     assemble_runtime,
@@ -1313,6 +1314,22 @@ class OpenEtaCli:
         )
         self.state.runtime = assembly.runtime
         self.state.supervision_gate = assembly.supervision_gate
+        anygrasp = assembly.perception_capabilities.get("backends", {}).get(
+            "anygrasp", {}
+        )
+        if (
+            isinstance(anygrasp, dict)
+            and anygrasp.get("configured") is True
+            and anygrasp.get("compatible") is not True
+        ):
+            print(
+                Theme.err(
+                    str(
+                        anygrasp.get("message")
+                        or "AnyGrasp is unavailable: deployment capability check failed."
+                    )
+                )
+            )
         self.state.runtime.memory.save_fact(
             "session_workspace",
             workspace.to_dict(),
@@ -1879,7 +1896,10 @@ def _load_mcp_url(
 
 
 def _new_supervision_backend(cli: OpenEtaCli) -> OpenAICompatiblePlannerBackend:
-    return _new_cli_backend(cli, max_tokens=512)
+    return _new_cli_backend(
+        cli,
+        max_tokens=REASONING_SUBAGENT_MAX_OUTPUT_TOKENS,
+    )
 
 
 def _new_cli_backend(
@@ -1887,6 +1907,7 @@ def _new_cli_backend(
     *,
     max_tokens: int | None = None,
     max_vision_images: int | None = None,
+    enable_thinking: bool | None = None,
 ) -> OpenAICompatiblePlannerBackend:
     backend_config = OpenAICompatiblePlannerBackendConfig.from_provider_config(cli.state.config)
     if max_tokens is not None:
@@ -1896,6 +1917,8 @@ def _new_cli_backend(
             backend_config.max_vision_images,
             max_vision_images,
         )
+    if enable_thinking is not None:
+        backend_config.enable_thinking = enable_thinking
     return OpenAICompatiblePlannerBackend(backend_config)
 
 

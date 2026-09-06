@@ -18,130 +18,145 @@ allowed_tools:
   - estimate_depth_prior
   - enhance_depth
   - grasp_pose_estimate
+  - molmopoint
   - reject_sam3_detections
-  - activate_final_grasp_candidate
   - compile_grasp_seed
   - compute_wrist_alignment
+  - propose_wrist_viewpoints
   - camera_pose_to_world
   - ik_preview_check
-  - obstacle_avoidance
+  - prepare_attachment_probe
+  - assess_attachment_probe
+  - python_exec
   - move_to
+  - follow_eef_trajectory
   - gripper_control
 ---
 # Pick
 
-Use as text guidance only, not an executable macro. Inspect each result.
+Use this as reusable task guidance, not an executable macro. It explains why
+and when capabilities are useful; the live tool contracts exclusively define
+their request fields, returned references, validity rules, and repair payloads.
 
-## Recommended Tool Sequence
+## Evidence and target identity
 
-1. Call `observe` to get the complete current scene observation.
-2. Extract the target phrase from the user task and normalize it to a concise
-   English visual object phrase for `sam3`. For example:
-   - "please pick up milk box" -> `milk box`
-   - "把桌上的罐子抓起来" -> `can`
-   - "拿起牛奶盒" -> `milk box`
-   - "抓取方块" -> `cube`
-3. Call `sam3` on the exact local RGB path from `current_camera_artifacts` with
-   the normalized `prompt`, for example `milk box` or `can`.
-   Do not pass a non-English user phrase directly to `sam3` if a clear English object name is available.
-   If direct text segmentation is empty or clearly fails to identify an unusual
-   simulator asset, and `retrieve_asset_reference` is executable, call it with
-   the active simulator `environment`, the exact target asset name from the task
-   as `target_object`, and the exact local original RGB `scene_image`. Object
-   memory resolves this task phrase to a canonical asset. Do not add
-   visual category words such as `can`, `bottle`, or `box` to object-memory
-   lookup. Its isolated localizer returns original-image `positive_points` and an
-   audit image. Call `sam3` on that exact `scene_image`; copy points unchanged.
-   Use `roi_bbox_xyxy` only for the runtime's single bbox fallback after the
-   selected point mask and one dense grasp attempt produce no candidates.
-4. Stop after `sam3` and inspect its result before calling
-   `grasp_pose_estimate`. The
-   runtime does not pass outputs between dependent batched calls. For every
-   non-empty result, including a single detection, the runtime creates a
-   `selection_obligation` and attaches the original RGB plus a candidate contact
-   sheet to the next VLM planner request. Inspect those images and call
-   `select_sam3_detection` with the exact `sam3_result_id` and `detection_id`.
-   Score ranks candidates but does not prove identity. Gather another view when uncertain.
-5. For real-robot RGB-D or poor depth, call `estimate_depth_prior` when
-   executable, then `enhance_depth` with the same camera's exact `rgb`, `depth`,
-   and `intrinsics`. Pass prior paths and confidence semantics unchanged, plus
-   available registration, timestamps, scene epoch, and calibration hash. If
-   no prior tool exists, sensor-only enhancement is diagnostic. Use
-   `candidate_depth_png` for grasp generation only when its quality flag allows
-   it. Collision evidence must use `safety_depth_png` or the safety point cloud,
-   never mono-filled geometry.
-6. Call `grasp_pose_estimate` with the exact
-   `targeted_grasp_obligation.required_parameters`. The host joins:
-   - `rgb`/`depth`: exact current artifact paths for the same camera.
-   - `intrinsics`: same camera intrinsics with `fx`, `fy`, `cx`, `cy`, and `scale`.
-   - `object_mask`: selected artifact with exact `mask_ref` and `source_image`;
-     never pass a bare path or default to `detections[0]`.
-   - `camera_frame_id` and `scene_epoch`: exact host provenance.
-   Backend-specific options and fallback are host-owned. Do not call AnyGrasp,
-   Contact-GraspNet, or GraspGenX directly.
-   If candidate depth was used, follow the host-generated
-   `grasp_sensor_safety_obligation`: `obstacle_avoidance` must return
-   `clear=true` for the exact candidate, scene epoch, report, and sensor-only
-   safety artifacts before `compile_grasp_seed` becomes available.
-7. Read the normalized grasp candidate list. Candidate poses use the
-   camera/OpenCV GraspNet convention and are sorted by backend-local score.
-   Scores are not comparable across backends. The runtime records
-   `grasp_candidate_policy`: rank 0 is the initial `active_candidate`; lower
-   ranked candidates are fallbacks and must not be selected early.
-   When selecting the SAM3 mask, include truthful
-   `target_geometry_family` (`upright_can`, `upright_bottle`, `boxed_item`,
-   `bowl`, `apple`, `drawer_handle`, or `other`) only when visually clear. It is
-   task evidence for strategy matching, not a calibration allowlist.
-8. Before grasp motion, call `compile_grasp_seed` with:
-   - `camera_pose`: the complete `grasp_candidate_policy.active_candidate`,
-     preserving its id, camera-frame rotation/translation, width, and dimensions.
-   - `camera_extrinsics`: the matching `camera_packet.extrinsics` from the same
-     observe/render camera used for RGB and depth.
-   - `camera_frame_id`: the matching camera frame id, such as `agentview`.
-   - `scene_epoch`: copy the current host `scene_epoch` exactly.
-   - `target_geometry_family`: optional truthful hint; omit when uncertain and
-     never relabel an object to match a strategy.
-   - `strategy_id`: optional session-local strategy backed by prior evidence.
-   Calibration is not an object allowlist; no strategy match is required. Compiled
-   poses are references. Do not use `camera_pose_to_world` for normalized grasps.
-9. Follow `grasp_execution` one observed atomic edge at a time. The host opens only
-   when the latched command is not already open. Hover is at least 0.15 m opposite
-   world-frame `approach_world_xyz`, not unconditionally world `+Z`. At hover, use
-   fresh matching wrist RGB-D to call `compute_wrist_alignment`; bounded feedback
-   corrections must preserve world frame and candidate provenance. Accept only at contact.
-10. After contact, execute binary `gripper_control position=0`; `0=closed`, `1=open`,
-   and the command stays latched across motion. Its acknowledgement and observed
-   openness do not prove attachment; a static post-close image is not evidence.
-   Portable objects use the exact lift probe; PASS permits full lift. An articulated
-   handle instead uses `prepare_attachment_probe` for a 5 cm linear/arc path, then
-   `assess_attachment_probe`; PASS keeps its endpoint and UNKNOWN gets one refresh.
-11. A simulator transport timeout means the action outcome is unknown, not failed.
-    Observe the same handle and reconcile state before retry or a new action. A structured,
-    candidate-linked rejection advances to the next candidate; calibration errors,
-    unrelated failures, timeout, and interruption keep the current candidate active.
-    For host-classified `perception_refinable` or `uncertain_review` exhaustion,
-    follow `grasp_estimation_fallback_obligation` exactly: passive RGB-D views,
-    one IK/collision-checked hover plus fresh wrist re-estimation, then another
-    backend. Never invent a hover. Safety, IK, collision, wrong-target, malformed
-    pose, stale scene, and invalid calibration rejection remain hard stops.
+1. Inspect the scene before choosing a grasp target. Normalize the task
+   target into a concise English visual phrase when using text segmentation.
+2. Segment the intended object and visually inspect the original image plus
+   candidate overlays. Scores rank proposals but do not prove identity. Confirm
+   the candidate that matches the task, or reject the set and obtain better
+   evidence. Preserve the same physical instance across later views; do not
+   silently relabel a nearby object when the target moves or becomes occluded.
+3. When text segmentation misses an unusual known asset, use an available
+   controlled asset reference or point-grounding capability to localize it in
+   the original scene. Do not add category guesses that were not supported by
+   the task or reference image.
+4. Use depth enhancement only when sensor depth is too sparse for grasp
+   estimation. Treat enhanced depth as candidate-generation evidence, not as a
+   substitute for the sensor geometry required by collision checking.
+5. An exact-task playbook may supply object appearance, likely scene region, or
+   a previously useful strategy. Treat it only as a scoped prior: verify the
+   current object and scene visually before using it. Similar language or a
+   similar object from another task is not transferable evidence.
 
-## Recovery Notes
+## Grasp estimation and selection
 
-- If exact-task `sam3` returns an empty mask and `retrieve_asset_reference` is
-  executable, use reference localization before changing the prompt. Do not
-  broaden an unusual asset name such as `alphabet soup` to `soup can`: that can
-  segment another same-category instance. The point-prompt path may retry grasp
-  estimation once in dense mode, then SAM3 once with bbox ROI attention.
-- If `sam3` returns multiple plausible masks, resolve the target identity before
-  grasp estimation; confidence rank alone is not semantic identity.
-- After all views/backends, the host activates one highest-score refinable pose
-  for a final attempt. Pre-hover wrist images do not count as the wrist retry.
-- Do not advance the grasp queue for transport errors, missing calibration,
-  malformed parameters, or unrelated gripper failures. Automatic fallback is
-  limited to rejection explicitly linked to the active grasp pose.
-- Never move from stale perception. Observe after every world-mutating tool call.
-  Keep `scene_epoch` with artifact provenance; do not reuse old masks, depth, or poses.
+6. Estimate grasps only after target identity and aligned RGB-D evidence are
+   coherent. If the host reports that its prepared input is stale or incomplete,
+   refresh the relevant perception instead of reconstructing private paths or
+   calibration data. Use the grasp-estimation facade rather than choosing a
+   concrete backend directly. Estimator diversity is useful after physical
+   evidence such as a confirmed slip, not after an unrelated transport failure.
+7. Choose for transport stability, not merely the highest estimator score.
+   Compare finger aperture, visible contact depth, object geometry, collision
+   clearance, prior physical outcomes, and the projected contact location on
+   the target mask. Backend scores are local to each estimator and are not
+   directly comparable.
+8. Treat visual grasp-advisor output as evidence, not authority. Prefer a
+   candidate with broad, deep, symmetric contact on a stable body region. A
+   contact on a cap, rim, shoulder, thin edge, or barely overlapping boundary is
+   a slip risk. If every candidate has that weakness, obtain a materially
+   different view or candidate set rather than choosing the least-bad reachable one.
+9. Characterize the target geometry only when visually clear. Compare compatible
+   grasp strategies exposed by the runtime with the estimator-native pose when
+   their geometry assumptions match. Candidate strategies require an explicit
+   Agent choice and remain experimental; validated strategies may be stronger
+   priors, but neither bypasses visual, reachability, collision, contact, or
+   attachment checks. Task- or episode-specific evidence belongs in a playbook
+   or strategy record, not in this skill.
+10. Compile the selected estimator candidate before robot motion. Compilation is
+    the calibrated handoff from camera-frame grasp geometry to a world-frame EEF
+    reference. Do not treat an uncompiled estimator pose as a robot target.
 
-For explicit robot/environment calibration or parameter discovery, use the
-`embodiment_explore` skill outside the benchmark episode. This skill consumes
-the resulting validated profile; it does not silently recalibrate one.
+## Approach and near-field refinement
+
+11. Treat clearance, alignment, and contact references as ordinary geometric
+    waypoints rather than host-owned task phases. Choose the number and geometry
+    of motion edges from the current EEF pose, visible obstacles, carried-object
+    extent, and controller feedback.
+12. Approach contact through the corridor behind the selected grasp direction.
+    Avoid a long cross-axis sweep near the object: endpoint reachability alone
+    does not prevent the gripper from pushing the target away on the way in.
+    Establish a compatible contact orientation before the final inward motion.
+13. Use one checked endpoint for a short clear motion. For a long transit,
+    precision-sensitive approach, visible obstruction, or collision recovery,
+    choose a small ordered route and observe from the actual endpoint before
+    extending it. A midpoint on a failed straight path normally preserves the
+    same collision; route around the named obstacle instead. Keep collision
+    checking enabled and treat a controller stop as evidence to change geometry,
+    not as permission to replay or disable checks.
+14. Near the target, use the wrist view when it can materially improve contact:
+
+    - Use calibrated wrist alignment when the approach orientation and axial
+      contact depth remain credible and only a bounded lateral correction is
+      needed.
+    - Move to a target-facing wrist observation viewpoint when the target is
+      clipped or poorly framed.
+    - Run a fresh wrist-view grasp estimate when orientation, contact depth, or
+      candidate identity is uncertain. The wrist estimate is a new candidate
+      branch; it does not silently inherit or replace an earlier strategy.
+
+    Keep visual adjustments inside the host-provided safety envelope.
+15. A reachable endpoint proves kinematics, not controller convergence or path
+    safety. Compare execution-seed quality and residual diagnostics. If a full
+    contact orientation is infeasible, use a position-only reach only as a safe
+    observation or retreat waypoint; do not close at the same position with an
+    unrelated orientation and call it the same grasp.
+
+## Contact, attachment, and transport
+
+16. Close only after the actual motion receipt and fresh dual-view evidence show
+    that the fingers reached the intended contact geometry. A reported collision
+    may require visual reassessment, but collision with unrelated scenery does
+    not by itself make a finger-only close unsafe when contact geometry is still
+    valid. Follow the live gripper contract for the closed command.
+17. A close acknowledgement or measured aperture is not proof of attachment.
+    Keep the gripper latched and prepare a short, visually justified probe from
+    the measured EEF pose. Execute the frozen probe geometry through the normal
+    reachability and motion tools, then assess attachment from target/EEF
+    co-motion plus vacancy at the source location.
+18. Continue only on positive attachment evidence. Ambiguous evidence calls for
+    another observation or reassessment; an empty close, visible slip, or failed
+    co-motion calls for contact repair or a materially different candidate.
+19. Once attachment is confirmed, include the whole held object in route
+    clearance. Lift it clear of nearby clutter before lateral transport. Do not
+    combine a long lateral carry with descent toward a receptacle, because a rim
+    can strip an object from an otherwise latched gripper.
+
+## Recovery choices
+
+- Wrong or ambiguous target: reacquire identity before estimating another grasp.
+- Weak candidate set: change view, estimator evidence, or strategy rather than
+  cycling ranks from an unchanged result.
+- Contact motion stopped or missed: reason from the actual endpoint and repair
+  the approach corridor, orientation, or candidate.
+- Empty close or failed probe: reopen when safe, reject the physical branch, and
+  choose a materially different contact.
+- Attachment lost during transport: stop placement, re-observe the displaced
+  object, and begin a new evidence branch.
+- Missing calibration, backend failure, timeout, or malformed response is not
+  physical evidence against the candidate. Follow the structured tool recovery
+  or report the capability gap.
+
+For explicit robot, controller, sensor, or environment characterization, use
+the `embodiment_explore` skill outside the benchmark episode.

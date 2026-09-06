@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from adapter.protocol import JsonDict
+
+if TYPE_CHECKING:
+    from agent.tools.registry import ToolRegistry
 
 
 BUILTIN_SKILL_DIR = Path(__file__).resolve().parents[1] / "skills"
@@ -66,6 +71,120 @@ class SkillRegistry:
         return list(self._skills.values())
 
 
+def lint_skill_contracts(
+    skills: SkillRegistry,
+    tools: "ToolRegistry",
+) -> list[JsonDict]:
+    """Check skill guidance against the host-owned executable tool contracts."""
+
+    issues: list[JsonDict] = []
+    known_tools = {spec.name: spec for spec in tools.list()}
+    from agent.tools.contracts import build_default_tool_contract_catalog
+
+    tool_contracts = build_default_tool_contract_catalog(tools.list())
+    call_pattern = re.compile(
+        r"tool_call::([a-z][a-z0-9_]*)|"
+        r"(?:call|use|run|invoke|调用|使用)\s+`([a-z][a-z0-9_]*)`",
+        flags=re.IGNORECASE,
+    )
+    for skill in skills.list():
+        allowed = set(skill.allowed_tools)
+        for tool_name in sorted(allowed):
+            if tool_name not in known_tools:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "unknown_allowed_tool",
+                        "skill": skill.name,
+                        "tool": tool_name,
+                        "message": (
+                            f"Skill {skill.name!r} allows unknown tool {tool_name!r}."
+                        ),
+                    }
+                )
+        documented_calls: set[str] = set()
+        for match in call_pattern.finditer(skill.content):
+            prefix = skill.content[max(0, match.start() - 24) : match.start()].lower()
+            if re.search(r"(?:do not|don't|never|must not|不要|不可)\s*$", prefix):
+                continue
+            documented_calls.add(str(match.group(1) or match.group(2)).lower())
+        for tool_name in sorted(documented_calls):
+            if tool_name in {"ask_human", "talk", "task_complete"}:
+                continue
+            if tool_name not in known_tools:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "unknown_documented_tool",
+                        "skill": skill.name,
+                        "tool": tool_name,
+                        "message": (
+                            f"Skill {skill.name!r} instructs an unknown tool call "
+                            f"{tool_name!r}."
+                        ),
+                    }
+                )
+            elif tool_name not in allowed:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "documented_tool_not_allowed",
+                        "skill": skill.name,
+                        "tool": tool_name,
+                        "message": (
+                            f"Skill {skill.name!r} documents {tool_name!r} but omits it "
+                            "from allowed_tools."
+                        ),
+                    }
+                )
+        for tool_name in sorted(documented_calls & set(known_tools)):
+            request_properties = tool_contracts.get(tool_name).request_schema.get(
+                "properties"
+            )
+            parameter_names = (
+                set(request_properties)
+                if isinstance(request_properties, dict)
+                else set()
+            )
+            if parameter_names != {"bundle_id"}:
+                continue
+            mentions_bundle = bool(
+                re.search(
+                    rf"(?:call|调用)\s+`?{re.escape(tool_name)}`?[\s\S]{{0,200}}?"
+                    r"bundle_id",
+                    skill.content,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if not mentions_bundle:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "code": "bundle_only_contract_omitted",
+                        "skill": skill.name,
+                        "tool": tool_name,
+                        "message": (
+                            f"Skill {skill.name!r} must instruct {tool_name!r} through "
+                            "its host-issued bundle_id only."
+                        ),
+                    }
+                )
+    return issues
+
+
+def assert_skill_contracts(skills: SkillRegistry, tools: "ToolRegistry") -> None:
+    """Fail startup when executable skill guidance contradicts ToolSpec."""
+
+    errors = [
+        issue
+        for issue in lint_skill_contracts(skills, tools)
+        if issue.get("severity") == "error"
+    ]
+    if errors:
+        messages = "; ".join(str(issue.get("message") or issue) for issue in errors)
+        raise ValueError(f"Skill contract lint failed: {messages}")
+
+
 def build_default_skill_registry() -> SkillRegistry:
     """Create the first text-guidance skill library."""
 
@@ -79,13 +198,14 @@ def build_default_skill_registry() -> SkillRegistry:
             description="Place a held object on or inside a target receptacle.",
             task_patterns=("place <object> on <target>", "put <object> into <target>"),
             allowed_tools=(
-                "scene_detector",
+                "observe",
                 "sam3",
+                "select_sam3_detection",
+                "anyplace",
+                "camera_pose_to_world",
                 "ik_preview_check",
-                "obstacle_avoidance",
                 "move_to",
                 "gripper_control",
-                "observe",
             ),
             content=(
                 "Use this skill as guidance only. Locate the receptacle or surface, "
@@ -99,13 +219,11 @@ def build_default_skill_registry() -> SkillRegistry:
             description="Draft guidance for short planar push manipulation.",
             task_patterns=("push <object>", "move <object> by pushing"),
             allowed_tools=(
-                "scene_detector",
+                "observe",
                 "sam3",
                 "ik_preview_check",
-                "obstacle_avoidance",
                 "move_to",
                 "gripper_control",
-                "observe",
             ),
             content=(
                 "Use this skill as guidance only. This is placeholder guidance "
@@ -120,13 +238,14 @@ def build_default_skill_registry() -> SkillRegistry:
             description="Draft guidance for short pull manipulation.",
             task_patterns=("pull <object>", "move <object> by pulling"),
             allowed_tools=(
-                "scene_detector",
-                "sam3",
-                "ik_preview_check",
-                "obstacle_avoidance",
-                "move_to",
-                "gripper_control",
                 "observe",
+                "sam3",
+                "grasp_pose_estimate",
+                "compile_grasp_seed",
+                "ik_preview_check",
+                "move_to",
+                "follow_eef_trajectory",
+                "gripper_control",
             ),
             content=(
                 "Use this skill as guidance only. This is placeholder guidance "
@@ -141,14 +260,14 @@ def build_default_skill_registry() -> SkillRegistry:
             description="Guidance for stacking one object on another.",
             task_patterns=("stack <object> on <object>",),
             allowed_tools=(
-                "scene_detector",
+                "observe",
                 "sam3",
-                "anygrasp",
+                "select_sam3_detection",
+                "grasp_pose_estimate",
+                "compile_grasp_seed",
                 "ik_preview_check",
-                "obstacle_avoidance",
                 "move_to",
                 "gripper_control",
-                "observe",
             ),
             content=(
                 "Use this skill as guidance only. Combine pick and place guidance, "
@@ -171,10 +290,14 @@ def load_skill_markdown(path: Path) -> SkillSpec:
     description = _frontmatter_string(metadata, "description") or name
     version = _frontmatter_string(metadata, "version") or "v1"
     editable = _frontmatter_bool(metadata, "editable", default=True)
+    context_char_limit = _frontmatter_positive_int(metadata, "context_char_limit")
     try:
         source_path = path.relative_to(BUILTIN_SKILL_DIR.parent)
     except ValueError:
         source_path = path
+    skill_metadata: JsonDict = {"path": str(path)}
+    if context_char_limit is not None:
+        skill_metadata["context_char_limit"] = context_char_limit
     return SkillSpec(
         name=name,
         description=description,
@@ -184,7 +307,7 @@ def load_skill_markdown(path: Path) -> SkillSpec:
         source=f"markdown:{source_path}",
         version=version,
         editable=editable,
-        metadata={"path": str(path)},
+        metadata=skill_metadata,
     )
 
 
@@ -226,6 +349,19 @@ def _parse_frontmatter(lines: list[str]) -> dict[str, str | list[str]]:
 def _frontmatter_string(data: dict[str, str | list[str]], key: str) -> str:
     value = data.get(key)
     return value if isinstance(value, str) else ""
+
+
+def _frontmatter_positive_int(
+    data: dict[str, str | list[str]], key: str
+) -> int | None:
+    value = data.get(key)
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _frontmatter_bool(
