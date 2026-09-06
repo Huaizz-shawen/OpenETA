@@ -18,10 +18,6 @@ from agent.runtime.depth_enhancement import (
     enhance_rgbd_depth,
     materialize_depth_enhancement,
 )
-from agent.runtime.image_artifacts import (
-    DEFAULT_MCP_IMAGE_OUTPUT_ROOT,
-    materialize_mcp_images,
-)
 from agent.runtime.interfaces import ActionInterfaceRegistry, build_default_action_interfaces
 from agent.runtime.memory import AgentMemory, MemoryStore
 from agent.runtime.pipeline import ActionPipeline
@@ -29,6 +25,7 @@ from agent.runtime.planner import BasePlanner, ToolCallingPlanner
 from agent.runtime.rollout import RolloutRecorder, build_rollout_provenance
 from agent.runtime.self_improvement import SelfImprovementReviewer
 from agent.runtime.skills import SkillRegistry, build_default_skill_registry
+from agent.runtime.visual_history import VisualHistoryManager
 from agent.tools.coding import PythonExecRuntime
 from agent.tools.registry import (
     ToolExecutionContext,
@@ -36,7 +33,6 @@ from agent.tools.registry import (
     ToolResult,
     build_default_tool_registry,
     make_tool_result,
-    make_tool_result_details,
 )
 
 
@@ -47,6 +43,27 @@ class RuntimeExecutionCancelled(RuntimeError):
 def _raise_if_execution_cancelled(cancel_event: threading.Event | None) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeExecutionCancelled("episode execution was cancelled")
+
+
+def _assert_tool_contract_runtime_alignment(planner: object, pipeline: object) -> None:
+    """Fail before execution if Planner and Gate use different contract truth."""
+
+    planner_catalog = getattr(planner, "tool_contract_catalog", None)
+    pipeline_catalog = getattr(pipeline, "tool_contract_catalog", None)
+    if planner_catalog is not None and pipeline_catalog is not None:
+        if planner_catalog.to_dict() != pipeline_catalog.to_dict():
+            raise ValueError(
+                "Planner and ActionPipeline ToolContract catalogs differ; refusing "
+                "to start a runtime with split interface authority."
+            )
+    planner_policy = getattr(planner, "tool_contract_policy", None)
+    pipeline_policy = getattr(pipeline, "tool_contract_policy", None)
+    if planner_policy is not None and pipeline_policy is not None:
+        if planner_policy.to_dict() != pipeline_policy.to_dict():
+            raise ValueError(
+                "Planner and ActionPipeline ToolContract runtime policies differ; "
+                "refusing to start a runtime with split authority."
+            )
 
 
 class OpenEtaAgentRuntime:
@@ -66,6 +83,8 @@ class OpenEtaAgentRuntime:
         rollout_recorder: RolloutRecorder | None = None,
         rollout_enabled: bool = True,
         default_session_id: str | None = None,
+        visual_history: VisualHistoryManager | None = None,
+        startup_facts: dict[str, JsonDict] | None = None,
     ) -> None:
         self.planner = planner or ToolCallingPlanner()
         self.memory = memory or AgentMemory(store=memory_store)
@@ -73,8 +92,14 @@ class OpenEtaAgentRuntime:
         self.skills = skills or build_default_skill_registry()
         self.interfaces = interfaces or build_default_action_interfaces()
         self.pipeline = pipeline or ActionPipeline(interfaces=self.interfaces)
+        _assert_tool_contract_runtime_alignment(self.planner, self.pipeline)
         self.self_improvement_reviewer = self_improvement_reviewer or SelfImprovementReviewer()
         self.default_session_id = default_session_id
+        self.visual_history = visual_history
+        self.startup_facts = {
+            str(name): dict(payload)
+            for name, payload in (startup_facts or {}).items()
+        }
         self.rollout_recorder = rollout_recorder
         if self.rollout_recorder is None and rollout_enabled:
             store_root = getattr(self.memory.store, "root", None)
@@ -82,6 +107,8 @@ class OpenEtaAgentRuntime:
                 self.rollout_recorder = RolloutRecorder(store_root)
         if isinstance(self.planner, ToolCallingPlanner):
             self.planner.set_rollout_recorder(self.rollout_recorder)
+        if self.visual_history is not None:
+            self.visual_history.set_rollout_recorder(self.rollout_recorder)
         if self.rollout_recorder is not None:
             self.tools.add_listener(self.rollout_recorder.record_tool_event)
         self._act_lock = threading.Lock()
@@ -99,6 +126,8 @@ class OpenEtaAgentRuntime:
             metadata=metadata,
             session_id=session_id or self.default_session_id,
         )
+        for name, payload in self.startup_facts.items():
+            self.memory.save_fact(name, payload, source="runtime_preflight")
         if self.rollout_recorder is not None and self.memory.session_id is not None:
             self.rollout_recorder.start_session(
                 session_id=self.memory.session_id,
@@ -114,10 +143,15 @@ class OpenEtaAgentRuntime:
                 "interfaces": [interface.descriptor() for interface in self.interfaces.list()],
                 "tools": [tool.name for tool in self.tools.list()],
                 "skills": [skill.name for skill in self.skills.list()],
+                "visual_history": (
+                    self.visual_history.descriptor()
+                    if self.visual_history is not None
+                    else {"enabled": False}
+                ),
             },
         )
 
-    def resume_session(self, session_id: str, *, max_events: int | None = 64) -> None:
+    def resume_session(self, session_id: str, *, max_events: int | None = None) -> None:
         self.memory.resume_session(session_id, max_events=max_events)
         if self.rollout_recorder is not None:
             self.rollout_recorder.start_session(
@@ -146,10 +180,25 @@ class OpenEtaAgentRuntime:
         with self._act_lock:
             _raise_if_execution_cancelled(cancel_event)
             self.memory.add_observation(observation)
+            visual_delta: JsonDict | None = None
+            if self.visual_history is not None:
+                visual_delta = self.visual_history.observe(observation, memory=self.memory)
             execution_metadata: JsonDict = {
                 "execution_id": execution_id,
                 "session_id": self.memory.session_id or "",
                 "task": self.memory.current_user_request or observation.task,
+                "_observation_packet_resolver": self.memory.resolve_observation_packet,
+                "_contact_authorization_resolver": (
+                    self.memory.resolve_compiled_contact_authorization
+                ),
+                "_attachment_candidate_resolver": (
+                    self.memory.resolve_active_attachment_candidate
+                ),
+                "_ik_execution_seed_resolver": self.memory.resolve_ik_execution_seed,
+                "_ik_trajectory_execution_bundle_resolver": (
+                    self.memory.resolve_ik_trajectory_execution_bundle
+                ),
+                "_controller_capabilities_resolver": self.memory.controller_capabilities,
                 "supervision_context": {
                     "memory": self.memory.planning_context(max_events=4),
                 },
@@ -163,6 +212,12 @@ class OpenEtaAgentRuntime:
                     tools=self.tools,
                     skills=self.skills,
                 )
+                if visual_delta is not None:
+                    decision.metadata["visual_delta_usage"] = {
+                        key: visual_delta.get(key)
+                        for key in ("delta_id", "status", "provider", "model", "usage")
+                        if visual_delta.get(key) is not None
+                    }
                 _raise_if_execution_cancelled(cancel_event)
                 plan = self.pipeline.compile(
                     decision,
@@ -193,6 +248,7 @@ class OpenEtaAgentRuntime:
     def _rollout_provenance(self, metadata: JsonDict | None) -> JsonDict:
         return build_rollout_provenance(
             planner=self.planner,
+            pipeline=self.pipeline,
             tools=self.tools,
             skills=self.skills,
             metadata=metadata,
@@ -204,11 +260,9 @@ class OpenEtaAgentRuntime:
             "get_memory": self._get_memory_tool,
             "delete_memory": self._delete_memory_tool,
             "compact_memory": self._compact_memory_tool,
-            "materialize_mcp_images": self._materialize_mcp_images_tool,
             "enhance_depth": self._enhance_depth_tool,
             "select_sam3_detection": self._select_sam3_detection_tool,
             "reject_sam3_detections": self._reject_sam3_detections_tool,
-            "activate_final_grasp_candidate": self._activate_final_grasp_candidate_tool,
             "python_exec": PythonExecRuntime().handler,
         }
         for name, handler in handlers.items():
@@ -265,64 +319,45 @@ class OpenEtaAgentRuntime:
         summary = self.memory.compact(max_events=max_events)
         return ToolResult(True, content=summary, details={"summary": summary})
 
-    def _materialize_mcp_images_tool(self, context: ToolExecutionContext) -> ToolResult:
-        payload = context.parameters.get("payload")
-        if payload is None:
-            payload = context.parameters.get("mcp_payload")
-        if payload is None:
-            payload = context.parameters.get("observation")
-        if not isinstance(payload, dict):
-            return make_tool_result(
-                context,
-                success=False,
-                content="materialize_mcp_images requires a dict payload.",
-                diagnostics=[{"code": "invalid_payload"}],
-            )
-
-        output_root = context.parameters.get("output_root")
-        bundle_id = context.parameters.get("bundle_id")
-        bundle = materialize_mcp_images(
-            payload,
-            output_root=str(output_root) if output_root else DEFAULT_MCP_IMAGE_OUTPUT_ROOT,
-            bundle_id=str(bundle_id).strip() if bundle_id else None,
-            session_id=artifact_session_id(context.metadata),
-        )
-        bundle_details = bundle.to_dict()
-        return ToolResult(
-            True,
-            content=f"materialized {len(bundle.images)} MCP image(s)",
-            details=make_tool_result_details(
-                context.spec,
-                {
-                    "payload": {
-                        "base64_omitted": True,
-                        "top_level_keys": sorted(str(key) for key in payload),
-                    },
-                    "output_root": str(output_root)
-                    if output_root
-                    else str(DEFAULT_MCP_IMAGE_OUTPUT_ROOT),
-                    "bundle_id": bundle_details["bundle_id"],
-                },
-                success=True,
-                outputs={
-                    "bundle_id": bundle_details["bundle_id"],
-                    "artifact_root": bundle_details["artifact_root"],
-                    "payload": bundle_details["payload"],
-                },
-                artifacts=bundle_details["images"],
-            ),
-        )
-
     def _enhance_depth_tool(self, context: ToolExecutionContext) -> ToolResult:
         rgb_path = str(context.parameters.get("rgb") or "").strip()
         depth_path = str(context.parameters.get("depth") or "").strip()
         intrinsics = context.parameters.get("intrinsics")
+        source_packet_id = str(
+            context.parameters.get("source_packet_id") or ""
+        ).strip()
+        source_frame_id = str(
+            context.parameters.get("camera_frame_id")
+            or context.parameters.get("camera_id")
+            or ""
+        ).strip()
+        public_config = context.parameters.get("config")
+
+        def finish(tool_result: ToolResult) -> ToolResult:
+            outputs = tool_result.details.get("outputs")
+            if isinstance(outputs, dict) and source_packet_id:
+                outputs["source_packet_id"] = source_packet_id
+                outputs["camera_frame_id"] = source_frame_id
+                outputs["depth_prior_resolution"] = (
+                    "matched"
+                    if context.parameters.get("prior_depth")
+                    else "absent_sensor_only"
+                )
+            if source_packet_id:
+                context.parameters = {
+                    "source_packet_id": source_packet_id,
+                    "camera_frame_id": source_frame_id,
+                    **({"config": public_config} if isinstance(public_config, dict) else {}),
+                }
+            return tool_result
         if not rgb_path or not depth_path or not isinstance(intrinsics, dict):
-            return make_tool_result(
-                context,
-                success=False,
-                content="enhance_depth requires rgb, depth, and intrinsics.",
-                diagnostics=[{"code": "invalid_depth_enhancement_request"}],
+            return finish(
+                make_tool_result(
+                    context,
+                    success=False,
+                    content="enhance_depth requires host-resolved RGB-D and intrinsics.",
+                    diagnostics=[{"code": "invalid_depth_enhancement_request"}],
+                )
             )
         try:
             rgb = _read_rgb_image(rgb_path)
@@ -374,30 +409,33 @@ class OpenEtaAgentRuntime:
                 source_sensor_confidence_path=sensor_confidence_path,
             )
         except Exception as exc:  # noqa: BLE001 - user-facing tool result.
-            return make_tool_result(
-                context,
-                success=False,
-                content=f"enhance_depth failed: {type(exc).__name__}: {exc}",
-                diagnostics=[
-                    {
-                        "code": "depth_enhancement_failed",
-                        "error_type": type(exc).__name__,
-                        "message": str(exc),
-                    }
-                ],
+            return finish(
+                make_tool_result(
+                    context,
+                    success=False,
+                    content=f"enhance_depth failed: {type(exc).__name__}: {exc}",
+                    diagnostics=[
+                        {
+                            "code": "depth_enhancement_failed",
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                    ],
+                )
             )
         artifact = artifacts.to_dict()
         candidate_intrinsics = dict(intrinsics)
         candidate_intrinsics["scale"] = 1000.0
-        return make_tool_result(
-            context,
-            success=True,
-            content=(
-                "depth enhancement completed"
-                if result.enabled
-                else f"depth enhancement produced sensor-only outputs: {result.reason}"
-            ),
-            outputs={
+        return finish(
+            make_tool_result(
+                context,
+                success=True,
+                content=(
+                    "depth enhancement completed"
+                    if result.enabled
+                    else f"depth enhancement produced sensor-only outputs: {result.reason}"
+                ),
+                outputs={
                 "enabled": result.enabled,
                 "reason": result.reason,
                 "camera_id": result.camera_id,
@@ -434,9 +472,20 @@ class OpenEtaAgentRuntime:
                 "candidate_point_cloud_npz": artifacts.point_cloud_npz,
                 "safety_point_cloud_npz": artifacts.safety_point_cloud_npz,
                 "provenance_mask_png": artifacts.provenance_mask_png,
-            },
-            artifacts=[artifact],
-            diagnostics=result.diagnostics,
+                },
+                artifacts=[artifact],
+                diagnostics=result.diagnostics,
+                semantic_outcome=(
+                    "depth_enhanced"
+                    if result.enabled
+                    else "requires_depth_alignment_repair"
+                ),
+                recovery_options=(
+                    []
+                    if result.enabled
+                    else _depth_enhancement_recovery_options(result.reason)
+                ),
+            )
         )
 
     def _select_sam3_detection_tool(self, context: ToolExecutionContext) -> ToolResult:
@@ -473,18 +522,66 @@ class OpenEtaAgentRuntime:
                 result_id=result_id,
                 detection_id=detection_id,
                 selection_source="main_agent_vlm",
+                evidence_role=str(context.parameters.get("evidence_role") or ""),
                 confidence=confidence,
                 reason=str(context.parameters.get("reason") or ""),
                 target_geometry_family=str(
                     context.parameters.get("target_geometry_family") or ""
                 ),
+                identity_anchor_id=str(
+                    context.parameters.get("identity_anchor_id") or ""
+                ),
+                identity_relation=str(
+                    context.parameters.get("identity_relation") or ""
+                ),
             )
         except ValueError as exc:
+            message = str(exc)
+            diagnostic_code = message.split(":", 1)[0] or "invalid_detection_selection"
+            outputs: JsonDict = {}
+            recovery_options: list[JsonDict] = []
+            if diagnostic_code.startswith("target_identity_"):
+                anchor = self.memory.target_identity_anchor() or {}
+                pending = self.memory.pending_sam3_selection() or {}
+                outputs = {
+                    "active_identity_anchor_id": anchor.get("anchor_id"),
+                    "pending_sam3_result_id": pending.get("result_id"),
+                    "pending_detection_id": detection_id,
+                    "identity_relation_choices": [
+                        "same_instance",
+                        "replace_misidentified_anchor",
+                    ],
+                }
+                recovery_options = [
+                    {
+                        "action": "retry_target_selection_with_identity_relation",
+                        "tool": "select_sam3_detection",
+                        "copy_parameters": {
+                            "sam3_result_id": result_id,
+                            "detection_id": detection_id,
+                            "identity_anchor_id": anchor.get("anchor_id"),
+                        },
+                        "required_choice": "identity_relation",
+                        "reason": (
+                            "compare the old and new visual evidence, then declare "
+                            "same_instance or an explicit misidentification correction"
+                        ),
+                    },
+                    {
+                        "action": "reject_pending_detections",
+                        "tool": "reject_sam3_detections",
+                        "parameters": {"sam3_result_id": result_id},
+                        "reason": "use when none of the pending masks is the intended target",
+                    },
+                ]
             return make_tool_result(
                 context,
                 success=False,
-                content=str(exc),
-                diagnostics=[{"code": "invalid_detection_selection"}],
+                content=message,
+                outputs=outputs,
+                diagnostics=[{"code": diagnostic_code}],
+                semantic_outcome=diagnostic_code,
+                recovery_options=recovery_options,
             )
         artifacts = []
         mask_ref = selected.get("mask_ref")
@@ -499,16 +596,75 @@ class OpenEtaAgentRuntime:
                     "mask_ref": mask_ref,
                 }
             )
+        source_observation = selected.get("source_observation")
+        source_observation = (
+            source_observation if isinstance(source_observation, dict) else {}
+        )
+        camera_frame_id = str(
+            source_observation.get("frame_id")
+            or selected.get("frame_id")
+            or ""
+        )
+        camera_role = str(
+            source_observation.get("role")
+            or selected.get("camera_role")
+            or ""
+        )
+        is_wrist_target = (
+            str(selected.get("evidence_role") or "") == "target_object"
+            and (
+                "wrist" in camera_frame_id.lower()
+                or "eye_in_hand" in camera_frame_id.lower()
+                or "wrist" in camera_role.lower()
+            )
+        )
+        downstream_handoff: JsonDict = {}
+        content_suffix = ""
+        if is_wrist_target:
+            downstream_handoff = {
+                "schema_version": "openeta.perception_consumer_handoff.v1",
+                "status": "materializes_in_next_planner_context",
+                "producer": "select_sam3_detection",
+                "camera_frame_id": camera_frame_id,
+                "source_packet_id": source_observation.get("packet_id")
+                or selected.get("source_packet_id"),
+                "inspect": "host_resolved_inputs.wrist_alignment",
+                "primary_consumer": "compute_wrist_alignment",
+                "fallback_consumer": "grasp_pose_estimate",
+                "instruction": (
+                    "On the next planner turn, inspect the wrist-alignment input. "
+                    "If status=ready, copy only its exact bundle_id into "
+                    "compute_wrist_alignment. If orientation or axial contact depth "
+                    "is uncertain, consume the wrist grasp_pose_estimate bundle instead."
+                ),
+                "agent_discretion": True,
+            }
+            content_suffix = (
+                " This wrist target selection materializes its downstream input on "
+                "the next planner turn: inspect host_resolved_inputs.wrist_alignment; "
+                "when ready, copy its bundle_id into compute_wrist_alignment, or use "
+                "the wrist grasp_pose_estimate bundle when orientation/depth is "
+                "uncertain."
+            )
         return make_tool_result(
             context,
             success=True,
-            content=f"Selected {detection_id} from SAM3 result {result_id}.",
+            content=(
+                f"Selected {detection_id} from SAM3 result {result_id}."
+                f"{content_suffix}"
+            ),
             outputs={
                 "result_id": result_id,
                 "selected_detection": selected,
                 "mask_ref": mask_ref,
                 "selection_source": selected.get("selection_source"),
+                "evidence_role": selected.get("evidence_role"),
                 "target_geometry_family": selected.get("target_geometry_family"),
+                **(
+                    {"downstream_consumer_handoff": downstream_handoff}
+                    if downstream_handoff
+                    else {}
+                ),
             },
             artifacts=artifacts,
         )
@@ -535,29 +691,6 @@ class OpenEtaAgentRuntime:
             outputs={"rejection": rejected},
         )
 
-    def _activate_final_grasp_candidate_tool(
-        self,
-        context: ToolExecutionContext,
-    ) -> ToolResult:
-        recovery_id = str(context.parameters.get("recovery_id") or "").strip()
-        try:
-            activated = self.memory.activate_final_grasp_candidate(
-                recovery_id=recovery_id,
-            )
-        except ValueError as exc:
-            return make_tool_result(
-                context,
-                success=False,
-                content=str(exc),
-                diagnostics=[{"code": "invalid_final_grasp_fallback"}],
-            )
-        return make_tool_result(
-            context,
-            success=True,
-            content="Activated the final highest-scoring refinable grasp candidate.",
-            outputs={"activation": activated},
-        )
-
 
 def _read_rgb_image(path: str) -> np.ndarray:
     resolved = _existing_file(path)
@@ -568,10 +701,8 @@ def _read_rgb_image(path: str) -> np.ndarray:
 def _read_depth_array(path: str, *, scale: float) -> np.ndarray:
     resolved = _existing_file(path)
     if resolved.suffix.lower() == ".npy":
-        array = np.load(resolved)
-        return np.asarray(array, dtype=np.float32)
-    image = Image.open(resolved)
-    array = np.asarray(image)
+        return np.asarray(np.load(resolved), dtype=np.float32)
+    array = np.asarray(Image.open(resolved))
     if array.ndim == 3:
         array = array[..., 0]
     if array.dtype.kind in {"u", "i"}:
@@ -583,8 +714,7 @@ def _read_optional_numeric_array(path: str) -> np.ndarray:
     resolved = _existing_file(path)
     if resolved.suffix.lower() == ".npy":
         return np.asarray(np.load(resolved), dtype=np.float32)
-    image = Image.open(resolved)
-    array = np.asarray(image)
+    array = np.asarray(Image.open(resolved))
     if array.ndim == 3:
         array = array[..., 0]
     return array.astype(np.float32)
@@ -639,6 +769,77 @@ def _depth_enhancement_config(value: object) -> DepthEnhancementConfig:
         if key in value:
             kwargs[key] = value[key]
     return DepthEnhancementConfig(**kwargs)
+
+
+def _depth_enhancement_recovery_options(reason: str) -> list[JsonDict]:
+    """Translate a safe sensor-only fallback into concrete Agent choices."""
+
+    if reason == "no_depth_prior":
+        return [
+            {
+                "action": "estimate_matching_depth_prior_then_retry",
+                "reason": (
+                    "Call estimate_depth_prior for the same source_packet_id and "
+                    "camera_frame_id, then call enhance_depth again."
+                ),
+            },
+            {
+                "action": "continue_with_sensor_depth_only",
+                "reason": "The materialized safety depth remains usable as raw sensor evidence.",
+            },
+        ]
+    if reason in {"rgb_depth_not_registered", "rgb_depth_timestamp_skew"}:
+        return [
+            {
+                "action": "observe_fresh_aligned_rgbd_then_retry",
+                "reason": (
+                    "Use one fresh packet whose RGB and depth share the same camera "
+                    "registration and timestamp envelope."
+                ),
+            },
+            {
+                "action": "continue_with_sensor_depth_only",
+                "reason": "Do not use the monocular candidate as metric geometry.",
+            },
+        ]
+    if reason == "alignment_scale_out_of_bounds":
+        return [
+            {
+                "action": "inspect_depth_prior_units_and_source_match",
+                "reason": (
+                    "The prior and sensor overlap, but their fitted metric scale is "
+                    "outside the accepted range; verify prior units/model output and "
+                    "that both artifacts came from the same packet and camera."
+                ),
+            },
+            {
+                "action": "continue_with_sensor_depth_only",
+                "reason": "The candidate prior was rejected; use only safety sensor depth.",
+            },
+        ]
+    if reason == "insufficient_alignment_pixels":
+        return [
+            {
+                "action": "acquire_view_with_more_valid_depth_overlap",
+                "reason": (
+                    "A fresh view with more mutually valid sensor/prior pixels may make "
+                    "metric alignment identifiable."
+                ),
+            },
+            {
+                "action": "continue_with_sensor_depth_only",
+                "reason": "Do not infer metric depth from an underconstrained alignment.",
+            },
+        ]
+    return [
+        {
+            "action": "continue_with_sensor_depth_only",
+            "reason": (
+                "Depth enhancement produced no trustworthy mono-filled geometry; "
+                "inspect diagnostics before deciding whether a fresh view is useful."
+            ),
+        }
+    ]
 
 
 def _intrinsics_scale(intrinsics: Mapping[str, Any]) -> float:

@@ -18,18 +18,20 @@ The worker exposes a subset of the REST API:
     POST /env/{handle}/step    {action?, num_steps?}
     POST /env/{handle}/observe
     POST /env/{handle}/render
+    POST /env/{handle}/reachability
+    POST /env/{handle}/controller-goal
 """
 
 from __future__ import annotations
 
-import argparse, asyncio, base64, io, json, math, os, queue, sys, threading, uuid, warnings
+import argparse, asyncio, base64, copy, io, json, math, os, queue, sys, threading, uuid, warnings
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import contextlib
 
 warnings.filterwarnings("ignore")
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("MS_SKIP_ASSET_DOWNLOAD_PROMPT", "1")
-os.environ.setdefault("LIBERO_DIR", "/tmp/LIBERO")
+os.environ.setdefault("LIBERO_DIR", "/home/yfzhang/nvme1/LIBERO")
 os.environ.setdefault(
     "LIBERO_DATASET_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "venvs", "libero", "assets", "datasets"),
@@ -44,6 +46,24 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 while _REPO in sys.path:
     sys.path.remove(_REPO)
 sys.path.insert(0, _REPO)
+
+# The manager intentionally strips inherited PYTHONPATH to protect package
+# resolution. A host-selected experimental Mink profile may instead expose one
+# explicit dependency directory to the LIBERO worker. It is never accepted
+# from an Agent tool parameter.
+if os.environ.get("OPENETA_LIBERO_CONTROLLER_PROFILE", "").strip().lower() == (
+    "mink_joint_velocity"
+):
+    from sim.controllers.dependency_overlay import validate_mink_dependency_overlay
+
+    _mink_dependency_path = os.environ.get(
+        "OPENETA_LIBERO_MINK_DEPENDENCY_PATH", ""
+    ).strip()
+    if _mink_dependency_path:
+        _validated_mink_dependency_path = validate_mink_dependency_overlay(
+            _mink_dependency_path
+        )
+        sys.path.insert(1, str(_validated_mink_dependency_path))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -83,6 +103,10 @@ _obs_locks_guard = threading.Lock()
 # return the last observation instead (the client must reset_env to continue).
 # Guarded implicitly by the per-handle obs lock (step/reset/close serialise).
 _done_handles: set[str] = set()
+# Exact terminal StepResult for each done handle.  Repeated step requests are
+# idempotent reads of this result: they must never replace an official positive
+# terminal reward with a newly synthesized zero.
+_terminal_step_results: dict[str, dict] = {}
 
 
 def _obs_lock_for(handle: str) -> threading.Lock:
@@ -392,22 +416,34 @@ def _env_obs_to_mcp(obs: dict) -> dict:
 def _terminated_step_result(handle: str) -> dict:
     """Build a StepResult for a handle whose episode already finished.
 
-    Returns the last cached observation (no new step) with ``terminated``
-    set, so a client that keeps calling step after done gets a clean signal
-    instead of an HTTP 500 from robosuite's "terminated episode" guard.
+    Replays the exact terminal result (no new step), so a client that keeps
+    calling step after done gets a clean and reward-preserving signal instead
+    of an HTTP 500 from robosuite's "terminated episode" guard.
     Caller must hold the per-handle obs lock.
     """
-    from adapter.protocol import EnvObservation, StepResult
-
-    obs = _last_obs.get(handle, {})
-    try:
-        env_obs = EnvObservation.from_dict(obs) if obs else EnvObservation.from_dict({})
-    except Exception:
-        env_obs = EnvObservation.from_dict({})
-    return StepResult(
-        observation=env_obs, reward=0.0, terminated=True, truncated=False,
-        info={"note": "episode already terminated — call reset_env to continue"},
-    ).to_mcp_dict()
+    cached = _terminal_step_results.get(handle)
+    if cached is None:
+        # This state should be unreachable because _done_handles and the cache
+        # are written and cleared atomically under the same per-handle lock.
+        return {
+            "error": "episode terminated but its terminal result is unavailable",
+            "handle": handle,
+            "terminated": True,
+            "truncated": False,
+            "info": {
+                "terminal_result_replayed": False,
+                "terminal_result_cache_missing": True,
+                "note": "call reset_env to continue",
+            },
+        }
+    replayed = copy.deepcopy(cached)
+    original_info = replayed.get("info")
+    replayed["info"] = {
+        **(original_info if isinstance(original_info, dict) else {}),
+        "terminal_result_replayed": True,
+        "note": "episode already terminated — replaying the terminal result; call reset_env to continue",
+    }
+    return replayed
 
 
 def _step_with_image(env, act, handle: str = "", render: bool = True) -> dict:
@@ -454,27 +490,32 @@ def _step_with_image(env, act, handle: str = "", render: bool = True) -> dict:
                     pass  # render is best-effort; don't lose the step result
         if handle:
             _last_obs[handle] = obs
-            if term or trunc:
-                _done_handles.add(handle)
         env_obs = EnvObservation.from_dict(obs)
-    # Sanitise info: drop non-serialisable values
-    safe_info: dict = {}
-    if isinstance(info, dict):
-        for k, v in info.items():
-            try:
-                json.dumps({k: v})
-                safe_info[k] = v
-            except (TypeError, ValueError):
-                safe_info[k] = str(v)
-    else:
-        safe_info = {"raw_info": str(info)}
-    return StepResult(
-        observation=env_obs,
-        reward=float(rew),
-        terminated=bool(term),
-        truncated=bool(trunc),
-        info=safe_info,
-    ).to_mcp_dict()
+        # Sanitise info: drop non-serialisable values while still holding the
+        # handle lock, then publish the done bit and its exact terminal result
+        # atomically so a concurrent repeated request cannot observe one
+        # without the other.
+        safe_info: dict = {}
+        if isinstance(info, dict):
+            for k, v in info.items():
+                try:
+                    json.dumps({k: v})
+                    safe_info[k] = v
+                except (TypeError, ValueError):
+                    safe_info[k] = str(v)
+        else:
+            safe_info = {"raw_info": str(info)}
+        result = StepResult(
+            observation=env_obs,
+            reward=float(rew),
+            terminated=bool(term),
+            truncated=bool(trunc),
+            info=safe_info,
+        ).to_mcp_dict()
+        if handle and (term or trunc):
+            _terminal_step_results[handle] = copy.deepcopy(result)
+            _done_handles.add(handle)
+        return result
 
 
 def _reset_with_image(env, seed=None, handle: str = "") -> dict:
@@ -491,6 +532,7 @@ def _reset_with_image(env, seed=None, handle: str = "") -> dict:
         if handle:
             _last_obs[handle] = obs
             _done_handles.discard(handle)  # fresh episode — stepping allowed again
+            _terminal_step_results.pop(handle, None)
         return EnvObservation.from_dict(obs).to_mcp_dict()
 
 
@@ -709,9 +751,20 @@ async def create_env(request):
     elif be == "dummy":
         adesc = "dict {action_type,code}"
     hints = {
-        "metaworld": "~6mm/step at action=1.0, use 5-10 steps for visible motion",
-        "libero": "~9mm/step at action=1.0, use 3-5 steps for visible motion",
-        "maniskill": "use 3-5 steps for visible motion",
+        "metaworld": (
+            "raw step_env only: ~6mm/step at action=1.0; use 5-10 raw steps for "
+            "visible motion. For goal-directed move_to, omit num_steps or provide "
+            "a sufficient closed-loop iteration budget."
+        ),
+        "libero": (
+            "raw step_env only: ~9mm/step at action=1.0; use 3-5 raw steps for "
+            "visible motion. For goal-directed move_to, omit num_steps or provide "
+            "a sufficient closed-loop iteration budget."
+        ),
+        "maniskill": (
+            "raw step_env only: use 3-5 steps for visible motion. For goal-directed "
+            "move_to, omit num_steps or provide a sufficient closed-loop iteration budget."
+        ),
         "robocasa": (
             "fixed Panda: arm 0:6, gripper 6"
             if adim == 7
@@ -728,6 +781,12 @@ async def create_env(request):
             control_spec = candidate
     except Exception:
         control_spec = {}
+    if be == "libero" and isinstance(control_spec.get("controller"), dict):
+        controller = control_spec["controller"]
+        adesc = (
+            f"{controller.get('configured_name', '<unknown>')} via "
+            f"{controller.get('goal_executor', '<unknown>')}"
+        )
 
     return _json_response({
         "handle": h, "env_id": eid, "action_dim": adim, "action_desc": adesc,
@@ -744,6 +803,7 @@ async def close_env(request):
         env = _envs.pop(h, None)
         _last_obs.pop(h, None)
         _done_handles.discard(h)
+        _terminal_step_results.pop(h, None)
         if env:
             if request.app.state.bench == "behavior":
                 # Sending og.shutdown() from inside this HTTP handler closes Kit's
@@ -856,6 +916,143 @@ async def observe_env(request):
     return _json_response(await _run_sim_call(_observe_with_image, env, handle=h))
 
 
+async def reachability_env(request):
+    """Run a read-only endpoint IK check against the worker-owned model."""
+
+    h = request.path_params.get("handle", "")
+    env = _envs.get(h)
+    if env is None:
+        return _json_response({"error": f"Unknown handle: {h}"}, 400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    xyz = body.get("target_xyz")
+    if not isinstance(xyz, list) or len(xyz) != 3:
+        return _json_response({"error": "target_xyz must contain three numbers"}, 400)
+
+    target_quat = body.get("target_quat_xyzw")
+    euler_deg = body.get("target_euler_xyz_deg")
+    if target_quat is None and euler_deg is not None:
+        try:
+            from scipy.spatial.transform import Rotation
+
+            target_quat = Rotation.from_euler("xyz", euler_deg, degrees=True).as_quat().tolist()
+        except Exception as exc:
+            return _json_response({"error": f"invalid target_euler_xyz_deg: {exc}"}, 400)
+
+    def _check():
+        from sim.reachability import check_endpoint_reachability
+
+        # Capture current qpos consistently with reset/step/close.  The solver
+        # uses an independent MjData and therefore never mutates the live env.
+        with _obs_lock_for(h):
+            return check_endpoint_reachability(
+                env,
+                target_xyz=xyz,
+                target_quat_xyzw=target_quat,
+                preserve_current_orientation=body.get(
+                    "preserve_current_orientation", True
+                ),
+                position_tolerance_m=body.get("position_tolerance_m", 0.002),
+                orientation_tolerance_rad=body.get("orientation_tolerance_rad", 0.05),
+                max_attempts=body.get("max_attempts", 24),
+                max_nfev_per_attempt=body.get("max_nfev_per_attempt", 300),
+                timeout_s=body.get("timeout_s", 10.0),
+            )
+
+    return _json_response(await _run_sim_call(_check))
+
+
+async def controller_goal_env(request):
+    """Execute one host-selected worker-local Cartesian goal controller."""
+
+    h = request.path_params.get("handle", "")
+    env = _envs.get(h)
+    if env is None:
+        return _json_response({"error": f"Unknown handle: {h}"}, 400)
+    body = _safe_json_body(await request.body())
+    target_xyz = body.get("target_xyz")
+    if not isinstance(target_xyz, list) or len(target_xyz) != 3:
+        return _json_response({"error": "target_xyz must contain three numbers"}, 400)
+    target_quat = body.get("target_quat_xyzw")
+    euler_deg = body.get("target_euler_xyz_deg")
+    if target_quat is None and euler_deg is not None:
+        try:
+            from scipy.spatial.transform import Rotation
+
+            target_quat = Rotation.from_euler(
+                "xyz", euler_deg, degrees=True
+            ).as_quat().tolist()
+        except Exception as exc:
+            return _json_response({"error": f"invalid target_euler_xyz_deg: {exc}"}, 400)
+
+    def _execute():
+        from sim.controllers.mink_goal import execute_libero_mink_goal
+
+        result = execute_libero_mink_goal(
+            env,
+            target_xyz=target_xyz,
+            target_quat_xyzw=target_quat,
+            preserve_current_orientation=body.get(
+                "preserve_current_orientation", True
+            ),
+            max_steps=body.get("max_steps", 100),
+            position_tolerance_m=body.get("position_tolerance_m", 0.002),
+            orientation_tolerance_rad=body.get("orientation_tolerance_rad", 0.05),
+            gripper_command=body.get("gripper_command", 0.0),
+            enable_collision_check=body.get("enable_collision_check", True) is not False,
+            contact_authorization=(
+                dict(body["contact_authorization"])
+                if isinstance(body.get("contact_authorization"), dict)
+                else None
+            ),
+            attachment_proxy=(
+                dict(body["attachment_proxy"])
+                if isinstance(body.get("attachment_proxy"), dict)
+                else None
+            ),
+            ik_execution_seed=(
+                dict(body["ik_execution_seed"])
+                if isinstance(body.get("ik_execution_seed"), dict)
+                else None
+            ),
+            motion_execution_condition=body.get("motion_execution_condition", "A"),
+            step_callback=lambda action, render: _step_with_image(
+                env,
+                action,
+                handle=h,
+                render=render,
+            ),
+        )
+        # Always return a fresh final visual observation, even when the short
+        # controller run completed before the periodic render cadence.
+        result["observation"] = _observe_with_image(env, handle=h)
+        return result
+
+    try:
+        result = await _run_sim_call(_execute)
+        _env_errors.pop(h, None)
+        return _json_response(result)
+    except Exception as exc:
+        import traceback as _tb
+
+        _tb.print_exc()
+        error = f"Worker-local controller goal failed: {type(exc).__name__}: {exc}"
+        _env_errors[h] = error
+        return _json_response(
+            {
+                "ok": False,
+                "code": "worker_controller_goal_failed",
+                "error": error,
+                "steps_executed": 0,
+                "reached_target": False,
+                "stop_reason": "controller_error",
+            },
+            500,
+        )
+
+
 async def render_env(request):
     h = request.path_params.get("handle", "")
     env = _envs.get(h)
@@ -929,6 +1126,8 @@ app = Starlette(routes=[
     Route("/env/{handle}/step", step_env, methods=["POST"]),
     Route("/env/{handle}/observe", observe_env, methods=["POST"]),
     Route("/env/{handle}/render", render_env, methods=["POST"]),
+    Route("/env/{handle}/reachability", reachability_env, methods=["POST"]),
+    Route("/env/{handle}/controller-goal", controller_goal_env, methods=["POST"]),
     Route("/render_all", render_all_envs, methods=["POST"]),
 ])
 

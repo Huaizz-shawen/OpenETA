@@ -3,6 +3,10 @@
 This document defines the first structured agent-command schema and execution
 pipeline for the lightweight OpenETA agent runtime.
 
+Cross-tool result projection, packet-validity semantics, no-progress reflection,
+and the durable rollout auditor are specified in
+[`tool-contract-audit-and-grasp-recovery.md`](tool-contract-audit-and-grasp-recovery.md).
+
 ## Goal
 
 The agent should not send an unstructured dict to the simulator. The primary
@@ -82,7 +86,7 @@ Primary `tool_call` example:
     "kind": "tool_call",
     "name": "sam3",
     "parameters": {
-      "image": "front_rgbd",
+      "source_packet_id": "env-abc-observation-0001",
       "prompt": "red cube"
     },
     "reasoning": "Locate the target object before selecting a grasp."
@@ -94,7 +98,7 @@ Primary `tool_call` example:
       "kind": "tool_call",
       "name": "sam3",
       "parameters": {
-        "image": "front_rgbd",
+        "source_packet_id": "env-abc-observation-0001",
         "prompt": "red cube"
       },
       "status": "pending",
@@ -125,7 +129,7 @@ Restricted `tool_call` batch example:
   "name": "tool_batch",
   "parameters": {
     "calls": [
-      {"name": "sam3", "parameters": {"image": "front_rgbd", "prompt": "cube"}},
+      {"name": "sam3", "parameters": {"source_packet_id": "env-abc-observation-0001", "prompt": "cube"}},
       {"name": "hand_pose_database", "parameters": {"object": "cube", "task": "pick"}}
     ]
   }
@@ -136,6 +140,35 @@ This is valid because both tools are read-only or planning helpers. A batch that
 contains a world-mutating tool such as `lower_body_control_policy` is compiled
 as `blocked`.
 
+The `EnvAction`/`AgentCommand` JSON above is the internal, post-parse logging
+shape. The live main-planner wire format is XML:
+
+```xml
+<decision>
+  <kind>tool_call</kind>
+  <name>python_exec</name>
+  <reasoning>Inspect the persisted result.</reasoning>
+  <parameters>
+    <code><![CDATA[
+result = artifacts.read_json('/workspace/result.json')
+]]></code>
+  </parameters>
+</decision>
+```
+
+The response must contain exactly one `<decision>` with `kind`, `name`,
+`reasoning`, and `parameters`. Tool arguments are named children of
+`parameters`; an argument-free call uses `<parameters/>`. Repeated `<item>`
+children encode lists and named children encode nested objects. Scalars may use
+`type="integer"`, `type="number"`, `type="boolean"`, or `type="null"`.
+Multi-line code and quoted text should use CDATA. `tool_batch` uses repeated
+`<call>` children under `<calls>`, each with its own `name` and `parameters`.
+
+`ToolCallingPlanner` converts XML to the existing internal decision dict before
+schema validation and rollout recording. Host-generated failure payloads and
+deterministic test fixtures may still provide an already-parsed dict. Isolated
+sub-agents retain their explicit JSON contracts and JSON response mode.
+
 ## Pipeline Stages
 
 The default runtime stages are:
@@ -144,12 +177,14 @@ The default runtime stages are:
 2. `ToolCallingPlanner`: builds bounded `tool_context` from the current
    observation, session task, memory summary, tool references, skill metadata,
    selected markdown skill guidance, and execution rules.
-3. `PlannerBackend`: returns one JSON decision payload from a placeholder,
+3. `PlannerBackend`: returns one decision payload from a placeholder,
    deterministic fixture, callable SDK/API wrapper, future commercial API, or
-   local LLM/VLM backend.
-4. Backend validation: `ToolCallingPlanner` parses JSON, validates command
-   kind, tool/skill names, parameters, and bounded code-policy requirements,
-   then retries with validation feedback before falling back to
+   local LLM/VLM backend. The live main planner emits XML; fixture backends may
+   return the parsed dict directly.
+4. Backend validation: `ToolCallingPlanner` parses XML into the internal
+   `{kind, name, parameters, reasoning}` shape, validates command kind,
+   tool/skill names, parameters, and bounded code-policy requirements, then
+   retries with validation feedback before falling back to
    `response::ask_human`.
 5. `ActionPipeline`: normalizes that decision into a `CommandRequest`.
 6. Compilation: registered tool handlers may execute immediately and return a
@@ -173,7 +208,7 @@ successful or failed return into the same `ToolResult.details` envelope:
   "effect": "read_only",
   "result_type": "perception",
   "success": true,
-  "parameters": {"image": "front", "prompt": "cube"},
+  "parameters": {"source_packet_id": "env-abc-observation-0001", "prompt": "cube"},
   "outputs": {
     "masks": [{"mask_id": "mask-cube-001", "label": "cube", "score": 0.99}]
   },
@@ -231,31 +266,32 @@ refresh attempts without a snapshot truncate the episode with
 `fresh_observation_unavailable`, preventing an unbounded retry loop. Historical
 images remain in trace/memory but are never exposed as the current frame.
 
-### SAM3 detection selection obligation
+### SAM3 detection selection evidence
 
 The agent-facing `sam3` ToolSpec has two explicit modes. `mode="text"` (the
-default) consumes one local image path plus a natural-language `prompt`;
-`mode="points"` consumes one local image path plus 1–64 top-left pixel points
+default) consumes one session-scoped `source_packet_id` plus a natural-language
+`prompt`; `mode="points"` consumes the same packet reference plus 1–64 top-left pixel points
 with normalized `{x, y, label}` fields, where label `1` is foreground and `0`
 is background and at least one foreground point is required. Prompt and point
-inputs are mutually exclusive. MolmoPoint results are not passed through
+inputs are mutually exclusive. The host resolves the packet to an exact RGB
+artifact and aligned source observation. Packet ids are unique within the
+active Agent session; an individual image is identified internally by
+`(source_packet_id, camera_frame_id, kind)`. Unknown ids, missing artifacts,
+ambiguous cameras, duplicate ids, and path/id mismatches fail closed. MolmoPoint results are not passed through
 verbatim: the planner selects `image_sources[image_index]` and maps
 `pixel_x/pixel_y` to `x/y` before calling SAM3.
 
 SAM3 detections are ranked by score while preserving `backend_index` and a
 stable ranked detection id. Score is only a ranking hint. Every non-empty SAM3
-result creates a durable `selection_obligation`, including the single-candidate
-case. The obligation contains the original image, candidate-specific overlay or
+result creates durable `pending_target_selection` evidence, including the single-candidate
+case. The evidence contains the original image, candidate-specific overlay or
 crop references, and a contact sheet so the main agent explicitly confirms the
 mask before downstream use.
 
-For backward compatibility, the standalone text-mode handler still exposes its
-sole candidate through `selected_detection` and reports
-`selection_required=false` when exactly one detection is returned. That field
-is a handler convenience, not a closed-loop runtime bypass: `AgentMemory`
-creates the semantic-confirmation obligation for every non-empty result before
-targeted grasping or world-mutating execution. Point mode always has three
-candidates and therefore never uses the single-candidate convenience.
+Every non-empty result reports `selection_required=true` and
+`selected_detection=null`, including the single-candidate case. `AgentMemory`
+creates the matching semantic-confirmation record before targeted grasping or
+world-mutating execution; there is no handler-level auto-selection bypass.
 
 Point mode always returns exactly three score-ranked mask candidates and never
 auto-selects one. The handler verifies the echoed points, binary mask geometry,
@@ -263,38 +299,32 @@ candidate ranks and backend indices, overlays, and coordinate metadata before
 materializing the result; any inconsistency rejects the complete response.
 
 The next VLM planner request attaches the original image and contact sheet as
-multimodal image parts. The main agent resolves the obligation with
+multimodal image parts. The main agent resolves the open question with
 `select_sam3_detection(sam3_result_id, detection_id, ...)`. The handler validates
-that both ids belong to the pending result and records the selected mask.
-Targeted AnyGrasp, GraspGenX, and world-mutating tools are blocked while an
-obligation is pending. After selection, both grasp predictors must use the
-selected mask; GraspGenX consumes the complete SAM3 artifact so the handler can
-also validate `source_image`. This is a planning obligation rather than a
-safety/failure checker verdict.
+that both ids belong to the pending result and records the selected mask under
+the SAM3 request's explicit `evidence_role`. `target_object` is the compatible
+default; `placement_region` retains a receptacle independently. Starting or
+resolving one role never deletes the other role's mask or source-observation
+bundle, and a selection cannot change the role declared by its pending result.
+The first target selection creates `openeta.target_identity_anchor.v1`. A later
+target selection from different detection evidence must copy its exact
+`identity_anchor_id` and declare either `identity_relation=same_instance` or
+`identity_relation=replace_misidentified_anchor`. The former is an auditable
+cross-view identity confirmation; the latter requires a concrete correction
+reason, creates a new anchor, and cannot override an exact reference-verifier
+match. Missing or mismatched identity parameters leave the SAM3 selection
+pending and return executable correction guidance.
+Targeted AnyGrasp and GraspGenX may consume only a mask whose semantic selection
+has been explicitly recorded; an unresolved result is rejected as unverified
+provenance, with the result id and reason returned to the Agent. After selection,
+both predictors must use that exact mask. This is evidence integrity, not an
+instruction to call a particular tool next.
 
-AnyGrasp and GraspGenX pose ambiguity use the same existing greedy policy.
-
-Physical gripper-width rejection has a bounded host-owned recovery path. When
-every raw candidate from a successful estimator response exceeds the calibrated
-Panda width limit, memory records the backend, camera artifact, and outcome.
-The planner then segments the same target on each remaining aligned RGB-D view
-and retries the normalized `grasp_pose_estimate` facade. After all views are
-exhausted it passes an `excluded_backends` hint to the facade, which skips the
-over-width backend and tries the next compatible estimator. This obligation is
-dispatched before unchanged-scene ROI recovery, so width exhaustion cannot lock
-both perception and motion. Once all compatible backends are recorded as
-over-width, recovery ends explicitly instead of re-entering validation retries.
-Candidates are normalized in score-descending order and memory exposes
-`grasp_candidate_policy` with one active candidate. A later successful
-inference replaces the active policy while older results remain in history.
-Rank 0 is tried first. The candidate ID survives
-`camera_pose_to_world` and must be preserved in the complete world pose passed
-to safety and motion tools. A safety rejection or motion failure linked to that
-ID records the rejection and activates the next rank. Input, calibration,
-transport, and unrelated tool failures do not consume a candidate. Exhaustion
-requires fresh observation or grasp generation. A successful candidate-linked
-`move_to` marks the queue accepted and ends its gate scope, preventing stale
-grasp state from constraining later place or retreat motions.
+Candidates are normalized in score-descending order and persisted in full. The
+Agent chooses among them using current visual evidence, calibration, geometry,
+checker results, and its own attempt notes. Candidate IDs survive compilation,
+motion, review, and receipts. The host records outcomes but never advances a
+queue, activates a fallback, or dispatches a retry sequence.
 
 The independent agent-facing `graspgenx` ToolSpec is bound only when the
 `openeta-graspgenx` (or `graspgenx`) MCP URL is configured. It requires local
@@ -351,24 +381,39 @@ tool-name mapping so the planner-facing name can stay stable even if the
 simulator-side MCP tool is named differently. The current remote simulator MCP
 server maps `observe -> render_env`, `move_to -> move_to`; and
 `gripper_control` is routed to `gripper_open` or `gripper_close` according to
-the requested gripper position.
+the requested binary position (`0=closed`, `1=open`); fractions are rejected.
+The close/open command is latched across subsequent motion. Planner context
+reports the binary commanded state separately from continuous measured aperture
+and from attachment evidence.
+
+Simulator safety requests privileged object geometry internally while preserving
+the public `include_objects` boundary. After a non-empty close, object/EEF
+co-motion promotes a tentative target to an attached collision proxy. The proxy
+is checked against scene geometry before each carry batch, with a receptacle
+interior corridor allowing centred insertion but rejecting rim overlap. These
+safety details do not become task-stage state.
 
 Environment creation is a stable AgentTool operation. `create_simulator_env`
 is the only planner-facing creation path and owns the MCP
 `create_env -> reset_env` sequence, 512x512 defaults, artifact materialization,
-and active handle/session synchronization. The generic `python_exec` MCP helper
-rejects direct `create_env` calls so creation cannot bypass this lifecycle.
-Low-frequency discovery and experimental MCP calls such as `search_envs` may
-still use `mcp.call_tool(name, arguments)` from restricted `python_exec`.
+and active handle/session synchronization. Environment cleanup and simulator
+control likewise use stable AgentTools. The restricted `python_exec` runtime has
+no Simulator MCP client, so code cannot bypass those lifecycles.
 
-`python_exec` defaults to the restricted in-process globals. A request for
+`python_exec` is a `planning` tool for coding-agent-style inspection, filtering,
+computation, and derived artifacts. It can read the full current session tree
+(rollout, working memory, and artifacts), while writes are confined to the
+session sandbox. Complete high-cardinality outputs such as grasp or placement
+candidate lists are persisted as immutable JSON; working memory carries a
+bounded preview, count, truncation flag, and queryable artifact reference. A
+request for
 `sandbox="outside_sandbox"` requires explicit approval for each invocation and
 runs in a disposable host subprocess using the current OpenETA Python
 interpreter and working directory. It has host-level imports, filesystem, and
 network permissions, receives only JSON observation/parameter inputs, does not
-receive in-process MCP or artifact helper objects, and is terminated when its
-bounded timeout expires. This escape path is general-purpose and is not needed
-for configured simulator MCP operations.
+receive in-process AgentTool or artifact helper objects, and is terminated when
+its bounded timeout expires. Because normal `python_exec` has `planning` effect,
+its feedback does not require a fresh simulator observation.
 
 The remote simulator MCP server currently exposes stable environment-level MCP
 tools such as `create_env`, `reset_env`, `step_env`, `render_env`, and
@@ -390,6 +435,22 @@ world-frame poses before control, including OpenCV grasp pose to OpenGL sim
 camera conversions when required. Simulator control tools such as `move_to`
 should receive world-frame targets only.
 
+For AnyPlace, the planner-facing conversion contract is reference-only:
+`camera_pose_to_world({placement_result_id, candidate_id})`. A successful
+AnyPlace call stores the five candidates and their immutable source observation
+lineage in host memory. The pipeline resolves the chosen `place_grasp_pose` and
+the original packet's camera extrinsics atomically. Mixed calls that combine
+these IDs with model-authored pose or calibration fields are rejected. The
+generic explicit-pose conversion form remains available for non-AnyPlace
+geometry operations.
+
+The resolved AnyPlace transform also returns
+`openeta.placement_world_reference.v1`. It explicitly marks the world pose as a
+low release geometric reference with `execution_authorized=false`; no fixed
+carry script or fabricated clearance is implied. The Agent proposes waypoints
+from current visual/EEF evidence, while exact-pose IK and controller-side
+trajectory/attached-object collision checks remain the execution boundary.
+
 Any test, smoke run, or integration runner that calls `create_env` against a
 remote simulator MCP server must call `close_env` in a `finally` block once the
 test is done. Remote env handles consume simulator resources on another
@@ -404,8 +465,11 @@ transport boundary, but they must not be copied into planner context,
 multi-turn memory, or downstream tool parameters because they can dominate the
 context window.
 
-Agent-side simulator facades and MCP-backed tool handlers should run
-`materialize_mcp_images` before exposing an observation to the planner. The
+Agent-side simulator facades and MCP-backed tool handlers should run the
+host-internal `materialize_mcp_images()` utility before exposing an observation
+to the planner. It is deliberately not registered as a main-Agent tool because
+the Agent never receives raw MCP base64 payloads and therefore has no valid
+reason to call it. The
 materializer writes each image to `outputs/mcp_images/runs/<bundle_id>/` by
 default, removes the inline base64 payload, and inserts lightweight references
 such as:
@@ -444,7 +508,10 @@ This is the current placeholder for future safety/failure sub-agents:
   `{"move_to": "ik_preview_check"}` runs `ik_preview_check` before the
   world-mutating move. If the checker is pending, failed, or returns
   `success=false`, the target tool call is skipped and the command is marked
-  `blocked`. CLI pre-check gates are deliberately opt-in through the
+  `blocked`. The rejection always carries `openeta.gate_repair.v1`, including
+  the complete checker call/result, violated invariant, rejected parameters,
+  current evidence ids, and executable recovery calls. Empty skipped-call
+  feedback is a contract failure. CLI pre-check gates are deliberately opt-in through the
   `OPENETA_PRE_SAFETY_CHECKS` JSON object because its default safety handlers
   are deterministic placeholders, not real safety backends.
 - `post_failure_checks`: lists target tools that should trigger a post-tool
@@ -455,6 +522,11 @@ This is the current placeholder for future safety/failure sub-agents:
 - A blocked or failed pipeline also writes a bounded `recovery_feedback` memory
   event. Its compact command status, request, tool result, and checker metadata
   are visible in the next planner turn for explicit replan/recovery.
+
+Batch-level rejections use the same repair schema per blocked member. No gate
+uses a manipulation-stage label as evidence: later motion is evaluated from the
+actual EEF state reported by the previous receipt, not from the previous
+requested target.
 
 The hook output deliberately stays in `metadata.checker_results` and existing
 `PipelineCall` records. A final standalone `SafetyVerdict` / `FailureVerdict`
@@ -526,6 +598,10 @@ Default runtime policy:
   a structured `failure_reason`; the agent can still end an episode through
   `response::task_complete`, while environment/checker feedback can force
   `terminated=True` or `truncated=True` through `StepResult`.
+- Evaluation specs may set `recovery_turns_per_branch` and
+  `max_recovery_turns`. Only a distinct post-close compiled-grasp branch switch
+  grants turns, so repeated perception and duplicate evidence cannot consume an
+  unbounded extension.
 - A runner deadline actively abandons a blocked turn, requests environment
   close, and prevents its late result from becoming an `EpisodeStep`. Missing
   provider token usage falls back to the shared TUI token estimator and records
@@ -553,7 +629,7 @@ planner = ToolCallingPlanner(
         {
             "kind": "tool_call",
             "name": "sam3",
-            "parameters": {"image": "front", "prompt": "cube"},
+            "parameters": {"source_packet_id": "env-abc-observation-0001", "prompt": "cube"},
             "reasoning": "Segment the target before grasp planning.",
         }
     )
@@ -568,8 +644,12 @@ from agent.runtime.planner import ToolCallingPlanner
 
 
 def call_model(request: PlannerBackendRequest) -> str:
-    # Replace this with provider SDK/API code. Return JSON text or a dict.
-    return '{"kind": "response", "name": "talk", "parameters": {"message": "demo"}, "reasoning": "demo"}'
+    # Replace this with provider SDK/API code. Return main-planner XML or a dict.
+    return (
+        "<decision><kind>response</kind><name>talk</name>"
+        "<reasoning>demo</reasoning>"
+        "<parameters><message>demo</message></parameters></decision>"
+    )
 
 
 planner = ToolCallingPlanner(CallablePlannerBackend(call_model, provider="local"))

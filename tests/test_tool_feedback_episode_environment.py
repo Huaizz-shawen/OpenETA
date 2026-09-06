@@ -12,12 +12,15 @@ from agent.runtime.episode import (
     OpenEtaEpisodeRunner,
     ToolFeedbackEpisodeEnvironment,
 )
+from agent.runtime.checkers import CheckerSubagentConfig
 from agent.runtime.memory import AgentMemory
 from agent.runtime.parallel import classify_episode_result
+from agent.runtime.pipeline import ActionPipeline
 from agent.runtime.planner import PlannerDecision, ToolCallingPlanner
 from agent.runtime.runtime import OpenEtaAgentRuntime
 from agent.runtime.skills import build_default_skill_registry
 from agent.tools.registry import (
+    ToolResult,
     build_default_tool_registry,
     make_tool_result,
 )
@@ -106,7 +109,7 @@ def _observation_response(*, reward: float = 0.0, terminated: bool = False) -> d
 def test_untrusted_tool_cannot_publish_environment_receipt() -> None:
     tools = build_default_tool_registry()
     tools.bind_handler(
-        "scene_detector",
+        "get_memory",
         lambda context: make_tool_result(
             context,
             success=True,
@@ -120,7 +123,7 @@ def test_untrusted_tool_cannot_publish_environment_receipt() -> None:
         ),
     )
 
-    result = tools.call("scene_detector", {})
+    result = tools.call("get_memory", {})
 
     assert "environment_receipt" not in result.details
     assert "host_provenance" not in result.details
@@ -224,7 +227,7 @@ def test_world_mutation_without_snapshot_hides_old_frame_and_host_observes(
     )
     assert decision.action_type == "tool_call"
     assert decision.action == "observe"
-    assert decision.metadata["execution_model"] == "host_obligation_dispatch"
+    assert decision.metadata["execution_model"] == "host_invariant_dispatch"
 
     with tools.execution_scope(
         {"execution_id": "episode-1", "session_id": "agent-1"}
@@ -343,6 +346,55 @@ def test_libero_success_requires_same_execution_trusted_receipt(
     )
 
 
+def test_terminal_receipt_is_not_overwritten_within_one_action() -> None:
+    def trusted_call(name: str, *, reward: float) -> dict:
+        return {
+            "name": name,
+            "result": {
+                "success": True,
+                "details": {
+                    "host_provenance": {"authority": "environment"},
+                    "environment_receipt": {
+                        "schema_version": "openeta.environment_receipt.v1",
+                        "execution_id": "episode-1",
+                        "agent_session_id": "agent-1",
+                        "simulator_session_id": "sim-session",
+                        "handle": "env-1",
+                        "reward_present": True,
+                        "reward": reward,
+                        "terminated": True,
+                        "truncated": False,
+                        "observation_fresh": False,
+                    },
+                },
+            },
+        }
+
+    environment = ToolFeedbackEpisodeEnvironment()
+    environment.reset(
+        task="pick cube",
+        metadata={"execution_id": "episode-1", "agent_session_id": "agent-1"},
+    )
+    action = EnvAction(
+        action_type="tool_call",
+        command={
+            "request": {"kind": "tool_call", "name": "move_to"},
+            "tool_calls": [
+                trusted_call("move_to", reward=1.0),
+                trusted_call("repeated_step", reward=0.0),
+            ],
+        },
+    )
+
+    step = environment.step(action)
+
+    assert step.reward == 1.0
+    assert step.terminated is True
+    assert step.info["rejected_environment_receipts"] == [
+        {"reason": "environment_receipt_after_terminal_state"}
+    ]
+
+
 def test_receipt_from_another_execution_is_rejected(tmp_path: Path) -> None:
     tools = bind_simulator_mcp_tool_handlers(
         build_default_tool_registry(),
@@ -436,6 +488,21 @@ def test_runner_auto_observes_after_world_mutation_without_snapshot(
         ),
         tool_names=("observe", "move_to"),
     )
+    tools.bind_handler(
+        "ik_preview_check",
+        lambda _context: ToolResult(
+            True,
+            content="IK preview reachable.",
+            details={
+                "operational_success": True,
+                "semantic_outcome": "ik_feasible",
+                "outputs": {
+                    "ik_preview_receipt": {"classification": "feasible"}
+                },
+            },
+        ),
+        replace=True,
+    )
 
     class OneMovePlanner(ToolCallingPlanner):
         def plan(self, observation, *, memory, tools, skills):
@@ -464,6 +531,11 @@ def test_runner_auto_observes_after_world_mutation_without_snapshot(
             )
         ),
         tools=tools,
+        pipeline=ActionPipeline(
+            checker_subagents=CheckerSubagentConfig(
+                pre_safety_checks={"move_to": "ik_preview_check"}
+            )
+        ),
         rollout_enabled=False,
     )
     runner = OpenEtaEpisodeRunner(
@@ -480,7 +552,7 @@ def test_runner_auto_observes_after_world_mutation_without_snapshot(
         episode.steps[1].action.command["metadata"]["planner_metadata"][
             "execution_model"
         ]
-        == "host_obligation_dispatch"
+        == "host_invariant_dispatch"
     )
     assert episode.steps[1].step_result.reward == 1.0
     assert episode.terminated is True

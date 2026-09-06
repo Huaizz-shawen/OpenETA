@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -22,42 +23,95 @@ from agent.runtime.calibration_registry import (
     DEFAULT_GRASP_CALIBRATION_PROFILE,
     load_grasp_calibration_capabilities,
 )
+from agent.runtime.structured_artifacts import (
+    load_structured_tool_output,
+    materialize_structured_tool_output,
+)
+from agent.runtime.depth_contract import target_depth_cutoff_factor
+from agent.runtime.memory_migrations import (
+    is_removed_task_policy_key,
+    purge_removed_task_policy_facts,
+)
+from agent.runtime.observation_packets import (
+    ObservationPacketResolutionError,
+    build_observation_packet_entries,
+    find_packet_id_for_path,
+    find_packet_reference_for_path,
+    packet_integrity_fingerprint,
+    resolve_packet_source,
+)
+from agent.tools.grasp_geometry import (
+    GraspGeometryError,
+    assess_target_mask_quality,
+    rebase_camera_direction,
+    rebase_camera_grasp_candidate,
+    world_up_direction_camera,
+)
 
 
 PENDING_SAM3_SELECTION_KEY = "pending_sam3_selection"
 SELECTED_SAM3_DETECTION_KEY = "selected_sam3_detection"
+SELECTED_SAM3_DETECTIONS_KEY = "selected_sam3_detections"
 PENDING_REFERENCE_LOCALIZATION_KEY = "pending_reference_localization"
 REFERENCE_LOCALIZATION_FAILURE_KEY = "reference_localization_failure"
 TARGET_LOCALIZATION_BUDGET_KEY = "target_localization_budget"
 TARGET_ASSET_REFERENCE_KEY = "target_asset_reference"
+TARGET_IDENTITY_ANCHOR_KEY = "target_identity_anchor"
 SAM3_NO_DETECTION_KEY = "sam3_no_detection"
-GRASP_CANDIDATE_POLICY_KEY = "grasp_candidate_policy"
-LEGACY_ANYGRASP_CANDIDATE_POLICY_KEY = "anygrasp_candidate_policy"
-GRASP_REESTIMATION_KEY = "grasp_reestimation"
-GRASP_LIFT_PROBE_KEY = "grasp_lift_probe"
+SAM3_NO_DETECTIONS_KEY = "sam3_no_detections"
 ARTICULATED_ATTACHMENT_PROBE_KEY = "articulated_attachment_probe"
-GRASP_EXECUTION_KEY = "grasp_execution"
-GRASP_RECOVERY_KEY = "grasp_recovery"
-GRASP_ESTIMATION_RECOVERY_KEY = "grasp_estimation_recovery"
 GRIPPER_COMMAND_STATE_KEY = "gripper_command_state"
-ATTACHMENT_GATE_KEY = "attachment_gate"
-PLACEMENT_RELEASE_KEY = "placement_release"
-COMPLETED_PLACEMENT_SUBGOALS_KEY = "completed_placement_subgoals"
+ATTACHMENT_EVIDENCE_KEY = "attachment_evidence"
 MOTION_RECONCILIATION_KEY = "motion_reconciliation"
+IK_PREVIEW_RECEIPTS_KEY = "ik_preview_receipts"
+CONTROLLER_CAPABILITIES_KEY = "controller_capabilities"
+OBSERVED_OBJECT_SCENE_CHANGE_KEY = "observed_object_scene_change"
 SCENE_EPOCH_KEY = "scene_epoch"
+OBJECT_SCENE_EPOCH_KEY = "object_scene_epoch"
+ROBOT_MOTION_EPOCH_KEY = "robot_motion_epoch"
+GRASP_PROVENANCE_KEY = "grasp_provenance"
+GRASP_INPUT_BUNDLES_KEY = "grasp_input_bundles"
+WRIST_ALIGNMENT_BUNDLES_KEY = "wrist_alignment_bundles"
+ANYPLACE_INPUT_BUNDLES_KEY = "anyplace_input_bundles"
+PLACEMENT_WORLD_REFERENCE_KEY = "placement_world_reference"
+GRASP_ADJUSTMENT_BUDGET_KEY = "grasp_adjustment_budget"
 TRANSITION_LEDGER_KEY = "transition_ledger"
+TOOL_HEALTH_KEY = "tool_health"
 ACTIVE_ENVIRONMENT_TASK_KEY = "active_environment_task"
-GRASP_LIFT_PROBE_DISTANCE_M = 0.08
-GRASP_FULL_LIFT_DISTANCE_M = 0.08
-GRASP_RECOVERY_RETREAT_DISTANCE_M = 0.12
-GRASP_CANDIDATE_MAX_ATTEMPTS = 3
-ARTICULATED_HANDLE_APPROACH_MODES = ("top_down", "front", "side")
+LATEST_COMPILED_CONTACT_EXECUTION_KEY = "latest_compiled_contact_execution"
+LATEST_COMPILED_CLEARANCE_EXECUTION_KEY = "latest_compiled_clearance_execution"
+# Closing is a finger-only action and the Agent receives fresh dual-view evidence
+# after contact motion.  Keep an independent residual envelope, but do not make
+# it tighter than the centimetre-scale execution accuracy of the supported
+# controllers; an overly strict 5 mm veto prevented visually valid closes after
+# otherwise safe contact reaches.
+COMPILED_CONTACT_CLOSE_POSITION_TOLERANCE_M = 0.01
+COMPILED_CONTACT_CLOSE_ORIENTATION_TOLERANCE_RAD = 0.30
+# A clearance point is a geometric route anchor, not the final contact pose.  A
+# controller receipt that misses only inside this envelope can still support a
+# subsequent approach-corridor check; larger misses remain explicit failures.
+COMPILED_CLEARANCE_POSITION_TOLERANCE_M = 0.01
+COMPILED_CLEARANCE_ORIENTATION_TOLERANCE_RAD = 0.30
+# A long contact move must enter along the estimator's approach axis.  This is
+# a geometric safety/evidence invariant, not a grasp-stage requirement: the
+# Agent remains free to choose any number and meaning of preceding waypoints.
+COMPILED_CONTACT_NEAR_FIELD_RADIUS_M = 0.04
+COMPILED_CONTACT_APPROACH_CORRIDOR_RADIUS_M = 0.025
+COMPILED_CONTACT_APPROACH_MIN_COSINE = 0.94
+# Entering the object while the wrist is still making a large rotation can let
+# an open finger or palm push the target away even when the Cartesian approach
+# corridor is correct.  This is a pose-envelope invariant, not a task stage:
+# the Agent remains free to align at any safe waypoint or choose another grasp.
+COMPILED_CONTACT_ENTRY_ORIENTATION_TOLERANCE_RAD = 0.30
 GRASP_REFERENCE_POSITION_TOLERANCE_M = 0.05
 GRASP_REFERENCE_ORIENTATION_TOLERANCE_DEG = 20.0
-TRANSITION_LEDGER_LIMIT = 32
+GRASP_ADJUSTMENT_STEP_LIMIT_M = 0.02
+GRASP_ADJUSTMENT_CUMULATIVE_LIMIT_M = 0.10
+GRASP_ADJUSTMENT_EPSILON_M = 1e-6
 GRASP_GEOMETRY_FAMILIES = {
     "upright_can",
     "upright_bottle",
+    "lying_bottle",
     "boxed_item",
     "bowl",
     "apple",
@@ -66,6 +120,41 @@ GRASP_GEOMETRY_FAMILIES = {
     "other",
     "unknown",
 }
+DEFAULT_SAM3_EVIDENCE_ROLE = "target_object"
+SAM3_EVIDENCE_ROLES = frozenset({DEFAULT_SAM3_EVIDENCE_ROLE, "placement_region"})
+INFRASTRUCTURE_FAILURE_CODES = frozenset(
+    {
+        "mcp_timeout",
+        "mcp_connection_error",
+        "mcp_transport_error",
+        "mcp_call_failed",
+        "backend_timeout",
+        "backend_unavailable",
+        "connection_error",
+        "service_unavailable",
+    }
+)
+
+
+def _paths_have_identical_content(left: object, right: object) -> bool:
+    """Compare immutable local artifacts without trusting packet-id churn."""
+
+    left_value = str(left or "").strip()
+    right_value = str(right or "").strip()
+    if not left_value or not right_value:
+        return False
+    try:
+        left_path = Path(left_value).resolve(strict=True)
+        right_path = Path(right_value).resolve(strict=True)
+        if left_path == right_path:
+            return True
+        if left_path.stat().st_size != right_path.stat().st_size:
+            return False
+        return hashlib.sha256(left_path.read_bytes()).digest() == hashlib.sha256(
+            right_path.read_bytes()
+        ).digest()
+    except OSError:
+        return False
 
 
 class MemoryStore(Protocol):
@@ -110,8 +199,14 @@ class AgentMemory:
     events are written to JSONL and working memory is loaded/saved as JSON.
     """
 
-    def __init__(self, *, store: MemoryStore | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        store: MemoryStore | None = None,
+        artifact_root: str | Path | None = None,
+    ) -> None:
         self.store = store
+        self.artifact_root = Path(artifact_root).resolve() if artifact_root else None
         self.session_id: str | None = None
         self.task: str | None = None
         self.current_user_request: str = ""
@@ -119,7 +214,9 @@ class AgentMemory:
         self.events: list[MemoryEvent] = []
         self.conversation = ConversationHistory()
         self.facts: dict[str, JsonDict] = {}
+        self.agent_working_state: dict[str, JsonDict] = {}
         self.artifacts: dict[str, JsonDict] = {}
+        self._observation_packets: dict[str, JsonDict] = {}
         self.skill_notes: dict[str, list[JsonDict]] = {}
         self.compact_summary: str = ""
 
@@ -131,6 +228,7 @@ class AgentMemory:
         session_id: str | None = None,
     ) -> None:
         boot_facts = dict(self.facts) if self.session_id is None else {}
+        boot_agent_state = dict(self.agent_working_state) if self.session_id is None else {}
         boot_artifacts = dict(self.artifacts) if self.session_id is None else {}
         self.session_id = session_id or str(uuid4())
         self.task = task
@@ -139,11 +237,23 @@ class AgentMemory:
         self.events.clear()
         self.conversation.clear()
         self.facts = boot_facts
+        purge_removed_task_policy_facts(self.facts)
+        self.agent_working_state = boot_agent_state
+        purge_removed_task_policy_facts(self.agent_working_state)
         self.facts.setdefault(
             SCENE_EPOCH_KEY,
             _memory_fact_entry({"epoch": 0}, source="runtime"),
         )
+        self.facts.setdefault(
+            OBJECT_SCENE_EPOCH_KEY,
+            _memory_fact_entry({"epoch": self.scene_epoch()}, source="runtime"),
+        )
+        self.facts.setdefault(
+            ROBOT_MOTION_EPOCH_KEY,
+            _memory_fact_entry({"epoch": 0}, source="runtime"),
+        )
         self.artifacts = boot_artifacts
+        self._observation_packets.clear()
         self.skill_notes.clear()
         self.compact_summary = ""
         if self.store is not None:
@@ -169,7 +279,7 @@ class AgentMemory:
         *,
         task: str = "",
         metadata: JsonDict | None = None,
-        max_events: int | None = 64,
+        max_events: int | None = None,
     ) -> None:
         self.session_id = session_id
         stored_metadata: JsonDict = {}
@@ -187,7 +297,9 @@ class AgentMemory:
         self.events.clear()
         self.conversation.clear()
         self.facts.clear()
+        self.agent_working_state.clear()
         self.artifacts.clear()
+        self._observation_packets.clear()
         self.skill_notes.clear()
         self.compact_summary = ""
         if self.store is not None:
@@ -212,6 +324,7 @@ class AgentMemory:
                         timestamp_s=timestamp_s,
                     )
                 )
+                self._index_observation_packets_from_payload(payload)
             records = self.store.load_conversation_records(session_id)
             if records:
                 self.conversation.replay(records)
@@ -221,6 +334,15 @@ class AgentMemory:
                 )
                 for item in self.conversation.items:
                     self._append_conversation_record(item_record(item))
+        legacy_scene_epoch = self.scene_epoch()
+        self.facts.setdefault(
+            OBJECT_SCENE_EPOCH_KEY,
+            _memory_fact_entry({"epoch": legacy_scene_epoch}, source="session_migration"),
+        )
+        self.facts.setdefault(
+            ROBOT_MOTION_EPOCH_KEY,
+            _memory_fact_entry({"epoch": legacy_scene_epoch}, source="session_migration"),
+        )
         self.current_user_request = self.conversation.current_user_request or (self.task or "")
         self.record(
             "session_resumed",
@@ -255,18 +377,62 @@ class AgentMemory:
         return event
 
     def add_observation(self, observation: EnvObservation) -> None:
+        object_scene_updated = self._capture_observed_object_scene_change(observation)
+        controller_capabilities_updated = self._capture_controller_capabilities(
+            observation
+        )
         summary = summarize_observation(observation)
+        observation_index = self._next_observation_index()
+        summary["observation_index"] = observation_index
+        environment_step = observation.metadata.get("step_idx")
+        if isinstance(environment_step, int) and not isinstance(environment_step, bool):
+            summary["environment_step"] = environment_step
         summary["scene_epoch"] = self.scene_epoch()
+        summary["object_scene_epoch"] = self.object_scene_epoch()
+        summary["robot_motion_epoch"] = self.robot_motion_epoch()
+        summary["visual_signature"] = _observation_visual_signature(observation)
         summary["runtime_camera_calibrations"] = [
             {
                 "frame_id": camera.frame_id,
+                "role": camera.role,
+                "intrinsics": dict(camera.intrinsics),
                 "extrinsics": dict(camera.extrinsics),
+                "timestamp_s": camera.timestamp_s,
             }
             for camera in observation.cameras
-            if isinstance(camera.extrinsics, dict) and camera.extrinsics
         ]
         runtime_sources: list[JsonDict] = []
+        visual_artifacts: list[JsonDict] = []
         seen_sources: set[tuple[str, str]] = set()
+        cameras = {camera.frame_id: camera for camera in observation.cameras}
+        for artifact in observation.metadata.get("image_artifacts", []):
+            if (
+                not isinstance(artifact, dict)
+                or artifact.get("kind") not in {"rgb", "depth"}
+                or not isinstance(artifact.get("path"), str)
+            ):
+                continue
+            frame_id = str(artifact.get("frame_id") or "")
+            camera = cameras.get(frame_id)
+            visual_artifact: JsonDict = {
+                "kind": str(artifact["kind"]),
+                "frame_id": frame_id,
+                "path": str(artifact["path"]),
+            }
+            role = str(
+                artifact.get("role")
+                or getattr(camera, "role", "")
+                or ""
+            )
+            if role:
+                visual_artifact["role"] = role
+            timestamp_s = getattr(camera, "timestamp_s", None)
+            if timestamp_s is not None:
+                visual_artifact["timestamp_s"] = timestamp_s
+            for field_name in ("packet_id", "width", "height", "format", "index"):
+                if artifact.get(field_name) is not None:
+                    visual_artifact[field_name] = artifact[field_name]
+            visual_artifacts.append(visual_artifact)
         for artifact in observation.metadata.get("image_artifacts", []):
             if (
                 not isinstance(artifact, dict)
@@ -291,126 +457,355 @@ class AgentMemory:
                 seen_sources.add(key)
                 runtime_sources.append({"frame_id": frame_id, "rgb_path": rgb_path})
         summary["runtime_camera_sources"] = runtime_sources
+        summary["visual_artifacts"] = visual_artifacts
+        packet_entries = build_observation_packet_entries(
+            observation,
+            observation_index=observation_index,
+            scene_epoch=self.scene_epoch(),
+            object_scene_epoch=self.object_scene_epoch(),
+            robot_motion_epoch=self.robot_motion_epoch(),
+            compact_ids=True,
+        )
+        if packet_entries:
+            packet_aliases = {
+                str(entry.get("origin_packet_id") or entry.get("packet_id") or ""):
+                str(entry.get("packet_id") or "")
+                for entry in packet_entries
+            }
+            for artifact in visual_artifacts:
+                raw_packet_id = str(artifact.get("packet_id") or "")
+                if raw_packet_id in packet_aliases:
+                    artifact["packet_id"] = packet_aliases[raw_packet_id]
+            summary["observation_packets"] = packet_entries
+            for entry in packet_entries:
+                self._register_observation_packet(entry)
         self.record("observation", summary)
-        self._capture_grasp_reestimation_observation()
         reconciliation_updated = self._reconcile_unknown_motion(observation)
-        attachment_updated = self._capture_attachment_observation_verdict(observation)
         if (
-            self._capture_grasp_lift_probe_obligation(observation)
-            or reconciliation_updated
-            or attachment_updated
+            reconciliation_updated
+            or object_scene_updated
+            or controller_capabilities_updated
         ):
             self._save_working_memory()
 
-    def _capture_grasp_reestimation_observation(self) -> bool:
-        reestimate = _memory_fact_value(self.facts.get(GRASP_REESTIMATION_KEY))
-        if not isinstance(reestimate, dict) or reestimate.get("status") != "pending_observation":
-            return False
-        reestimate.update({"status": "ready", "observed_at_s": time.time()})
-        self.facts[GRASP_REESTIMATION_KEY] = _memory_fact_entry(
-            reestimate,
-            source="candidate_reestimate_observation",
+    def _capture_controller_capabilities(self, observation: EnvObservation) -> bool:
+        create_env = observation.metadata.get("create_env")
+        control_spec = (
+            create_env.get("control_spec") if isinstance(create_env, dict) else None
         )
-        for key in (
-            PENDING_SAM3_SELECTION_KEY,
-            SELECTED_SAM3_DETECTION_KEY,
-            GRASP_CANDIDATE_POLICY_KEY,
-            LEGACY_ANYGRASP_CANDIDATE_POLICY_KEY,
-            GRASP_LIFT_PROBE_KEY,
-            ARTICULATED_ATTACHMENT_PROBE_KEY,
-            GRASP_EXECUTION_KEY,
-            ATTACHMENT_GATE_KEY,
-        ):
-            self.facts.pop(key, None)
-        for key in (
-            "anygrasp_grasp_candidates_latest",
-            "grasp_pose_estimate_grasp_candidates_latest",
-            "graspgenx_grasp_candidates_latest",
-            "contact_graspnet_grasp_candidates_latest",
-            "anyplace_placement_candidates_latest",
-            "camera_pose_to_world_world_pose_latest",
-        ):
-            self.artifacts.pop(key, None)
-        self.record("grasp_reestimate_ready", dict(reestimate))
-        self._save_working_memory()
+        controller = (
+            control_spec.get("controller") if isinstance(control_spec, dict) else None
+        )
+        if not isinstance(controller, dict):
+            return False
+        collision_scope = str(controller.get("collision_scope") or "")
+        value = {
+            "schema_version": "openeta.controller_capabilities.v1",
+            "controller_id": str(controller.get("controller_id") or ""),
+            "goal_executor": str(controller.get("goal_executor") or ""),
+            "collision_callback": controller.get("collision_callback") is True,
+            "collision_scope": collision_scope,
+            "motion_owns_trajectory_world_collision": (
+                controller.get("collision_callback") is True
+                and "per_step_pre_actuation_and_post_step" in collision_scope
+            ),
+            "control_spec": dict(control_spec),
+        }
+        existing = self.controller_capabilities()
+        if existing == value:
+            return False
+        self.facts[CONTROLLER_CAPABILITIES_KEY] = _memory_fact_entry(
+            value,
+            source="create_env.control_spec",
+        )
+        self.record("controller_capabilities", dict(value))
         return True
 
+    def _next_observation_index(self) -> int:
+        for event in reversed(self.events):
+            if event.event_type != "observation":
+                continue
+            value = event.payload.get("observation_index")
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value + 1
+        if self.store is not None and self.session_id is not None:
+            try:
+                rows = self.store.load_events(self.session_id, limit=None)
+            except (OSError, ValueError, json.JSONDecodeError):
+                rows = []
+            for row in reversed(rows):
+                if not isinstance(row, dict) or row.get("event_type") != "observation":
+                    continue
+                payload = row.get("payload")
+                value = payload.get("observation_index") if isinstance(payload, dict) else None
+                if isinstance(value, int) and not isinstance(value, bool):
+                    return value + 1
+        return sum(event.event_type == "observation" for event in self.events)
+
+    def resolve_observation_packet(
+        self,
+        source_packet_id: str,
+        camera_frame_id: str = "",
+        *,
+        require_files: bool = True,
+    ) -> JsonDict:
+        """Resolve a session-owned packet into aligned local camera inputs."""
+
+        packet_id = str(source_packet_id or "").strip()
+        if not packet_id:
+            raise ObservationPacketResolutionError(
+                "missing_source_packet_id",
+                "source_packet_id is required.",
+                details={"active_agent_session_id": self.session_id or ""},
+            )
+        entry = self._observation_packets.get(packet_id)
+        if entry is None:
+            self._load_observation_packet_index_from_store()
+            entry = self._observation_packets.get(packet_id)
+        if entry is None:
+            raise ObservationPacketResolutionError(
+                "unknown_source_packet_id",
+                "source_packet_id does not exist in the active Agent session.",
+                details={
+                    "source_packet_id": packet_id,
+                    "active_agent_session_id": self.session_id or "",
+                    "recent_source_packets": self.recent_observation_packet_refs(),
+                },
+            )
+        return resolve_packet_source(
+            entry,
+            camera_frame_id=str(camera_frame_id or ""),
+            require_files=require_files,
+        )
+
+    def resolve_depth_enhancement_input(
+        self,
+        source_packet_id: str,
+        camera_frame_id: str = "",
+    ) -> JsonDict:
+        """Resolve aligned RGB-D and the newest matching host-owned depth prior."""
+
+        source = self.resolve_observation_packet(
+            source_packet_id,
+            camera_frame_id,
+        )
+        depth = str(source.get("depth") or "")
+        intrinsics = source.get("intrinsics")
+        if not depth:
+            raise ObservationPacketResolutionError(
+                "source_depth_missing",
+                "The selected observation packet camera has no aligned depth artifact.",
+                details={
+                    "source_packet_id": source.get("packet_id"),
+                    "camera_frame_id": source.get("frame_id"),
+                },
+            )
+        if not isinstance(intrinsics, dict) or not intrinsics:
+            raise ObservationPacketResolutionError(
+                "source_intrinsics_missing",
+                "The selected observation packet camera has no calibrated intrinsics.",
+                details={
+                    "source_packet_id": source.get("packet_id"),
+                    "camera_frame_id": source.get("frame_id"),
+                },
+            )
+
+        source_rgb = str(source.get("rgb") or "")
+        matching_prior: JsonDict | None = None
+        for entry in reversed(list(self.artifacts.values())):
+            value = entry.get("value") if isinstance(entry, dict) else None
+            if not isinstance(value, dict) or value.get("type") != "depth_prior":
+                continue
+            prior_source = str(value.get("source_rgb") or "")
+            try:
+                same_source = bool(prior_source) and (
+                    Path(prior_source).resolve(strict=False)
+                    == Path(source_rgb).resolve(strict=False)
+                )
+            except (OSError, ValueError):
+                same_source = prior_source == source_rgb
+            if same_source:
+                matching_prior = dict(value)
+                break
+
+        parameters: JsonDict = {
+            "rgb": source_rgb,
+            "depth": depth,
+            "intrinsics": dict(intrinsics),
+            "camera_id": source.get("frame_id"),
+            "registration_status": "aligned",
+            "rgb_timestamp_s": source.get("timestamp_s"),
+            "depth_timestamp_s": source.get("timestamp_s"),
+            "scene_epoch": source.get("object_scene_epoch", source.get("scene_epoch")),
+            "bundle_id": f"{source.get('packet_id')}:{source.get('frame_id')}",
+            "source_packet_id": source.get("packet_id"),
+            "camera_frame_id": source.get("frame_id"),
+            "_source_observation": dict(source),
+        }
+        if isinstance(matching_prior, dict):
+            parameters.update(
+                {
+                    "prior_depth": matching_prior.get("prior_depth"),
+                    "prior_confidence": matching_prior.get("prior_confidence"),
+                    "prior_confidence_semantics": matching_prior.get(
+                        "prior_confidence_semantics"
+                    ),
+                }
+            )
+        return {
+            "schema_version": "openeta.depth_enhancement_input_resolution.v1",
+            "source_packet_id": source.get("packet_id"),
+            "camera_frame_id": source.get("frame_id"),
+            "depth_prior_status": "matched" if matching_prior is not None else "absent",
+            "parameters": parameters,
+        }
+
+    def observation_packet_id_for_path(self, path: object) -> str:
+        """Map one exact session artifact path back to its owning packet."""
+
+        packet_id = find_packet_id_for_path(self._observation_packets.values(), path)
+        if packet_id:
+            return packet_id
+        self._load_observation_packet_index_from_store()
+        return find_packet_id_for_path(self._observation_packets.values(), path)
+
+    def observation_packet_reference_for_path(self, path: object) -> JsonDict:
+        """Map one exact session artifact path to packet and camera identifiers."""
+
+        reference = find_packet_reference_for_path(self._observation_packets.values(), path)
+        if reference:
+            return reference
+        self._load_observation_packet_index_from_store()
+        return find_packet_reference_for_path(self._observation_packets.values(), path)
+
+    def recent_observation_packet_refs(self, *, limit: int = 6) -> list[JsonDict]:
+        """Return a bounded repair index without exposing local paths."""
+
+        entries = list(self._observation_packets.values())[-max(0, limit) :]
+        refs: list[JsonDict] = []
+        for entry in entries:
+            frames = sorted(
+                {
+                    str(item.get("frame_id") or "")
+                    for item in entry.get("artifacts", [])
+                    if isinstance(item, dict) and item.get("kind") == "rgb"
+                }
+            )
+            refs.append(
+                {
+                    "source_packet_id": entry.get("packet_id"),
+                    "observation_index": entry.get("observation_index"),
+                    "camera_frame_ids": frames,
+                }
+            )
+        return refs
+
+    def _register_observation_packet(self, entry: JsonDict) -> None:
+        packet_id = str(entry.get("packet_id") or "").strip()
+        if not packet_id:
+            return
+        existing = self._observation_packets.get(packet_id)
+        if existing is not None:
+            if packet_integrity_fingerprint(existing) != packet_integrity_fingerprint(entry):
+                raise ObservationPacketResolutionError(
+                    "duplicate_source_packet_id",
+                    "One source_packet_id refers to different immutable packet contents.",
+                    details={
+                        "source_packet_id": packet_id,
+                        "active_agent_session_id": self.session_id or "",
+                    },
+                )
+            return
+        self._observation_packets[packet_id] = dict(entry)
+
+    def _index_observation_packets_from_payload(self, payload: JsonDict) -> None:
+        entries = payload.get("observation_packets")
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if isinstance(entry, dict):
+                self._register_observation_packet(entry)
+
+    def _load_observation_packet_index_from_store(self) -> None:
+        if self.store is None or self.session_id is None:
+            return
+        try:
+            rows = self.store.load_events(self.session_id, limit=None)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return
+        for row in rows:
+            if not isinstance(row, dict) or row.get("event_type") != "observation":
+                continue
+            payload = row.get("payload")
+            if isinstance(payload, dict):
+                self._index_observation_packets_from_payload(payload)
+
     def add_action(self, action: EnvAction) -> None:
+        # Bind each decision to the exact evidence state it was made from.  This
+        # is causal bookkeeping for reflection/debugging, not a task phase: the
+        # Agent remains free to choose any next tool.
+        input_state_anchor = self._latest_observation_state_anchor()
         environment_task_updated = self._capture_active_environment_task(action)
+        tool_health_updated = self._capture_tool_health(action)
         self._capture_reference_localization_state(action)
         self._capture_sam3_selection_state(action)
-        target_mask_invalidated = self._invalidate_failed_anygrasp_target_mask(action)
-        self._capture_anygrasp_candidate_policy(action)
-        self._capture_compiled_grasp(action)
-        self._capture_wrist_alignment(action)
+        self._materialize_complete_structured_outputs(action)
         captured_artifacts = _extract_action_artifacts(action)
         for artifact in captured_artifacts:
+            if artifact.get("type") == "grasp_candidates" and artifact.get(
+                "scene_epoch"
+            ) is None:
+                artifact["scene_epoch"] = self.scene_epoch()
             key = _artifact_memory_key(artifact, fallback_index=len(self.artifacts))
             self.artifacts[key] = {
                 "value": artifact,
                 "source": "tool_result",
                 "timestamp_s": time.time(),
             }
-        world_mutated = self._record_successful_world_mutation(action)
+        new_grasp_evidence_recorded = self._record_new_targeted_grasp_evidence(action)
+        grasp_provenance_updated = self._capture_grasp_provenance(action)
+        grasp_input_bundle_updated = self._refresh_grasp_input_bundle()
+        wrist_alignment_bundle_updated = self._refresh_wrist_alignment_bundle()
+        # Freeze an AnyPlace result against the exact bundle that authorized
+        # the completed call before deriving any newer host bundle.  Refreshing
+        # first can advance active_bundle_id and make a valid result look
+        # unrelated to its own request, leaving the artifact on disk but absent
+        # from the session resolver index.
+        anyplace_bundle_materialized = self._capture_anyplace_bundle_materialization(action)
+        anyplace_bundle_updated = self._refresh_anyplace_input_bundle()
+        placement_reference_updated = self._capture_placement_world_reference(action)
+        grasp_adjustment_budget_updated = self._capture_grasp_adjustment_budget(action)
+        ik_preview_updated = self._capture_ik_preview_receipt(action)
+        world_mutated = self._record_world_mutation(action)
+        clearance_execution_updated = self._capture_compiled_clearance_execution(action)
+        contact_execution_updated = self._capture_compiled_contact_execution(action)
         gripper_state_updated = self._capture_gripper_command_state(action)
-        placement_release_denied = self._capture_placement_release_denial(action)
-        placement_release_updated = self._capture_placement_release(action)
-        attachment_updated = self._capture_attachment_verdict(action)
-        articulated_assessment_updated = self._capture_articulated_attachment_assessment(
-            action
-        )
         articulated_probe_prepared = self._capture_articulated_attachment_probe(action)
         articulated_probe_updated = self._capture_articulated_attachment_probe_result(action)
-        lift_probe_updated = self._capture_grasp_lift_probe_result(action)
-        execution_updated = self._advance_grasp_execution(action)
+        articulated_assessment_updated = self._capture_articulated_attachment_assessment(action)
         reconciliation_updated = self._capture_motion_reconciliation(action)
-        recovery_updated = self._advance_grasp_recovery(action)
-        estimation_recovery_updated = self._advance_grasp_estimation_recovery(action)
-        candidate_advanced = self._advance_anygrasp_candidate_after_rejection(action)
-        candidate_accepted = (
-            False if candidate_advanced else self._accept_anygrasp_candidate_after_motion(action)
-        )
-        if candidate_advanced:
-            self.facts.pop(GRASP_LIFT_PROBE_KEY, None)
-            self.facts.pop(ARTICULATED_ATTACHMENT_PROBE_KEY, None)
-            self.facts.pop(GRASP_EXECUTION_KEY, None)
-            self.facts.pop(ATTACHMENT_GATE_KEY, None)
-            invalidated = [
-                key
-                for key in (
-                    "anyplace_placement_candidates_latest",
-                    "camera_pose_to_world_world_pose_latest",
-                )
-                if self.artifacts.pop(key, None) is not None
-            ]
-            if invalidated:
-                self.record(
-                    "placement_plan_invalidated",
-                    {
-                        "reason": "grasp_candidate_changed",
-                        "artifact_keys": invalidated,
-                    },
-                )
         self._append_transition_ledger(action)
         if (
             captured_artifacts
             or world_mutated
-            or placement_release_denied
-            or placement_release_updated
-            or lift_probe_updated
             or articulated_probe_prepared
             or articulated_probe_updated
-            or execution_updated
-            or attachment_updated
             or articulated_assessment_updated
             or reconciliation_updated
-            or recovery_updated
-            or estimation_recovery_updated
             or gripper_state_updated
-            or candidate_advanced
-            or candidate_accepted
-            or target_mask_invalidated
             or environment_task_updated
+            or grasp_provenance_updated
+            or new_grasp_evidence_recorded
+            or grasp_input_bundle_updated
+            or wrist_alignment_bundle_updated
+            or anyplace_bundle_updated
+            or anyplace_bundle_materialized
+            or placement_reference_updated
+            or grasp_adjustment_budget_updated
+            or ik_preview_updated
+            or clearance_execution_updated
+            or contact_execution_updated
+            or tool_health_updated
         ):
             self._save_working_memory()
         self.record(
@@ -421,133 +816,11 @@ class AgentMemory:
                 "has_code": action.code is not None,
                 "metadata": action.metadata,
                 "captured_artifact_count": len(captured_artifacts),
+                "input_state_anchor": input_state_anchor,
             },
         )
         for conversation_item in self.conversation.add_action(action):
             self._append_conversation_record(item_record(conversation_item))
-
-    def _invalidate_failed_anygrasp_target_mask(self, action: EnvAction) -> bool:
-        call = _tool_call(action, "grasp_pose_estimate") or _tool_call(action, "anygrasp")
-        if not isinstance(call, dict) or _call_result_success(call):
-            return False
-        outputs = _tool_call_outputs(call)
-        reason = str(outputs.get("reason") or "")
-        if reason in {"insufficient_object_points", "empty_point_cloud"}:
-            reason = "no_grasp_candidates"
-        if reason == "all_backends_failed":
-            attempts = outputs.get("backend_attempts")
-            failed_reasons = (
-                {
-                    str(attempt.get("reason") or "")
-                    for attempt in attempts
-                    if isinstance(attempt, dict) and attempt.get("status") == "failed"
-                }
-                if isinstance(attempts, list)
-                else set()
-            )
-            if failed_reasons == {"no_grasp_candidates"}:
-                reason = "no_grasp_candidates"
-            elif failed_reasons and failed_reasons.issubset(
-                {
-                    "mcp_call_failed",
-                    "model_inference_failed",
-                    "model_load_failed",
-                    "unknown_error",
-                }
-            ):
-                reason = "model_inference_failed"
-        if reason not in {
-            "empty_target_mask",
-            "model_inference_failed",
-            "no_grasp_candidates",
-        }:
-            return False
-        selected = self.selected_sam3_detection()
-        if not isinstance(selected, dict):
-            return False
-        parameters = call.get("parameters")
-        if not isinstance(parameters, dict):
-            parameters = {}
-        if reason == "model_inference_failed":
-            unified = str(call.get("name") or "") == "grasp_pose_estimate"
-            failure_key = (
-                "grasp_estimator_backend_failure" if unified else "anygrasp_backend_failure"
-            )
-            previous = selected.get(failure_key)
-            previous_attempts = (
-                int(previous.get("attempt_count") or 0) if isinstance(previous, dict) else 0
-            )
-            metadata = outputs.get("metadata")
-            error_type = str(metadata.get("error_type") or "") if isinstance(metadata, dict) else ""
-            attempt_count = previous_attempts + 1
-            exhausted = attempt_count >= 2
-            selected[failure_key] = {
-                "reason": reason,
-                "error_type": error_type or None,
-                "attempt_count": attempt_count,
-                "max_attempts": 2,
-                "status": "exhausted" if exhausted else "retry_required",
-            }
-            self.facts[SELECTED_SAM3_DETECTION_KEY] = _memory_fact_entry(
-                selected,
-                source=failure_key,
-            )
-            self.record(
-                "grasp_estimator_backend_retry_exhausted"
-                if exhausted
-                else "grasp_estimator_backend_retry_required",
-                {
-                    "result_id": selected.get("result_id"),
-                    "detection_id": selected.get("id"),
-                    "reason": reason,
-                    "error_type": error_type or None,
-                    "attempt_count": attempt_count,
-                },
-            )
-            return True
-        hints = parameters.get("hints")
-        dense_sampling = hints.get("dense_sampling") if isinstance(hints, dict) else None
-        if (
-            reason == "no_grasp_candidates"
-            and parameters.get("dense_grasp") is not True
-            and dense_sampling is not True
-        ):
-            selected["dense_grasp_retry_required"] = True
-            self.facts[SELECTED_SAM3_DETECTION_KEY] = _memory_fact_entry(
-                selected,
-                source="anygrasp_dense_retry",
-            )
-            self.record(
-                "anygrasp_dense_retry_required",
-                {
-                    "result_id": selected.get("result_id"),
-                    "detection_id": selected.get("id"),
-                },
-            )
-            return True
-        source_image = outputs.get("source_rgb") or selected.get("source_image")
-        self.facts.pop(SELECTED_SAM3_DETECTION_KEY, None)
-        self.facts.pop(PENDING_SAM3_SELECTION_KEY, None)
-        self.facts[SAM3_NO_DETECTION_KEY] = _memory_fact_entry(
-            {
-                "result_id": selected.get("result_id"),
-                "source_image": source_image,
-                "target_prompt": selected.get("target_prompt"),
-                "reason": reason,
-                "segmentation_mode": selected.get("segmentation_mode"),
-                "bbox_xyxy": selected.get("bbox_xyxy"),
-            },
-            source="anygrasp",
-        )
-        self.record(
-            "sam3_detection_invalidated",
-            {
-                "result_id": selected.get("result_id"),
-                "detection_id": selected.get("id"),
-                "reason": reason,
-            },
-        )
-        return True
 
     def add_external_event(self, event: JsonDict) -> None:
         event_type = str(event.get("type", "external"))
@@ -558,12 +831,101 @@ class AgentMemory:
                 self.begin_user_turn(answer, source="human_answer")
 
     def save_fact(self, key: str, value: JsonDict, *, source: str = "") -> None:
-        if key == LEGACY_ANYGRASP_CANDIDATE_POLICY_KEY:
-            key = GRASP_CANDIDATE_POLICY_KEY
-            self.facts.pop(LEGACY_ANYGRASP_CANDIDATE_POLICY_KEY, None)
-        self.facts[key] = {"value": dict(value), "source": source, "timestamp_s": time.time()}
+        if is_removed_task_policy_key(key):
+            raise ValueError(
+                f"{key!r} is a reserved tombstone for deleted host task policy; "
+                "store an Agent-owned plan or hypothesis under a different key"
+            )
+        entry = {"value": dict(value), "source": source, "timestamp_s": time.time()}
+        self.facts[key] = entry
+        if source == "save_memory":
+            self.agent_working_state[key] = {
+                **entry,
+                "ownership": "agent",
+                "freshness": "agent_managed",
+            }
         self.record("memory_fact_saved", {"key": key, "source": source})
         self._save_working_memory()
+
+    def _latest_observation_state_anchor(self) -> JsonDict:
+        """Return the newest visual/epoch anchor actually available to a decision."""
+
+        for event in reversed(self.events):
+            if event.event_type != "observation":
+                continue
+            payload = event.payload
+            signature = str(payload.get("visual_signature") or "")
+            if not signature:
+                return {}
+            return {
+                "observation_index": payload.get("observation_index"),
+                "visual_signature": signature,
+                "object_scene_epoch": _fact_epoch_value(
+                    payload.get("object_scene_epoch")
+                ),
+                "robot_motion_epoch": _fact_epoch_value(
+                    payload.get("robot_motion_epoch")
+                ),
+            }
+        return {}
+
+    def _materialize_complete_structured_outputs(self, action: EnvAction) -> None:
+        """Persist complete candidate sets before working memory keeps only previews."""
+
+        if self.artifact_root is None:
+            return
+        command = action.command if isinstance(action.command, dict) else {}
+        for call in command.get("tool_calls", []) or []:
+            if not isinstance(call, dict):
+                continue
+            tool_name = str(call.get("name") or "")
+            if tool_name not in {
+                "grasp_pose_estimate",
+                "anygrasp",
+                "graspgenx",
+                "contact_graspnet",
+                "anyplace",
+            }:
+                continue
+            result = call.get("result")
+            if not isinstance(result, dict) or result.get("success") is not True:
+                continue
+            details = result.get("details")
+            if not isinstance(details, dict) or isinstance(
+                details.get("structured_artifact"), dict
+            ):
+                continue
+            structured_source = details.get("outputs")
+            if not isinstance(structured_source, dict):
+                structured_source = details
+            candidate_key = (
+                "placement_candidates" if tool_name == "anyplace" else "grasp_candidates"
+            )
+            if not isinstance(structured_source.get(candidate_key), list):
+                continue
+            try:
+                snapshot = json.loads(json.dumps(structured_source, ensure_ascii=False))
+                reference = materialize_structured_tool_output(
+                    output_root=self.artifact_root,
+                    tool=tool_name,
+                    outputs=snapshot,
+                    result_id=str(structured_source.get("result_id") or tool_name),
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                diagnostics = details.setdefault("diagnostics", [])
+                if isinstance(diagnostics, list):
+                    diagnostics.append(
+                        {
+                            "code": "structured_artifact_persistence_failed",
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                    )
+                continue
+            details["structured_artifact"] = reference
+            artifacts = details.setdefault("artifacts", [])
+            if isinstance(artifacts, list):
+                artifacts.append(dict(reference))
 
     def save_artifact(self, key: str, value: JsonDict, *, source: str = "") -> None:
         self.artifacts[key] = {"value": dict(value), "source": source, "timestamp_s": time.time()}
@@ -602,8 +964,65 @@ class AgentMemory:
     def pending_sam3_selection(self) -> JsonDict | None:
         return _memory_fact_value(self.facts.get(PENDING_SAM3_SELECTION_KEY))
 
-    def selected_sam3_detection(self) -> JsonDict | None:
-        return _memory_fact_value(self.facts.get(SELECTED_SAM3_DETECTION_KEY))
+    def selected_sam3_detection(
+        self,
+        evidence_role: str = DEFAULT_SAM3_EVIDENCE_ROLE,
+    ) -> JsonDict | None:
+        role = _normalize_sam3_evidence_role(evidence_role)
+        selections = _memory_fact_value(self.facts.get(SELECTED_SAM3_DETECTIONS_KEY))
+        if isinstance(selections, dict):
+            selected = selections.get(role)
+            if isinstance(selected, dict):
+                return selected
+        if role == DEFAULT_SAM3_EVIDENCE_ROLE:
+            return _memory_fact_value(self.facts.get(SELECTED_SAM3_DETECTION_KEY))
+        return None
+
+    def selected_sam3_detections(self) -> JsonDict:
+        selections = _memory_fact_value(self.facts.get(SELECTED_SAM3_DETECTIONS_KEY))
+        result = {
+            str(role): dict(selected)
+            for role, selected in (selections.items() if isinstance(selections, dict) else [])
+            if role in SAM3_EVIDENCE_ROLES and isinstance(selected, dict)
+        }
+        legacy = _memory_fact_value(self.facts.get(SELECTED_SAM3_DETECTION_KEY))
+        if DEFAULT_SAM3_EVIDENCE_ROLE not in result and isinstance(legacy, dict):
+            result[DEFAULT_SAM3_EVIDENCE_ROLE] = dict(legacy)
+        return result
+
+    def _store_selected_sam3_detection(
+        self,
+        selected: JsonDict,
+        *,
+        evidence_role: str,
+        source: str,
+    ) -> None:
+        role = _normalize_sam3_evidence_role(evidence_role)
+        selections = self.selected_sam3_detections()
+        selections[role] = dict(selected)
+        self.facts[SELECTED_SAM3_DETECTIONS_KEY] = _memory_fact_entry(
+            selections,
+            source=source,
+        )
+        if role == DEFAULT_SAM3_EVIDENCE_ROLE:
+            self.facts[SELECTED_SAM3_DETECTION_KEY] = _memory_fact_entry(
+                selected,
+                source=source,
+            )
+
+    def _remove_selected_sam3_detection(self, *, evidence_role: str) -> None:
+        role = _normalize_sam3_evidence_role(evidence_role)
+        selections = self.selected_sam3_detections()
+        selections.pop(role, None)
+        if selections:
+            self.facts[SELECTED_SAM3_DETECTIONS_KEY] = _memory_fact_entry(
+                selections,
+                source="sam3_selection_removed",
+            )
+        else:
+            self.facts.pop(SELECTED_SAM3_DETECTIONS_KEY, None)
+        if role == DEFAULT_SAM3_EVIDENCE_ROLE:
+            self.facts.pop(SELECTED_SAM3_DETECTION_KEY, None)
 
     def pending_reference_localization(self) -> JsonDict | None:
         return _memory_fact_value(self.facts.get(PENDING_REFERENCE_LOCALIZATION_KEY))
@@ -611,223 +1030,991 @@ class AgentMemory:
     def target_asset_reference(self) -> JsonDict | None:
         return _memory_fact_value(self.facts.get(TARGET_ASSET_REFERENCE_KEY))
 
+    def target_identity_anchor(self) -> JsonDict | None:
+        return _memory_fact_value(self.facts.get(TARGET_IDENTITY_ANCHOR_KEY))
+
     def reference_localization_failure(self) -> JsonDict | None:
         return _memory_fact_value(self.facts.get(REFERENCE_LOCALIZATION_FAILURE_KEY))
 
-    def sam3_no_detection(self) -> JsonDict | None:
-        return _memory_fact_value(self.facts.get(SAM3_NO_DETECTION_KEY))
+    def tool_health(self) -> JsonDict:
+        """Return compact session-local backend health inferred from tool receipts."""
 
-    def grasp_candidate_policy(self) -> JsonDict | None:
-        return _memory_fact_value(
-            self.facts.get(GRASP_CANDIDATE_POLICY_KEY)
-            or self.facts.get(LEGACY_ANYGRASP_CANDIDATE_POLICY_KEY)
-        )
-
-    def grasp_reestimation(self) -> JsonDict | None:
-        return _memory_fact_value(self.facts.get(GRASP_REESTIMATION_KEY))
-
-    def anygrasp_candidate_policy(self) -> JsonDict | None:
-        """Backward-compatible accessor for pre-facade callers."""
-
-        return self.grasp_candidate_policy()
-
-    def retained_targeted_grasp(self) -> JsonDict | None:
-        """Return the active targeted grasp and its exact aligned source packet."""
-
-        policy = self.grasp_candidate_policy() or {}
-        final_source = policy.get("final_fallback_source")
-        final_candidate = policy.get("active_candidate")
-        if (
-            policy.get("final_refinable_fallback") is True
-            and isinstance(final_source, dict)
-            and isinstance(final_candidate, dict)
-        ):
-            source = final_source.get("source")
-            source = dict(source) if isinstance(source, dict) else {}
-            for source_key, policy_key in (
-                ("rgb", "source_rgb"),
-                ("depth", "source_depth"),
-            ):
-                if not isinstance(source.get(source_key), str) or not source[source_key]:
-                    value = final_source.get(policy_key)
-                    if isinstance(value, str) and value:
-                        source[source_key] = value
-            frame_id = final_source.get("camera_frame_id")
-            if isinstance(frame_id, str) and frame_id:
-                source["camera_frame_id"] = frame_id
-            return {
-                "artifact_key": "grasp_estimation_recovery.final_candidate",
-                "result_id": policy.get("result_id"),
-                "status": policy.get("status", "retained"),
-                "candidate": dict(final_candidate),
-                "source": source,
-            }
-
-        artifact_key = next(
-            (
-                key
-                for key in (
-                    "grasp_pose_estimate_grasp_candidates_latest",
-                    "anygrasp_grasp_candidates_latest",
-                    "graspgenx_grasp_candidates_latest",
-                    "contact_graspnet_grasp_candidates_latest",
-                )
-                if key in self.artifacts
-            ),
-            "",
-        )
-        entry = self.artifacts.get(artifact_key)
-        if not isinstance(entry, dict):
-            return None
-        artifact = entry.get("value")
-        if not isinstance(artifact, dict):
-            return None
-        source_value = artifact.get("selected_grasp_source")
-        source = dict(source_value) if isinstance(source_value, dict) else {}
-        if str(source.get("mode") or "") != "targeted":
-            return None
-
-        for source_key, artifact_key in (
-            ("rgb", "source_rgb"),
-            ("depth", "source_depth"),
-            ("object_mask", "target_mask"),
-        ):
-            if not isinstance(source.get(source_key), str) or not source[source_key]:
-                value = artifact.get(artifact_key)
-                if isinstance(value, str) and value:
-                    source[source_key] = value
-
-        candidate = policy.get("active_candidate")
-        if not isinstance(candidate, dict):
-            candidate = artifact.get("best_grasp_candidate")
-        if not isinstance(candidate, dict):
-            return None
-
+        value = _memory_fact_value(self.facts.get(TOOL_HEALTH_KEY))
         return {
-            "artifact_key": artifact_key,
-            "result_id": policy.get("result_id"),
-            "status": policy.get("status", "retained"),
-            "candidate": dict(candidate),
-            "source": source,
+            str(name): dict(entry)
+            for name, entry in (value.items() if isinstance(value, dict) else [])
+            if isinstance(entry, dict)
         }
 
-    def activate_final_grasp_candidate(self, *, recovery_id: str) -> JsonDict:
-        recovery = self.grasp_estimation_recovery()
-        policy = self.grasp_candidate_policy()
-        if (
-            not isinstance(recovery, dict)
-            or recovery.get("status") != "required"
-            or str(recovery.get("recovery_id") or "") != recovery_id
-        ):
-            raise ValueError("final grasp fallback requires the active recovery_id.")
-        if str(recovery.get("trigger_class") or "") not in {
-            "perception_refinable",
-            "uncertain_review",
-        }:
-            raise ValueError("final grasp fallback is not allowed for a hard rejection.")
-        if not isinstance(policy, dict) or policy.get("status") != "exhausted":
-            raise ValueError("final grasp fallback requires an exhausted candidate policy.")
-        entries = [
-            dict(item)
-            for item in recovery.get("fallback_candidates", [])
-            if isinstance(item, dict) and isinstance(item.get("candidate"), dict)
-        ]
-        if not entries:
-            raise ValueError("final grasp fallback has no refinable candidate.")
-        selected = min(
-            entries,
-            key=lambda item: _grasp_candidate_sort_key(dict(item["candidate"])),
-        )
-        candidate = dict(selected["candidate"])
-        original_id = str(candidate.get("id") or "grasp")
-        candidate["original_candidate_id"] = original_id
-        candidate["id"] = f"{original_id}-final-{recovery_id[-8:]}"
-        candidate["final_refinable_fallback"] = True
-        capabilities = _fallback_candidate_capabilities(
-            selected,
-            default=self._active_grasp_calibration_capabilities(),
-        )
-        max_gripper_width = float(capabilities["max_gripper_width_m"])
-        try:
-            estimated_width = float(candidate.get("width"))
-        except (TypeError, ValueError):
-            estimated_width = max_gripper_width
-        if not math.isfinite(estimated_width):
-            estimated_width = max_gripper_width
-        candidate["estimated_width_m"] = estimated_width
-        candidate["width"] = min(max(0.0, estimated_width), max_gripper_width)
-        candidate["max_gripper_width_m"] = max_gripper_width
-        candidate["grasp_calibration_id"] = capabilities["calibration_id"]
-        candidate["width_clamped_to_physical_limit"] = (
-            estimated_width > max_gripper_width
-        )
-        policy.update(
-            {
-                "result_id": selected.get("source_result_id") or policy.get("result_id"),
-                "source_tool": selected.get("source_tool") or policy.get("source_tool"),
-                "source_backend": (
-                    selected.get("source_backend") or policy.get("source_backend")
+    def _capture_tool_health(self, action: EnvAction) -> bool:
+        """Track infrastructure failures without turning health into a hard gate.
+
+        Semantic failures such as no detection or no grasp candidate say nothing
+        about service health and are intentionally ignored. A later successful
+        receipt closes the advisory circuit immediately.
+        """
+
+        command = action.command if isinstance(action.command, dict) else {}
+        calls = command.get("tool_calls")
+        calls = calls if isinstance(calls, list) else []
+        health = self.tool_health()
+        changed = False
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("name") or "").strip()
+            status = str(call.get("status") or "").strip().lower()
+            result = call.get("result")
+            result = result if isinstance(result, dict) else {}
+            if not name or status == "skipped":
+                continue
+            details = result.get("details")
+            details = details if isinstance(details, dict) else {}
+            diagnostics = details.get("diagnostics")
+            diagnostics = diagnostics if isinstance(diagnostics, list) else []
+            failure_codes = {
+                str(item.get("code") or "").strip().lower()
+                for item in diagnostics
+                if isinstance(item, dict) and item.get("code")
+            }
+            reason = str(details.get("reason") or "").strip().lower()
+            if reason:
+                failure_codes.add(reason)
+            infrastructure_codes = sorted(
+                code for code in failure_codes if code in INFRASTRUCTURE_FAILURE_CODES
+            )
+            previous = health.get(name, {})
+            previous = previous if isinstance(previous, dict) else {}
+            if result.get("success") is True or (
+                previous and status in {"executed", "failed"} and not infrastructure_codes
+            ):
+                if previous:
+                    health[name] = {
+                        "status": "healthy",
+                        "consecutive_infrastructure_failures": 0,
+                        "last_success_at_s": (
+                            time.time() if result.get("success") is True else None
+                        ),
+                        "last_backend_response_at_s": time.time(),
+                        "last_failure_code": previous.get("last_failure_code"),
+                        "policy": "normal_use",
+                    }
+                    changed = True
+                continue
+            if status != "failed" or not infrastructure_codes:
+                continue
+            count = int(previous.get("consecutive_infrastructure_failures") or 0) + 1
+            parameters = call.get("parameters")
+            if not isinstance(parameters, dict):
+                request = command.get("request")
+                parameters = request.get("parameters") if isinstance(request, dict) else {}
+            parameters = parameters if isinstance(parameters, dict) else {}
+            sources = parameters.get("sources")
+            first_source = (
+                sources[0]
+                if isinstance(sources, list)
+                and sources
+                and isinstance(sources[0], dict)
+                else {}
+            )
+            circuit_open = count >= 2
+            health[name] = {
+                "status": "circuit_open" if circuit_open else "degraded",
+                "consecutive_infrastructure_failures": count,
+                "last_failure_code": infrastructure_codes[0],
+                "last_failure_at_s": time.time(),
+                "last_error": str(result.get("content") or "")[:500],
+                "last_request": {
+                    key: parameters.get(key, first_source.get(key))
+                    for key in ("source_packet_id", "camera_frame_id", "mode")
+                    if parameters.get(key, first_source.get(key)) is not None
+                },
+                "policy": (
+                    "do_not_repeat_until_successful_preflight_or_explicit_health_change"
+                    if circuit_open
+                    else "retry_at_most_once_after_preflight_or_use_alternative"
                 ),
-                "status": "active",
-                "candidate_count": 1,
-                "active_rank": 0,
-                "active_candidate": candidate,
-                "remaining_candidate_ids": [],
-                "candidates": [candidate],
-                "source_rgb": selected.get("source_rgb"),
-                "source_depth": selected.get("source_depth"),
-                "camera_frame_id": selected.get("camera_frame_id"),
-                "target_detection": selected.get("target_detection"),
-                "final_refinable_fallback": True,
-                "final_fallback_source": selected,
-                "final_fallback_recovery_id": recovery_id,
-                "physical_width_limit_m": max_gripper_width,
-                "grasp_calibration_id": capabilities["calibration_id"],
-                "grasp_calibration_profile_path": capabilities["profile_path"],
-                "activated_at_s": time.time(),
+                "host_enforcement": "advisory_only",
+            }
+            changed = True
+        if changed:
+            self.facts[TOOL_HEALTH_KEY] = _memory_fact_entry(
+                health,
+                source="runtime_tool_health",
+            )
+            self.record("tool_health_updated", {"tools": health})
+        return changed
+
+    def sam3_no_detection(
+        self,
+        evidence_role: str = DEFAULT_SAM3_EVIDENCE_ROLE,
+    ) -> JsonDict | None:
+        role = _normalize_sam3_evidence_role(evidence_role)
+        failures = _memory_fact_value(self.facts.get(SAM3_NO_DETECTIONS_KEY))
+        if isinstance(failures, dict):
+            failure = failures.get(role)
+            if isinstance(failure, dict):
+                return failure
+        if role == DEFAULT_SAM3_EVIDENCE_ROLE:
+            return _memory_fact_value(self.facts.get(SAM3_NO_DETECTION_KEY))
+        return None
+
+    def sam3_no_detections(self) -> JsonDict:
+        failures = _memory_fact_value(self.facts.get(SAM3_NO_DETECTIONS_KEY))
+        result = {
+            str(role): dict(failure)
+            for role, failure in (failures.items() if isinstance(failures, dict) else [])
+            if role in SAM3_EVIDENCE_ROLES and isinstance(failure, dict)
+        }
+        legacy = _memory_fact_value(self.facts.get(SAM3_NO_DETECTION_KEY))
+        if DEFAULT_SAM3_EVIDENCE_ROLE not in result and isinstance(legacy, dict):
+            result[DEFAULT_SAM3_EVIDENCE_ROLE] = dict(legacy)
+        return result
+
+    def same_view_point_grounding_source_error(
+        self,
+        resolved_sources: list[JsonDict],
+    ) -> str | None:
+        """Reject a silent packet refresh inside active same-view recovery.
+
+        Packet ids can advance on read-only turns even when the physical camera
+        view is unchanged.  A SAM3 no-detection handoff binds immutable pixels,
+        not the spelling of one packet id: a later same-camera packet is valid
+        when its RGB bytes are identical.  Changed pixels still require the exact
+        handoff packet (or an Agent-owned switch to another camera).
+        """
+
+        no_detection = self.sam3_no_detection()
+        if not isinstance(no_detection, dict):
+            return None
+        expected_packet = str(no_detection.get("source_packet_id") or "").strip()
+        expected_frame = str(no_detection.get("frame_id") or "").strip()
+        source_observation = no_detection.get("source_observation")
+        source_observation = (
+            source_observation if isinstance(source_observation, dict) else {}
+        )
+        object_epoch = no_detection.get("object_scene_epoch")
+        if object_epoch is None:
+            object_epoch = no_detection.get("scene_epoch")
+        if object_epoch is None:
+            object_epoch = source_observation.get("object_scene_epoch")
+        robot_epoch = no_detection.get("robot_motion_epoch")
+        if robot_epoch is None:
+            robot_epoch = source_observation.get("robot_motion_epoch")
+        if (
+            not expected_packet
+            or not expected_frame
+            or object_epoch is None
+            or robot_epoch is None
+            or _fact_epoch_value(object_epoch) != self.object_scene_epoch()
+            or _fact_epoch_value(robot_epoch) != self.robot_motion_epoch()
+        ):
+            return None
+        same_frame = [
+            source
+            for source in resolved_sources
+            if str(source.get("frame_id") or "") == expected_frame
+        ]
+        if not same_frame or any(
+            str(source.get("packet_id") or "") == expected_packet
+            for source in same_frame
+        ):
+            return None
+        expected_rgb = str(
+            source_observation.get("rgb") or no_detection.get("source_image") or ""
+        ).strip()
+        if expected_rgb and any(
+            _paths_have_identical_content(expected_rgb, source.get("rgb"))
+            for source in same_frame
+        ):
+            return None
+        supplied = sorted(
+            {
+                str(source.get("packet_id") or "")
+                for source in same_frame
+                if source.get("packet_id")
             }
         )
-        for key in ("fallback_required", "exhaustion_reason", "refinement_seed_candidate"):
-            policy.pop(key, None)
-        recovery.update(
-            {
-                "status": "final_candidate_activated",
-                "final_candidate_id": candidate["id"],
-                "final_source_result_id": selected.get("source_result_id"),
-                "completed_at_s": time.time(),
-            }
+        return (
+            "Same-view point grounding must include the exact SAM3 no-detection "
+            f"source packet {expected_packet!r} for camera {expected_frame!r}; "
+            f"received same-camera packet(s) {supplied!r}. Copy the immutable "
+            "handoff id instead of substituting a packet whose pixels changed. "
+            "A byte-identical read-only packet refresh is accepted automatically."
         )
-        self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-            policy,
-            source="final_refinable_grasp_fallback",
+
+    def _store_sam3_no_detection(
+        self,
+        failure: JsonDict,
+        *,
+        evidence_role: str,
+        source: str,
+    ) -> None:
+        role = _normalize_sam3_evidence_role(evidence_role)
+        failures = self.sam3_no_detections()
+        failures[role] = dict(failure)
+        self.facts[SAM3_NO_DETECTIONS_KEY] = _memory_fact_entry(
+            failures,
+            source=source,
         )
-        self.facts[GRASP_ESTIMATION_RECOVERY_KEY] = _memory_fact_entry(
-            recovery,
-            source="final_refinable_grasp_fallback",
-        )
-        self.facts.pop(GRASP_EXECUTION_KEY, None)
-        self.facts.pop(GRASP_LIFT_PROBE_KEY, None)
-        self.facts.pop(ARTICULATED_ATTACHMENT_PROBE_KEY, None)
-        self.facts.pop(ATTACHMENT_GATE_KEY, None)
-        self.record(
-            "final_refinable_grasp_candidate_activated",
-            {
-                "recovery_id": recovery_id,
-                "candidate_id": candidate["id"],
-                "original_candidate_id": original_id,
-                "score": candidate.get("score"),
-                "source_backend": policy.get("source_backend"),
-                "width_clamped": candidate["width_clamped_to_physical_limit"],
-            },
-        )
-        self._save_working_memory()
+        if role == DEFAULT_SAM3_EVIDENCE_ROLE:
+            self.facts[SAM3_NO_DETECTION_KEY] = _memory_fact_entry(
+                failure,
+                source=source,
+            )
+
+    def _remove_sam3_no_detection(self, *, evidence_role: str) -> None:
+        role = _normalize_sam3_evidence_role(evidence_role)
+        failures = self.sam3_no_detections()
+        failures.pop(role, None)
+        if failures:
+            self.facts[SAM3_NO_DETECTIONS_KEY] = _memory_fact_entry(
+                failures,
+                source="sam3_no_detection_removed",
+            )
+        else:
+            self.facts.pop(SAM3_NO_DETECTIONS_KEY, None)
+        if role == DEFAULT_SAM3_EVIDENCE_ROLE:
+            self.facts.pop(SAM3_NO_DETECTION_KEY, None)
+
+    def retained_targeted_grasp(self) -> JsonDict | None:
+        """Return the latest Agent-selected targeted-grasp evidence and source packet."""
+
+        provenance = _memory_fact_value(self.facts.get(GRASP_PROVENANCE_KEY))
+        if (
+            isinstance(provenance, dict)
+            and _fact_epoch_value(provenance.get("object_scene_epoch"))
+            == self.object_scene_epoch()
+            and not provenance.get("contact_geometry_invalidated_at_s")
+        ):
+            candidate = provenance.get("candidate")
+            source = provenance.get("source")
+            if isinstance(candidate, dict) and isinstance(source, dict):
+                return {
+                    "schema_version": "openeta.retained_targeted_grasp.v1",
+                    "evidence_id": provenance.get("evidence_id"),
+                    "artifact_key": provenance.get("artifact_key"),
+                    "result_id": provenance.get("result_id"),
+                    "compiled_grasp_id": provenance.get("compiled_grasp_id"),
+                    "status": "retained",
+                    "candidate": dict(candidate),
+                    "source": dict(source),
+                }
+
+        # Ranked estimator output remains evidence in working-memory artifacts.
+        # It becomes a singular retained target only after the Agent explicitly
+        # selects and compiles a candidate, which records grasp provenance above.
+        return None
+
+    def anyplace_input_bundle(self) -> JsonDict | None:
+        """Return the public reference for the active host-resolved AnyPlace bundle."""
+
+        state = _memory_fact_value(self.facts.get(ANYPLACE_INPUT_BUNDLES_KEY))
+        if not isinstance(state, dict):
+            return None
+        public = state.get("public")
+        return dict(public) if isinstance(public, dict) else None
+
+    def grasp_input_bundle(self) -> JsonDict | None:
+        """Return the public reference for the active targeted-grasp input bundle."""
+
+        state = _memory_fact_value(self.facts.get(GRASP_INPUT_BUNDLES_KEY))
+        if not isinstance(state, dict):
+            return None
+        public = state.get("public")
+        if not isinstance(public, dict):
+            return None
+        projected = dict(public)
+        bundle_epoch = _fact_epoch_value(projected.get("object_scene_epoch"))
+        if projected.get("status") == "ready" and bundle_epoch != self.object_scene_epoch():
+            projected.update(
+                {
+                    "status": "stale_object_scene",
+                    "bundle_id": None,
+                    "call_parameters": None,
+                    "recovery": "segment the target on a current observation packet",
+                }
+            )
+        return projected
+
+    def wrist_alignment_bundle(self) -> JsonDict | None:
+        state = _memory_fact_value(self.facts.get(WRIST_ALIGNMENT_BUNDLES_KEY))
+        public = state.get("public") if isinstance(state, dict) else None
+        if not isinstance(public, dict):
+            return None
+        projected = dict(public)
+        if projected.get("status") == "ready":
+            if (
+                _fact_epoch_value(projected.get("object_scene_epoch"))
+                != self.object_scene_epoch()
+            ):
+                projected.update(
+                    {
+                        "status": "stale_object_scene",
+                        "bundle_id": None,
+                        "call_parameters": None,
+                        "recovery": "segment the target on a current wrist observation packet",
+                    }
+                )
+            elif (
+                _fact_epoch_value(projected.get("robot_motion_epoch"))
+                != self.robot_motion_epoch()
+            ):
+                projected.update(
+                    {
+                        "status": "stale_robot_motion",
+                        "bundle_id": None,
+                        "call_parameters": None,
+                        "recovery": (
+                            "observe fresh wrist RGB-D after the latest robot motion, "
+                            "then segment and select the same target instance"
+                        ),
+                    }
+                )
+        return projected
+
+    def resolve_wrist_alignment_bundle(self, bundle_id: str) -> JsonDict:
+        requested = str(bundle_id or "").strip()
+        state = _memory_fact_value(self.facts.get(WRIST_ALIGNMENT_BUNDLES_KEY))
+        active_id = str(state.get("active_bundle_id") or "") if isinstance(state, dict) else ""
+        bundles = state.get("bundles") if isinstance(state, dict) else None
+        if not requested or requested != active_id:
+            raise ValueError(
+                "wrist alignment bundle is not active; inspect "
+                "host_resolved_inputs.wrist_alignment and copy its exact bundle_id"
+            )
+        bundle = bundles.get(requested) if isinstance(bundles, dict) else None
+        parameters = bundle.get("parameters") if isinstance(bundle, dict) else None
+        if not isinstance(parameters, dict):
+            raise ValueError("wrist alignment bundle parameters are unavailable")
+        if _fact_epoch_value(bundle.get("object_scene_epoch")) != self.object_scene_epoch():
+            raise ValueError("wrist alignment bundle belongs to a stale object-scene epoch")
+        if _fact_epoch_value(bundle.get("robot_motion_epoch")) != self.robot_motion_epoch():
+            raise ValueError(
+                "wrist alignment bundle belongs to a stale robot-motion epoch; "
+                "observe fresh wrist RGB-D and reselect the target"
+            )
         return {
-            "recovery_id": recovery_id,
-            "candidate": candidate,
-            "source_backend": policy.get("source_backend"),
-            "source_result_id": policy.get("result_id"),
-            "max_gripper_width_m": max_gripper_width,
-            "grasp_calibration_id": capabilities["calibration_id"],
+            "schema_version": "openeta.wrist_alignment_bundle_resolution.v1",
+            "bundle_id": requested,
+            "parameters": dict(parameters),
+            "target_evidence_id": bundle.get("target_evidence_id"),
+            "compiled_grasp_id": bundle.get("compiled_grasp_id"),
+        }
+
+    def resolve_grasp_input_bundle(self, bundle_id: str) -> JsonDict:
+        """Resolve an opaque targeted-grasp bundle to immutable host-owned inputs."""
+
+        requested = str(bundle_id or "").strip()
+        state = _memory_fact_value(self.facts.get(GRASP_INPUT_BUNDLES_KEY))
+        active_id = str(state.get("active_bundle_id") or "") if isinstance(state, dict) else ""
+        bundles = state.get("bundles") if isinstance(state, dict) else None
+        if not requested:
+            raise ValueError("grasp_pose_estimate requires a non-empty bundle_id")
+        if requested != active_id:
+            raise ValueError(
+                "grasp bundle is not the active host-resolved evidence bundle; inspect "
+                "host_resolved_inputs.grasp_pose_estimate and use its exact bundle_id"
+            )
+        bundle = bundles.get(requested) if isinstance(bundles, dict) else None
+        parameters = bundle.get("parameters") if isinstance(bundle, dict) else None
+        if not isinstance(parameters, dict):
+            raise ValueError("grasp bundle parameters are unavailable")
+        bundle_epoch = _fact_epoch_value(bundle.get("object_scene_epoch"))
+        if bundle_epoch != self.object_scene_epoch():
+            raise ValueError(
+                "grasp bundle belongs to a stale object-scene epoch; segment the target "
+                "on a current observation packet"
+            )
+        return {
+            "schema_version": "openeta.grasp_input_bundle_resolution.v1",
+            "bundle_id": requested,
+            "parameters": dict(parameters),
+            "target_evidence_id": bundle.get("target_evidence_id"),
+        }
+
+    def resolve_wrist_viewpoint_input(
+        self,
+        *,
+        compiled_grasp_id: str,
+        source_packet_id: str,
+        camera_frame_id: str,
+    ) -> JsonDict:
+        """Resolve current wrist geometry for read-only target-facing view proposals."""
+
+        compiled_id = str(compiled_grasp_id or "").strip()
+        if not compiled_id:
+            raise ValueError("propose_wrist_viewpoints requires compiled_grasp_id")
+        compiled = self._compiled_grasp_artifact(compiled_id)
+        if not isinstance(compiled, dict):
+            raise ValueError(
+                "compiled_grasp_id is unknown in the active provenance graph; compile "
+                "one current target candidate first"
+            )
+        source = self.resolve_observation_packet(source_packet_id, camera_frame_id)
+        frame_id = str(source.get("frame_id") or "")
+        role = str(source.get("role") or "")
+        if not _is_wrist_camera(frame_id, role):
+            raise ValueError(
+                "propose_wrist_viewpoints requires a wrist-camera frame from the source packet"
+            )
+        packet_object_epoch = _fact_epoch_value(source.get("object_scene_epoch"))
+        packet_robot_epoch = _fact_epoch_value(source.get("robot_motion_epoch"))
+        if packet_object_epoch != self.object_scene_epoch():
+            raise ValueError(
+                "source packet belongs to a stale object-scene epoch; observe again"
+            )
+        if packet_robot_epoch != self.robot_motion_epoch():
+            raise ValueError(
+                "source packet belongs to a stale robot-motion epoch; observe again after motion"
+            )
+        missing = [
+            name
+            for name in ("extrinsics", "current_eef_pose")
+            if not isinstance(source.get(name), dict) or not source.get(name)
+        ]
+        if missing:
+            raise ValueError(
+                "wrist source packet lacks calibrated viewpoint inputs: " + ", ".join(missing)
+            )
+        return {
+            "schema_version": "openeta.wrist_viewpoint_input_resolution.v1",
+            "compiled_grasp_id": compiled_id,
+            "source_packet_id": source.get("packet_id"),
+            "camera_frame_id": frame_id,
+            "parameters": {
+                "compiled_grasp": compiled,
+                "source_packet_id": source.get("packet_id"),
+                "camera_frame_id": frame_id,
+                "camera_extrinsics": source.get("extrinsics"),
+                "current_eef_pose": source.get("current_eef_pose"),
+                "object_scene_epoch": self.object_scene_epoch(),
+                "robot_motion_epoch": self.robot_motion_epoch(),
+            },
+        }
+
+    def resolve_grasp_candidate_input(
+        self,
+        *,
+        grasp_result_id: str,
+        candidate_id: str,
+    ) -> JsonDict:
+        """Resolve one estimator candidate and its immutable camera calibration."""
+
+        requested_result = str(grasp_result_id or "").strip()
+        requested_candidate = str(candidate_id or "").strip()
+        if not requested_result or not requested_candidate:
+            raise ValueError(
+                "compile_grasp_seed requires exact grasp_result_id and candidate_id"
+            )
+        recent_results: list[str] = []
+        for event in reversed(self.events):
+            if event.event_type != "action":
+                continue
+            command = event.payload.get("command")
+            command = command if isinstance(command, dict) else {}
+            calls = command.get("tool_calls")
+            calls = calls if isinstance(calls, list) else []
+            for call in reversed(calls):
+                if not isinstance(call, dict) or str(call.get("name") or "") not in {
+                    "grasp_pose_estimate",
+                    "anygrasp",
+                    "graspgenx",
+                    "contact_graspnet",
+                }:
+                    continue
+                outputs = _tool_call_outputs(call)
+                result_id = str(outputs.get("result_id") or "")
+                if result_id and result_id not in recent_results:
+                    recent_results.append(result_id)
+                if result_id != requested_result:
+                    continue
+                candidates = outputs.get("grasp_candidates")
+                candidates = candidates if isinstance(candidates, list) else []
+                candidate = next(
+                    (
+                        dict(item)
+                        for item in candidates
+                        if isinstance(item, dict)
+                        and str(item.get("id") or item.get("candidate_id") or "")
+                        == requested_candidate
+                    ),
+                    None,
+                )
+                if candidate is None:
+                    raise ValueError(
+                        f"candidate_id {requested_candidate!r} is not present in grasp "
+                        f"result {requested_result!r}; inspect that result's candidates"
+                    )
+                source = outputs.get("source")
+                source = source if isinstance(source, dict) else {}
+                source_packet_id = str(
+                    source.get("source_packet_id")
+                    or outputs.get("source_packet_id")
+                    or candidate.get("source_packet_id")
+                    or ""
+                )
+                camera_frame_id = str(
+                    source.get("camera_frame_id")
+                    or outputs.get("camera_frame_id")
+                    or candidate.get("camera_frame_id")
+                    or ""
+                )
+                resolved_source = self.resolve_observation_packet(
+                    source_packet_id,
+                    camera_frame_id,
+                )
+                evidence_epoch = _fact_epoch_value(
+                    outputs.get("scene_epoch", source.get("scene_epoch"))
+                )
+                if evidence_epoch != self.object_scene_epoch():
+                    raise ValueError(
+                        "grasp_result_id belongs to a stale object-scene epoch; rerun "
+                        "targeted grasp estimation"
+                    )
+                extrinsics = resolved_source.get("extrinsics")
+                if not isinstance(extrinsics, dict) or not extrinsics:
+                    raise ValueError(
+                        "the grasp result source packet lacks camera extrinsics"
+                    )
+                return {
+                    "schema_version": "openeta.grasp_candidate_input_resolution.v1",
+                    "grasp_result_id": requested_result,
+                    "candidate_id": requested_candidate,
+                    "source_packet_id": resolved_source.get("packet_id"),
+                    "camera_frame_id": resolved_source.get("frame_id"),
+                    "parameters": {
+                        "camera_pose": candidate,
+                        "camera_extrinsics": dict(extrinsics),
+                        "camera_frame_id": resolved_source.get("frame_id"),
+                        "scene_epoch": self.object_scene_epoch(),
+                        **(
+                            {
+                                "target_mask_quality": dict(
+                                    outputs["target_mask_quality"]
+                                )
+                            }
+                            if isinstance(outputs.get("target_mask_quality"), dict)
+                            else {}
+                        ),
+                        "grasp_candidate_count": _optional_int(
+                            outputs.get("candidate_count"), default=0
+                        ),
+                        **(
+                            {
+                                "grasp_selection_advice": dict(
+                                    outputs["grasp_selection_advice"]
+                                )
+                            }
+                            if isinstance(outputs.get("grasp_selection_advice"), dict)
+                            else {}
+                        ),
+                    },
+                }
+        raise ValueError(
+            f"unknown grasp_result_id {requested_result!r} in the active session; "
+            f"recent result ids: {recent_results[:6]}"
+        )
+
+    def resolve_wrist_viewpoint_candidate(
+        self,
+        *,
+        proposal_id: str,
+        candidate_id: str,
+    ) -> JsonDict:
+        """Resolve a proposal candidate to the exact full pose returned by the host."""
+
+        requested_proposal = str(proposal_id or "").strip()
+        requested_candidate = str(candidate_id or "").strip()
+        if not requested_proposal or not requested_candidate:
+            raise ValueError(
+                "ik_preview_check viewpoint reference requires viewpoint_proposal_id "
+                "and candidate_id"
+            )
+        for event in reversed(self.events):
+            if event.event_type != "action":
+                continue
+            command = event.payload.get("command")
+            command = command if isinstance(command, dict) else {}
+            calls = command.get("tool_calls")
+            calls = calls if isinstance(calls, list) else []
+            for call in reversed(calls):
+                if not isinstance(call, dict) or call.get("name") != "propose_wrist_viewpoints":
+                    continue
+                outputs = _tool_call_outputs(call)
+                if str(outputs.get("proposal_id") or "") != requested_proposal:
+                    continue
+                if _fact_epoch_value(outputs.get("object_scene_epoch")) != self.object_scene_epoch():
+                    raise ValueError(
+                        "viewpoint proposal is stale because object_scene_epoch changed"
+                    )
+                if _fact_epoch_value(outputs.get("robot_motion_epoch")) != self.robot_motion_epoch():
+                    raise ValueError(
+                        "viewpoint proposal is stale because robot_motion_epoch changed"
+                    )
+                candidates = outputs.get("candidates")
+                candidates = candidates if isinstance(candidates, list) else []
+                candidate = next(
+                    (
+                        item
+                        for item in candidates
+                        if isinstance(item, dict)
+                        and str(item.get("candidate_id") or "") == requested_candidate
+                    ),
+                    None,
+                )
+                if not isinstance(candidate, dict):
+                    raise ValueError(
+                        f"candidate_id {requested_candidate!r} is not present in "
+                        f"viewpoint proposal {requested_proposal!r}"
+                    )
+                target_pose = candidate.get("target_pose")
+                if not isinstance(target_pose, dict):
+                    raise ValueError("viewpoint candidate does not contain target_pose")
+                return {
+                    "schema_version": "openeta.wrist_viewpoint_candidate_resolution.v1",
+                    "proposal_id": requested_proposal,
+                    "candidate_id": requested_candidate,
+                    "parameters": {"target_pose": dict(target_pose)},
+                }
+        raise ValueError(
+            f"unknown viewpoint_proposal_id {requested_proposal!r} in the active session"
+        )
+
+    def resolve_anyplace_input_bundle(self, bundle_id: str) -> JsonDict:
+        """Resolve an Agent-supplied bundle id to immutable host-owned parameters."""
+
+        requested = str(bundle_id or "").strip()
+        state = _memory_fact_value(self.facts.get(ANYPLACE_INPUT_BUNDLES_KEY))
+        active_id = str(state.get("active_bundle_id") or "") if isinstance(state, dict) else ""
+        bundles = state.get("bundles") if isinstance(state, dict) else None
+        if not requested:
+            raise ValueError("anyplace requires a non-empty bundle_id")
+        if requested != active_id:
+            raise ValueError(
+                "anyplace bundle is not the active host-resolved evidence bundle; "
+                "inspect host_resolved_inputs.anyplace and use its exact bundle_id"
+            )
+        bundle = bundles.get(requested) if isinstance(bundles, dict) else None
+        parameters = bundle.get("parameters") if isinstance(bundle, dict) else None
+        if not isinstance(parameters, dict):
+            raise ValueError("anyplace bundle parameters are unavailable")
+        bundle_epoch = _fact_epoch_value(bundle.get("object_scene_epoch"))
+        valid_through_epoch = _fact_epoch_value(
+            bundle.get("valid_through_object_scene_epoch")
+        )
+        materialized = bundle.get("materialized") is True
+        current_epoch = self.object_scene_epoch()
+        if bundle_epoch != current_epoch and not (
+            materialized and valid_through_epoch >= current_epoch
+        ):
+            raise ValueError(
+                "anyplace bundle belongs to a stale object-scene epoch; regenerate grasp "
+                "and placement evidence"
+            )
+        return {
+            "schema_version": "openeta.anyplace_bundle_resolution.v1",
+            "bundle_id": requested,
+            "parameters": {**dict(parameters), "bundle_id": requested},
+            "grasp_evidence_id": bundle.get("grasp_evidence_id"),
+            "placement_evidence_id": bundle.get("placement_evidence_id"),
+        }
+
+    def resolve_placement_candidate_input(
+        self,
+        *,
+        placement_result_id: str,
+        candidate_id: str,
+    ) -> JsonDict:
+        """Resolve one frozen AnyPlace candidate with its original camera calibration."""
+
+        requested_result = str(placement_result_id or "").strip()
+        requested_candidate = str(candidate_id or "").strip()
+        if not requested_result or not requested_candidate:
+            raise ValueError(
+                "camera_pose_to_world requires exact placement_result_id and candidate_id"
+            )
+        state = _memory_fact_value(self.facts.get(ANYPLACE_INPUT_BUNDLES_KEY))
+        bundles = state.get("bundles") if isinstance(state, dict) else None
+        if not isinstance(bundles, dict):
+            raise ValueError("no materialized AnyPlace results exist in the active session")
+        recent_result_ids: list[str] = []
+        for bundle in reversed(list(bundles.values())):
+            if not isinstance(bundle, dict) or bundle.get("materialized") is not True:
+                continue
+            result_id = str(bundle.get("materialized_result_id") or "")
+            if result_id and result_id not in recent_result_ids:
+                recent_result_ids.append(result_id)
+            if result_id != requested_result:
+                continue
+            candidates = bundle.get("placement_candidates")
+            candidates = candidates if isinstance(candidates, list) else []
+            candidate = next(
+                (
+                    dict(item)
+                    for item in candidates
+                    if isinstance(item, dict)
+                    and str(item.get("id") or "") == requested_candidate
+                ),
+                None,
+            )
+            if candidate is None:
+                raise ValueError(
+                    f"candidate_id {requested_candidate!r} is not present in placement "
+                    f"result {requested_result!r}; valid ids: "
+                    + str(
+                        [
+                            item.get("id")
+                            for item in candidates
+                            if isinstance(item, dict) and item.get("id")
+                        ]
+                    )
+                )
+            place_pose = candidate.get("place_grasp_pose")
+            if not isinstance(place_pose, dict):
+                raise ValueError("placement candidate lacks place_grasp_pose")
+            parameters = bundle.get("parameters")
+            selected_grasp = (
+                parameters.get("selected_grasp") if isinstance(parameters, dict) else None
+            )
+            source = (
+                selected_grasp.get("source")
+                if isinstance(selected_grasp, dict)
+                else None
+            )
+            source = source if isinstance(source, dict) else {}
+            source_packet_id = str(source.get("source_packet_id") or "")
+            camera_frame_id = str(source.get("camera_frame_id") or "")
+            if not source_packet_id:
+                reference = self.observation_packet_reference_for_path(source.get("rgb"))
+                reference = reference if isinstance(reference, dict) else {}
+                source_packet_id = str(reference.get("source_packet_id") or "")
+                camera_frame_id = camera_frame_id or str(
+                    reference.get("camera_frame_id") or ""
+                )
+            try:
+                resolved_source = self.resolve_observation_packet(
+                    source_packet_id,
+                    camera_frame_id,
+                    require_files=False,
+                )
+            except (ValueError, ObservationPacketResolutionError) as exc:
+                raise ValueError(
+                    "the AnyPlace result's original observation packet cannot provide "
+                    f"camera calibration: {exc}"
+                ) from exc
+            extrinsics = resolved_source.get("extrinsics")
+            if not isinstance(extrinsics, dict) or not extrinsics:
+                raise ValueError(
+                    "the AnyPlace result's original observation packet lacks camera extrinsics"
+                )
+            return {
+                "schema_version": "openeta.placement_candidate_input_resolution.v1",
+                "placement_result_id": requested_result,
+                "candidate_id": requested_candidate,
+                "source_packet_id": resolved_source.get("packet_id"),
+                "camera_frame_id": resolved_source.get("frame_id"),
+                "parameters": {
+                    "camera_pose": dict(place_pose),
+                    "camera_extrinsics": dict(extrinsics),
+                    "camera_frame_id": resolved_source.get("frame_id"),
+                    "placement_result_id": requested_result,
+                    "candidate_id": requested_candidate,
+                },
+            }
+        raise ValueError(
+            f"unknown placement_result_id {requested_result!r} in the active session; "
+            f"recent result ids: {recent_result_ids[:6]}"
+        )
+
+    def provenance_evidence_graph(self) -> JsonDict:
+        """Project the current grasp/placement lineage as a read-only evidence graph."""
+
+        nodes: list[JsonDict] = []
+        edges: list[JsonDict] = []
+        inconsistencies: list[JsonDict] = []
+        target = self.selected_sam3_detection()
+        target_id = (
+            f"sam3:{target.get('result_id')}:{target.get('id')}"
+            if isinstance(target, dict)
+            and target.get("result_id")
+            and target.get("id")
+            else ""
+        )
+        grasp = _memory_fact_value(self.facts.get(GRASP_PROVENANCE_KEY))
+        if isinstance(grasp, dict) and isinstance(grasp.get("evidence_id"), str):
+            grasp_id = str(grasp["evidence_id"])
+            grasp_target_id = str(grasp.get("target_evidence_id") or "")
+            grasp_anchor_id = str(grasp.get("target_identity_anchor_id") or "")
+            current_anchor_id = (
+                str(target.get("identity_anchor_id") or "")
+                if isinstance(target, dict)
+                else ""
+            )
+            compiled_artifact = next(
+                (
+                    entry.get("value")
+                    for entry in self.artifacts.values()
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("value"), dict)
+                    and entry["value"].get("type") == "compiled_grasp"
+                    and str(entry["value"].get("compiled_grasp_id") or "")
+                    == str(grasp.get("compiled_grasp_id") or "")
+                ),
+                {},
+            )
+            target_superseded = bool(
+                target_id
+                and grasp_target_id
+                and target_id != grasp_target_id
+                and not (
+                    grasp_anchor_id
+                    and current_anchor_id
+                    and grasp_anchor_id == current_anchor_id
+                )
+            )
+            object_scene_current = (
+                _fact_epoch_value(grasp.get("object_scene_epoch"))
+                == self.object_scene_epoch()
+            )
+            contact_geometry_invalidated = bool(
+                grasp.get("contact_geometry_invalidated_at_s")
+            )
+            nodes.append(
+                {
+                    "evidence_id": grasp_id,
+                    "kind": "compiled_targeted_grasp",
+                    "target_evidence_id": grasp_target_id or None,
+                    "target_identity_anchor_id": grasp_anchor_id or None,
+                    "candidate_id": grasp.get("candidate_id"),
+                    "compiled_grasp_id": grasp.get("compiled_grasp_id"),
+                    "artifact_key": grasp.get("artifact_key"),
+                    "object_scene_epoch": grasp.get("object_scene_epoch"),
+                    "robot_motion_epoch": grasp.get("robot_motion_epoch"),
+                    "freshness": (
+                        "invalidated_contact_geometry"
+                        if contact_geometry_invalidated
+                        else (
+                            "superseded_target_evidence"
+                            if target_superseded
+                            else (
+                                "current_object_scene"
+                                if object_scene_current
+                                else "stale_object_scene"
+                            )
+                        )
+                    ),
+                    **(
+                        {
+                            "hover_pose": compiled_artifact.get("hover_pose"),
+                            "contact_pose": compiled_artifact.get("contact_pose"),
+                        }
+                        if isinstance(compiled_artifact, dict)
+                        else {}
+                    ),
+                }
+            )
+            if target_superseded:
+                inconsistencies.append(
+                    {
+                        "code": "compiled_grasp_target_superseded",
+                        "compiled_grasp_id": grasp.get("compiled_grasp_id"),
+                        "grasp_evidence_id": grasp_id,
+                        "compiled_target_evidence_id": grasp_target_id,
+                        "current_target_evidence_id": target_id,
+                        "recovery": (
+                            "use the current grasp_pose_estimate bundle, choose a new "
+                            "candidate, and compile it before contact or gripper close"
+                        ),
+                    }
+                )
+            if contact_geometry_invalidated:
+                inconsistencies.append(
+                    {
+                        "code": "compiled_grasp_contact_geometry_invalidated",
+                        "compiled_grasp_id": grasp.get("compiled_grasp_id"),
+                        "grasp_evidence_id": grasp_id,
+                        "invalidated_by": grasp.get("contact_geometry_invalidated_by"),
+                        "recovery": (
+                            "use fresh target evidence, choose a current grasp candidate, "
+                            "and compile new contact geometry before close or probe"
+                        ),
+                    }
+                )
+        else:
+            grasp_id = ""
+            grasp_target_id = ""
+        if isinstance(target, dict) and target_id:
+            nodes.append(
+                {
+                    "evidence_id": target_id,
+                    "kind": "selected_target_object",
+                    "sam3_result_id": target.get("result_id"),
+                    "detection_id": target.get("id"),
+                    "source_image": target.get("source_image"),
+                    "mask_ref": target.get("mask_ref"),
+                    "object_scene_epoch": target.get("scene_epoch"),
+                }
+            )
+            if grasp_id and grasp_target_id == target_id:
+                edges.append(
+                    {"from": target_id, "to": grasp_id, "relation": "target_input"}
+                )
+            elif (
+                grasp_id
+                and grasp_anchor_id
+                and str(target.get("identity_anchor_id") or "") == grasp_anchor_id
+            ):
+                edges.append(
+                    {
+                        "from": target_id,
+                        "to": grasp_id,
+                        "relation": "same_instance_visual_refinement",
+                    }
+                )
+            elif grasp_id and grasp_target_id:
+                edges.append(
+                    {"from": target_id, "to": grasp_id, "relation": "supersedes_target_input"}
+                )
+        placement = self.selected_sam3_detection("placement_region")
+        if isinstance(placement, dict):
+            placement_id = _placement_evidence_id(placement)
+            nodes.append(
+                {
+                    "evidence_id": placement_id,
+                    "kind": "selected_placement_region",
+                    "sam3_result_id": placement.get("result_id"),
+                    "detection_id": placement.get("id"),
+                    "source_image": placement.get("source_image"),
+                    "mask_ref": placement.get("mask_ref"),
+                    "object_scene_epoch": placement.get("scene_epoch"),
+                }
+            )
+        else:
+            placement_id = ""
+        bundle = self.anyplace_input_bundle()
+        if isinstance(bundle, dict) and bundle.get("status") == "ready":
+            bundle_id = str(bundle.get("bundle_id") or "")
+            node_id = f"anyplace_bundle:{bundle_id}"
+            nodes.append(
+                {
+                    "evidence_id": node_id,
+                    "kind": "anyplace_input_bundle",
+                    "bundle_id": bundle_id,
+                    "status": "ready",
+                }
+            )
+            if grasp_id:
+                edges.append({"from": grasp_id, "to": node_id, "relation": "grasp_input"})
+            if placement_id:
+                edges.append(
+                    {"from": placement_id, "to": node_id, "relation": "placement_input"}
+                )
+        return {
+            "schema_version": "openeta.provenance_evidence_graph.v1",
+            "nodes": nodes,
+            "edges": edges,
+            "inconsistencies": inconsistencies,
         }
 
     def _active_grasp_calibration_capabilities(self) -> JsonDict:
@@ -841,39 +2028,587 @@ class AgentMemory:
         )
         return load_grasp_calibration_capabilities(str(profile_path))
 
-    def grasp_lift_probe(self) -> JsonDict | None:
-        return _memory_fact_value(self.facts.get(GRASP_LIFT_PROBE_KEY))
-
     def articulated_attachment_probe(self) -> JsonDict | None:
         return _memory_fact_value(self.facts.get(ARTICULATED_ATTACHMENT_PROBE_KEY))
 
-    def grasp_execution(self) -> JsonDict | None:
-        return _memory_fact_value(self.facts.get(GRASP_EXECUTION_KEY))
+    def grasp_adjustment_budget(self) -> JsonDict | None:
+        """Return the host-owned residual budget for the active compiled grasp."""
 
-    def grasp_recovery(self) -> JsonDict | None:
-        return _memory_fact_value(self.facts.get(GRASP_RECOVERY_KEY))
-
-    def grasp_estimation_recovery(self) -> JsonDict | None:
-        return _memory_fact_value(self.facts.get(GRASP_ESTIMATION_RECOVERY_KEY))
+        return _memory_fact_value(self.facts.get(GRASP_ADJUSTMENT_BUDGET_KEY))
 
     def gripper_command_state(self) -> JsonDict | None:
         return _memory_fact_value(self.facts.get(GRIPPER_COMMAND_STATE_KEY))
 
-    def attachment_gate(self) -> JsonDict | None:
-        return _memory_fact_value(self.facts.get(ATTACHMENT_GATE_KEY))
+    def attachment_evidence(self) -> JsonDict | None:
+        return _memory_fact_value(self.facts.get(ATTACHMENT_EVIDENCE_KEY))
 
-    def placement_release(self) -> JsonDict | None:
-        return _memory_fact_value(self.facts.get(PLACEMENT_RELEASE_KEY))
+    def placement_world_reference(self) -> JsonDict | None:
+        return _memory_fact_value(self.facts.get(PLACEMENT_WORLD_REFERENCE_KEY))
 
     def motion_reconciliation(self) -> JsonDict | None:
         return _memory_fact_value(self.facts.get(MOTION_RECONCILIATION_KEY))
 
+    def ik_preview_receipts(self) -> JsonDict | None:
+        """Return the bounded host index of recent endpoint previews."""
+
+        return _memory_fact_value(self.facts.get(IK_PREVIEW_RECEIPTS_KEY))
+
+    def resolve_compiled_grasp_pose_reference(
+        self,
+        *,
+        compiled_grasp_id: str,
+        waypoint_role: str,
+    ) -> JsonDict:
+        """Resolve an exact compiled waypoint without model-side pose copying.
+
+        The Agent still chooses the compiled grasp and waypoint.  The host only
+        expands that explicit reference to the immutable pose already present in
+        the evidence graph; it does not choose a task stage or a fallback.
+        """
+
+        compiled_id = str(compiled_grasp_id or "").strip()
+        requested_role = str(waypoint_role or "").strip()
+        if not compiled_id:
+            raise ValueError("compiled_grasp_id is required")
+        if not requested_role:
+            raise ValueError("waypoint_role is required")
+        role = _compiled_grasp_pose_role({"waypoint_role": requested_role})
+        if not role:
+            raise ValueError(
+                "waypoint_role must be grasp_clearance, grasp_precontact, "
+                "grasp_alignment_reference, or grasp_contact"
+            )
+        compiled = self._compiled_grasp_artifact(compiled_id)
+        if not isinstance(compiled, dict):
+            available = [
+                str(value.get("compiled_grasp_id") or "")
+                for entry in reversed(list(self.artifacts.values()))
+                if isinstance(entry, dict)
+                and isinstance((value := entry.get("value")), dict)
+                and value.get("type") == "compiled_grasp"
+                and value.get("compiled_grasp_id")
+            ][:4]
+            raise ValueError(
+                f"compiled grasp {compiled_id!r} does not exist; "
+                f"available recent ids={available!r}"
+            )
+        artifact_epoch = _optional_int(compiled.get("scene_epoch"), default=-1)
+        if artifact_epoch != self.object_scene_epoch():
+            raise ValueError(
+                f"compiled grasp {compiled_id!r} belongs to object_scene_epoch "
+                f"{artifact_epoch}, current={self.object_scene_epoch()}"
+            )
+        pose = _compiled_grasp_reference_pose(compiled, role=role)
+        if not isinstance(pose, dict):
+            raise ValueError(
+                f"compiled grasp {compiled_id!r} has no pose for {requested_role!r}"
+            )
+        return {
+            "schema_version": "openeta.compiled_grasp_pose_resolution.v1",
+            "compiled_grasp_id": compiled_id,
+            "waypoint_role": requested_role,
+            "parameters": {"target_pose": dict(pose)},
+        }
+
+    def resolve_compiled_grasp_path_sample_reference(
+        self,
+        *,
+        compiled_grasp_id: str,
+        path_fraction: float,
+    ) -> JsonDict:
+        """Resolve an Agent-chosen sample on a compiled clearance-contact line.
+
+        This is deterministic geometry expansion, not a task phase: the Agent
+        decides whether samples are useful, how many to request, and their
+        fractions. Every returned pose still requires an independent IK preview.
+        """
+
+        compiled_id = str(compiled_grasp_id or "").strip()
+        if not compiled_id:
+            raise ValueError("compiled_grasp_id is required")
+        if isinstance(path_fraction, bool) or not isinstance(path_fraction, int | float):
+            raise ValueError("path_fraction must be a finite number strictly between 0 and 1")
+        fraction = float(path_fraction)
+        if not math.isfinite(fraction) or not 0.0 < fraction < 1.0:
+            raise ValueError("path_fraction must be a finite number strictly between 0 and 1")
+        compiled = self._compiled_grasp_artifact(compiled_id)
+        if not isinstance(compiled, dict):
+            raise ValueError(f"compiled grasp {compiled_id!r} does not exist")
+        artifact_epoch = _optional_int(compiled.get("scene_epoch"), default=-1)
+        if artifact_epoch != self.object_scene_epoch():
+            raise ValueError(
+                f"compiled grasp {compiled_id!r} belongs to object_scene_epoch "
+                f"{artifact_epoch}, current={self.object_scene_epoch()}"
+            )
+        clearance = _compiled_grasp_reference_pose(compiled, role="clearance")
+        contact = _compiled_grasp_reference_pose(compiled, role="contact")
+        if not isinstance(clearance, dict) or not isinstance(contact, dict):
+            raise ValueError(
+                f"compiled grasp {compiled_id!r} lacks clearance/contact endpoints"
+            )
+        clearance_xyz = clearance.get("xyz")
+        contact_xyz = contact.get("xyz")
+        if not _finite_xyz(clearance_xyz) or not _finite_xyz(contact_xyz):
+            raise ValueError(
+                f"compiled grasp {compiled_id!r} has non-finite path endpoints"
+            )
+        pose = dict(contact)
+        pose.update(
+            {
+                "xyz": [
+                    round(
+                        float(clearance_xyz[index])
+                        + fraction
+                        * (float(contact_xyz[index]) - float(clearance_xyz[index])),
+                        12,
+                    )
+                    for index in range(3)
+                ],
+                "waypoint_role": "grasp_path_sample",
+                "path_fraction": fraction,
+                "segment_start_role": "grasp_clearance",
+                "segment_end_role": "grasp_contact",
+            }
+        )
+        return {
+            "schema_version": "openeta.compiled_grasp_path_sample_resolution.v1",
+            "compiled_grasp_id": compiled_id,
+            "path_fraction": fraction,
+            "parameters": {"target_pose": pose},
+        }
+
+    def resolve_attachment_probe_waypoint(
+        self,
+        *,
+        probe_id: str,
+        waypoint_index: int,
+    ) -> JsonDict:
+        """Resolve one exact frozen probe waypoint from a short public reference.
+
+        The Agent selects the probe and ordered waypoint.  The host validates the
+        current evidence epochs and expands that reference to the immutable pose;
+        it does not choose a motion or advance a manipulation stage.
+        """
+
+        requested_probe = str(probe_id or "").strip()
+        if not requested_probe:
+            raise ValueError("probe_id is required")
+        if isinstance(waypoint_index, bool) or not isinstance(waypoint_index, int):
+            raise ValueError("waypoint_index must be a zero-based integer")
+        probe = self.articulated_attachment_probe()
+        if not isinstance(probe, dict):
+            raise ValueError(
+                f"attachment probe {requested_probe!r} does not exist; no prepared "
+                "probe is available"
+            )
+        available_probe = str(probe.get("probe_id") or "")
+        if requested_probe != available_probe:
+            raise ValueError(
+                f"attachment probe {requested_probe!r} does not exist; active "
+                f"probe_id={available_probe!r}"
+            )
+        if probe.get("status") != "prepared":
+            raise ValueError(
+                f"attachment probe {requested_probe!r} is {probe.get('status')!r}; "
+                "only a prepared, unexecuted probe can be previewed"
+            )
+        probe_object_epoch = _fact_epoch_value(
+            probe.get("object_scene_epoch", probe.get("scene_epoch"))
+        )
+        if probe_object_epoch != self.object_scene_epoch():
+            raise ValueError(
+                f"attachment probe {requested_probe!r} is stale: probe "
+                f"object_scene_epoch={probe_object_epoch}, current="
+                f"{self.object_scene_epoch()}"
+            )
+        probe_robot_epoch = _fact_epoch_value(probe.get("robot_motion_epoch"))
+        if probe_robot_epoch != self.robot_motion_epoch():
+            raise ValueError(
+                f"attachment probe {requested_probe!r} is stale: probe "
+                f"robot_motion_epoch={probe_robot_epoch}, current="
+                f"{self.robot_motion_epoch()}"
+            )
+        frozen_path = probe.get("frozen_path")
+        if not isinstance(frozen_path, list) or not frozen_path:
+            raise ValueError(
+                f"attachment probe {requested_probe!r} has no frozen waypoints"
+            )
+        if not 0 <= waypoint_index < len(frozen_path):
+            raise ValueError(
+                f"waypoint_index {waypoint_index} is out of range for attachment "
+                f"probe {requested_probe!r}; valid indices="
+                f"{list(range(len(frozen_path)))!r}"
+            )
+        pose = frozen_path[waypoint_index]
+        if not isinstance(pose, dict) or not _finite_xyz(
+            pose.get("xyz", pose.get("translation_xyz"))
+        ):
+            raise ValueError(
+                f"attachment probe {requested_probe!r} waypoint {waypoint_index} "
+                "has no executable target_pose"
+            )
+        marker = str(probe.get("path_sha256") or "")
+        if not marker or str(pose.get("probe_path_sha256") or "") != marker:
+            raise ValueError(
+                f"attachment probe {requested_probe!r} waypoint {waypoint_index} "
+                "does not match the frozen path digest"
+            )
+        return {
+            "schema_version": "openeta.attachment_probe_waypoint_resolution.v1",
+            "probe_id": requested_probe,
+            "waypoint_index": waypoint_index,
+            "waypoint_count": len(frozen_path),
+            "path_sha256": marker,
+            "parameters": {"target_pose": dict(pose)},
+        }
+
+    def resolve_ik_motion_reference(self, ik_receipt_id: str) -> JsonDict:
+        """Expand one exact IK receipt into move parameters.
+
+        This prevents a planner from having to reproduce xyz/orientation arrays
+        between preview and execution.  Freshness and authorization are still
+        checked by the ordinary motion gates after expansion.
+        """
+
+        requested_id = str(ik_receipt_id or "").strip()
+        if not requested_id:
+            raise ValueError("ik_receipt_id is required")
+        state = self.ik_preview_receipts() or {}
+        receipts = [
+            item for item in state.get("receipts", []) if isinstance(item, dict)
+        ]
+        receipt = next(
+            (
+                item
+                for item in reversed(receipts)
+                if str(item.get("receipt_id") or "") == requested_id
+            ),
+            None,
+        )
+        if not isinstance(receipt, dict):
+            available = [
+                str(item.get("receipt_id") or "")
+                for item in reversed(receipts)
+                if item.get("receipt_id")
+            ][:6]
+            raise ValueError(
+                f"IK receipt {requested_id!r} does not exist; "
+                f"available recent ids={available!r}"
+            )
+        receipt_object_epoch = _fact_epoch_value(receipt.get("object_scene_epoch"))
+        receipt_robot_epoch = _fact_epoch_value(receipt.get("robot_motion_epoch"))
+        if (
+            receipt_object_epoch != self.object_scene_epoch()
+            or receipt_robot_epoch != self.robot_motion_epoch()
+        ):
+            raise ValueError(
+                f"IK receipt {requested_id!r} is stale: receipt epochs "
+                f"object={receipt_object_epoch}, robot={receipt_robot_epoch}; current "
+                f"object={self.object_scene_epoch()}, robot={self.robot_motion_epoch()}"
+            )
+        target_pose = receipt.get("target_pose")
+        if not isinstance(target_pose, dict) or not _finite_xyz(
+            target_pose.get("xyz", target_pose.get("translation_xyz"))
+        ):
+            raise ValueError(
+                f"IK receipt {requested_id!r} has no executable target_pose"
+            )
+        parameters: JsonDict = {
+            "target_pose": dict(target_pose),
+            "ik_receipt_id": requested_id,
+        }
+        parameters["preserve_current_orientation"] = (
+            str(receipt.get("orientation_policy") or "") == "preserve_current"
+        )
+        tolerances = receipt.get("tolerances")
+        tolerances = tolerances if isinstance(tolerances, dict) else {}
+        if tolerances.get("position_tolerance_m") is not None:
+            parameters["tolerance"] = tolerances["position_tolerance_m"]
+        if tolerances.get("orientation_tolerance_rad") is not None:
+            parameters["ori_tolerance"] = tolerances["orientation_tolerance_rad"]
+        return {
+            "schema_version": "openeta.ik_motion_reference_resolution.v1",
+            "ik_receipt_id": requested_id,
+            "parameters": parameters,
+        }
+
+    def resolve_ik_trajectory_reference(
+        self,
+        ik_receipt_ids: object,
+    ) -> JsonDict:
+        """Resolve 1-5 checked endpoints into one atomic EEF trajectory."""
+
+        if not isinstance(ik_receipt_ids, list) or not 1 <= len(ik_receipt_ids) <= 5:
+            raise ValueError("ik_receipt_ids must contain between one and five ids")
+        if any(not isinstance(value, str) or not value.strip() for value in ik_receipt_ids):
+            raise ValueError("every ik_receipt_ids entry must be a non-empty string")
+        ids = [str(value).strip() for value in ik_receipt_ids]
+        if len(set(ids)) != len(ids):
+            raise ValueError("ik_receipt_ids must not contain duplicates")
+        resolutions = [self.resolve_ik_motion_reference(value) for value in ids]
+        trajectory = [
+            dict(resolution["parameters"]["target_pose"])
+            for resolution in resolutions
+        ]
+        return {
+            "schema_version": "openeta.ik_trajectory_reference_resolution.v1",
+            "ik_receipt_ids": ids,
+            "parameters": {
+                "trajectory": trajectory,
+                "ik_receipt_ids": ids,
+            },
+        }
+
+    def resolve_ik_trajectory_execution_bundle(
+        self,
+        parameters: object,
+    ) -> JsonDict | None:
+        """Build a host-private exact-route bundle for condition C.
+
+        The Agent remains responsible only for choosing ordered receipt IDs.
+        This bundle preserves each receipt's captured orientation and source
+        epochs so the simulator can re-preview every endpoint just in time from
+        the actual state reached by the previous segment.  It is not exposed in
+        the Agent-facing tool schema and does not claim path-collision coverage.
+        """
+
+        if not isinstance(parameters, dict):
+            return None
+        ids = parameters.get("ik_receipt_ids")
+        if not isinstance(ids, list) or not ids:
+            return None
+        # Reuse the ordinary resolver to enforce existence, freshness, endpoint
+        # authorization, duplicate rejection, and the current epoch contract.
+        resolution = self.resolve_ik_trajectory_reference(ids)
+        resolved = resolution.get("parameters")
+        trajectory = resolved.get("trajectory") if isinstance(resolved, dict) else None
+        if not isinstance(trajectory, list) or len(trajectory) != len(ids):
+            return None
+
+        state = self.ik_preview_receipts() or {}
+        by_id = {
+            str(receipt.get("receipt_id") or ""): receipt
+            for receipt in state.get("receipts", []) or []
+            if isinstance(receipt, dict) and receipt.get("receipt_id")
+        }
+        entries: list[JsonDict] = []
+        for index, (receipt_id, resolved_pose) in enumerate(zip(ids, trajectory)):
+            receipt = by_id.get(str(receipt_id))
+            if not isinstance(receipt, dict) or not isinstance(resolved_pose, dict):
+                return None
+            pose = dict(resolved_pose)
+            reachability = receipt.get("reachability")
+            reachability = reachability if isinstance(reachability, dict) else {}
+            checked_target = reachability.get("target")
+            checked_target = checked_target if isinstance(checked_target, dict) else {}
+            captured_quat = checked_target.get("quat_xyzw")
+            if (
+                str(receipt.get("orientation_policy") or "")
+                == "preserve_current"
+                and isinstance(captured_quat, list)
+                and len(captured_quat) == 4
+            ):
+                source_captured_quat = [float(value) for value in captured_quat]
+                # Preserve-current is an epoch-bound six-DoF receipt, not an
+                # unconstrained rotation.  The exact orientation captured by
+                # the original per-endpoint preview remains the route target;
+                # condition C rechecks that exact target from each actual
+                # preceding endpoint before it executes the segment.
+                pose["quat_xyzw"] = list(source_captured_quat)
+            else:
+                source_captured_quat = None
+            candidate = receipt.get("best_candidate")
+            candidate = candidate if isinstance(candidate, dict) else {}
+            entries.append(
+                {
+                    "index": index,
+                    "source_ik_receipt_id": str(receipt_id),
+                    "target_pose": pose,
+                    "orientation_policy": str(
+                        receipt.get("orientation_policy") or ""
+                    ),
+                    "source_captured_quat_xyzw": source_captured_quat,
+                    "tolerances": dict(receipt.get("tolerances") or {}),
+                    "source_object_scene_epoch": _fact_epoch_value(
+                        receipt.get("object_scene_epoch")
+                    ),
+                    "source_robot_motion_epoch": _fact_epoch_value(
+                        receipt.get("robot_motion_epoch")
+                    ),
+                    "source_seed_hint": {
+                        "joint_positions": list(candidate.get("joint_positions") or []),
+                        "joint_margin_min_rad": candidate.get(
+                            "joint_margin_min_rad"
+                        ),
+                        "joint_travel_l2_rad": candidate.get(
+                            "joint_travel_l2_rad"
+                        ),
+                    },
+                }
+            )
+        return {
+            "schema_version": "openeta.experimental_route_execution_bundle.v1",
+            "condition": "C",
+            "authority": "host_memory_exact_receipt_resolution",
+            "object_scene_epoch": self.object_scene_epoch(),
+            "robot_motion_epoch_at_dispatch": self.robot_motion_epoch(),
+            "sequential_preview_policy": "just_in_time_from_actual_segment_end",
+            "path_collision_authority": "controller_per_step_only",
+            "entries": entries,
+        }
+
+    def _resolve_executed_motion_reference_for_probe(
+        self,
+        *,
+        name: str,
+        parameters: object,
+    ) -> JsonDict | None:
+        """Recover already-dispatched probe geometry after motion advanced epochs."""
+
+        if not isinstance(parameters, dict):
+            return None
+        state = self.ik_preview_receipts() or {}
+        receipts = {
+            str(item.get("receipt_id") or ""): item
+            for item in state.get("receipts", [])
+            if isinstance(item, dict) and item.get("receipt_id")
+        }
+        if name == "move_to":
+            receipt = receipts.get(str(parameters.get("ik_receipt_id") or ""))
+            pose = receipt.get("target_pose") if isinstance(receipt, dict) else None
+            if not isinstance(pose, dict):
+                return None
+            return {
+                "target_pose": dict(pose),
+                "enable_collision_check": parameters.get("enable_collision_check"),
+            }
+        if name == "follow_eef_trajectory":
+            ids = parameters.get("ik_receipt_ids")
+            if not isinstance(ids, list) or not ids:
+                return None
+            selected = [receipts.get(str(value or "")) for value in ids]
+            if any(not isinstance(item, dict) for item in selected):
+                return None
+            poses = [item.get("target_pose") for item in selected]
+            if any(not isinstance(pose, dict) for pose in poses):
+                return None
+            return {
+                "trajectory": [dict(pose) for pose in poses],
+                "enable_collision_check": parameters.get("enable_collision_check"),
+            }
+        return None
+
+    def controller_capabilities(self) -> JsonDict | None:
+        return _memory_fact_value(self.facts.get(CONTROLLER_CAPABILITIES_KEY))
+
+    def resolve_ik_execution_seed(self, parameters: object) -> JsonDict | None:
+        """Resolve a current feasible pose preview to a private joint seed.
+
+        The seed is deliberately carried through execution metadata rather than
+        exposed as an Agent-authored ``move_to`` parameter.  The worker still
+        validates the joints against the requested endpoint and tolerances before
+        applying them, so a stale or malformed receipt cannot silently redirect a
+        motion.
+        """
+
+        if not isinstance(parameters, dict):
+            return None
+        signature = _ik_pose_policy_signature(parameters)
+        if not signature:
+            return None
+        target_pose = parameters.get("target_pose")
+        if not isinstance(target_pose, dict):
+            return None
+        orientation_fields = any(
+            target_pose.get(key) is not None
+            for key in (
+                "rotation_matrix",
+                "quat_xyzw",
+                "quaternion",
+                "rotvec",
+                "roll",
+                "pitch",
+                "yaw",
+            )
+        )
+        preserve_current = parameters.get("preserve_current_orientation")
+        if preserve_current is None:
+            preserve_current = not orientation_fields
+        # A preserve-current preview is still a complete six-DoF constraint: the
+        # host captures the then-current wrist orientation in the receipt.  The
+        # exact robot-motion epoch check below guarantees that no motion occurred
+        # before execution, so carrying its private joint seed is both safe and
+        # necessary when the local differential controller is near a redundancy
+        # or joint-limit boundary.
+        if preserve_current is not True and not orientation_fields:
+            return None
+
+        state = self.ik_preview_receipts() or {}
+        for receipt in reversed(state.get("receipts", []) or []):
+            if not isinstance(receipt, dict):
+                continue
+            if (
+                receipt.get("pose_policy_signature") != signature
+                and not ik_pose_policy_numerically_equivalent(receipt, parameters)
+            ):
+                continue
+            if not self._ik_receipt_authorizes_motion(receipt, parameters):
+                return None
+            if (
+                _fact_epoch_value(receipt.get("object_scene_epoch"))
+                != self.object_scene_epoch()
+                or _fact_epoch_value(receipt.get("robot_motion_epoch"))
+                != self.robot_motion_epoch()
+            ):
+                return None
+            candidate = receipt.get("best_candidate")
+            if not isinstance(candidate, dict):
+                reachability = receipt.get("reachability")
+                candidate = (
+                    reachability.get("best_candidate")
+                    if isinstance(reachability, dict)
+                    else None
+                )
+            joints = candidate.get("joint_positions") if isinstance(candidate, dict) else None
+            if (
+                not isinstance(joints, list)
+                or len(joints) != 7
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int | float)
+                    or not math.isfinite(float(value))
+                    for value in joints
+                )
+            ):
+                return None
+            return {
+                "schema_version": "openeta.ik_execution_seed.v1",
+                "receipt_id": str(receipt.get("receipt_id") or ""),
+                "pose_policy_signature": signature,
+                "joint_positions": [float(value) for value in joints],
+                "preview_tolerances": dict(receipt.get("tolerances") or {}),
+                "object_scene_epoch": self.object_scene_epoch(),
+                "robot_motion_epoch": self.robot_motion_epoch(),
+            }
+        return None
+
     def scene_epoch(self) -> int:
-        value = _memory_fact_value(self.facts.get(SCENE_EPOCH_KEY)) or {}
-        try:
-            return max(0, int(value.get("epoch") or 0))
-        except (TypeError, ValueError):
-            return 0
+        """Return the object-scene epoch (legacy ``scene_epoch`` alias)."""
+
+        return max(
+            _fact_epoch(self.facts.get(OBJECT_SCENE_EPOCH_KEY)),
+            _fact_epoch(self.facts.get(SCENE_EPOCH_KEY)),
+        )
+
+    def object_scene_epoch(self) -> int:
+        """Return the version used to invalidate object-relative evidence."""
+
+        return self.scene_epoch()
+
+    def robot_motion_epoch(self) -> int:
+        """Return the version of robot/camera configuration changes."""
+
+        return _fact_epoch(self.facts.get(ROBOT_MOTION_EPOCH_KEY))
 
     def transition_ledger(self) -> list[JsonDict]:
         value = _memory_fact_value(self.facts.get(TRANSITION_LEDGER_KEY)) or {}
@@ -884,6 +2619,120 @@ class AgentMemory:
 
     def latest_environment_receipt(self) -> JsonDict | None:
         return _memory_fact_value(self.facts.get("latest_environment_receipt"))
+
+    def world_evidence_context(self) -> JsonDict:
+        """Derive planner evidence with provenance and explicit freshness.
+
+        This is a projection of the event-backed runtime facts, not another
+        mutable task-state store. Values that refer to an older scene epoch are
+        exposed as stale rather than silently treated as the current world.
+        """
+
+        specs = (
+            ("selected_target", SELECTED_SAM3_DETECTION_KEY, "perception_result"),
+            ("target_asset_reference", TARGET_ASSET_REFERENCE_KEY, "reference_result"),
+            ("target_identity_anchor", TARGET_IDENTITY_ANCHOR_KEY, "identity_anchor"),
+            ("gripper_command", GRIPPER_COMMAND_STATE_KEY, "commanded_state"),
+            ("attachment_verdict", ATTACHMENT_EVIDENCE_KEY, "verifier_result"),
+            (
+                "placement_world_reference",
+                PLACEMENT_WORLD_REFERENCE_KEY,
+                "tool_geometry_reference",
+            ),
+            ("motion_reconciliation", MOTION_RECONCILIATION_KEY, "safety_constraint"),
+            ("ik_preview_receipts", IK_PREVIEW_RECEIPTS_KEY, "safety_evidence"),
+            ("environment_receipt", "latest_environment_receipt", "trusted_receipt"),
+        )
+        current_epoch = self.scene_epoch()
+        evidence: JsonDict = {}
+        for output_key, fact_key, evidence_kind in specs:
+            entry = self.facts.get(fact_key)
+            if not isinstance(entry, dict):
+                continue
+            value = _memory_fact_value(entry)
+            if not isinstance(value, dict):
+                continue
+            value_epoch = value.get("scene_epoch")
+            if evidence_kind == "trusted_receipt":
+                freshness = "authoritative_receipt"
+            elif evidence_kind == "commanded_state":
+                freshness = "commanded_not_observed"
+            elif isinstance(value_epoch, int) and not isinstance(value_epoch, bool):
+                freshness = (
+                    "current_scene_epoch" if value_epoch == current_epoch else "stale_scene_epoch"
+                )
+            else:
+                freshness = "session_evidence"
+            evidence[output_key] = {
+                "value": value,
+                "provenance": {
+                    "source": str(entry.get("source") or "runtime"),
+                    "timestamp_s": entry.get("timestamp_s"),
+                    "evidence_kind": evidence_kind,
+                },
+                "freshness": freshness,
+                "scene_epoch": value_epoch,
+                "current_scene_epoch": current_epoch,
+            }
+        placement = self.selected_sam3_detection("placement_region")
+        selections_entry = self.facts.get(SELECTED_SAM3_DETECTIONS_KEY)
+        if isinstance(placement, dict) and isinstance(selections_entry, dict):
+            placement_epoch = placement.get("scene_epoch")
+            placement_freshness = (
+                "current_scene_epoch"
+                if isinstance(placement_epoch, int)
+                and not isinstance(placement_epoch, bool)
+                and placement_epoch == current_epoch
+                else "stale_scene_epoch"
+                if isinstance(placement_epoch, int)
+                and not isinstance(placement_epoch, bool)
+                else "session_evidence"
+            )
+            evidence["placement_region"] = {
+                "value": placement,
+                "provenance": {
+                    "source": str(selections_entry.get("source") or "runtime"),
+                    "timestamp_s": selections_entry.get("timestamp_s"),
+                    "evidence_kind": "perception_result",
+                },
+                "freshness": placement_freshness,
+                "scene_epoch": placement_epoch,
+                "current_scene_epoch": current_epoch,
+            }
+        candidate_entry = max(
+            (
+                entry
+                for entry in self.artifacts.values()
+                if isinstance(entry, dict)
+                and isinstance(entry.get("value"), dict)
+                and entry["value"].get("type") == "grasp_candidates"
+            ),
+            key=lambda entry: float(entry.get("timestamp_s") or 0.0),
+            default=None,
+        )
+        if isinstance(candidate_entry, dict):
+            candidate_value = dict(candidate_entry["value"])
+            value_epoch = candidate_value.get("scene_epoch")
+            evidence["grasp_candidates"] = {
+                "value": candidate_value,
+                "provenance": {
+                    "source": str(
+                        candidate_value.get("source_tool")
+                        or candidate_entry.get("source")
+                        or "tool_result"
+                    ),
+                    "timestamp_s": candidate_entry.get("timestamp_s"),
+                    "evidence_kind": "tool_result",
+                },
+                "freshness": (
+                    "current_scene_epoch"
+                    if value_epoch == current_epoch
+                    else "stale_scene_epoch"
+                ),
+                "scene_epoch": value_epoch,
+                "current_scene_epoch": current_epoch,
+            }
+        return evidence
 
     def active_environment_task(self) -> JsonDict | None:
         return _memory_fact_value(self.facts.get(ACTIVE_ENVIRONMENT_TASK_KEY))
@@ -949,234 +2798,1033 @@ class AgentMemory:
             self.record("active_environment_task_updated", value)
         return previous != value or gripper_removed
 
-    def grasp_candidate_gate_error(
+    def compiled_grasp_target_gate_error(
         self,
         *,
         tool_name: str,
         parameters: JsonDict,
     ) -> str | None:
-        policy = self.grasp_candidate_policy()
-        if policy is None:
+        """Protect contact/close provenance without imposing a task phase."""
+
+        release_error = self._failed_attached_motion_release_gate_error(
+            tool_name=tool_name,
+            parameters=parameters,
+        )
+        if release_error:
+            return release_error
+
+        clearance_error = self._compiled_contact_clearance_gate_error(
+            tool_name=tool_name,
+            parameters=parameters,
+        )
+        if clearance_error:
+            return clearance_error
+
+        approach_error = self._compiled_contact_approach_gate_error(
+            tool_name=tool_name,
+            parameters=parameters,
+        )
+        if approach_error:
+            return approach_error
+
+        orientation_error = self._compiled_contact_orientation_gate_error(
+            tool_name=tool_name,
+            parameters=parameters,
+        )
+        if orientation_error:
+            return orientation_error
+
+        adjustment_error = self._compiled_grasp_adjustment_gate_error(
+            tool_name=tool_name,
+            parameters=parameters,
+        )
+        if adjustment_error:
+            return adjustment_error
+
+        contact_error = self._compiled_contact_close_gate_error(
+            tool_name=tool_name,
+            parameters=parameters,
+        )
+        if contact_error:
+            return contact_error
+
+        graph = self.provenance_evidence_graph()
+        mismatch = next(
+            (
+                item
+                for item in graph.get("inconsistencies", [])
+                if isinstance(item, dict)
+                and item.get("code") == "compiled_grasp_target_superseded"
+            ),
+            None,
+        )
+        if not isinstance(mismatch, dict):
             return None
-        if tool_name not in {
-            "compile_grasp_seed",
-            "camera_pose_to_world",
-            "move_to",
-            "follow_eef_trajectory",
-            "ik_preview_check",
-            "obstacle_avoidance",
-        }:
-            return None
-        recovery = self.grasp_recovery()
-        recovery_action = recovery.get("required_action") if isinstance(recovery, dict) else None
-        if (
-            isinstance(recovery, dict)
-            and recovery.get("status") == "required"
-            and isinstance(recovery_action, dict)
-            and tool_name == recovery_action.get("name")
-            and parameters == recovery_action.get("parameters")
-        ):
-            return None
-        estimation_recovery = self.grasp_estimation_recovery()
-        if _is_grasp_estimation_recovery_action(
-            tool_name,
-            parameters,
-            recovery=estimation_recovery,
-        ):
-            return None
-        status = str(policy.get("status") or "")
-        if status == "accepted":
-            return None
-        source_tool = str(policy.get("source_tool") or "grasp_pose_estimate")
-        source_backend = str(policy.get("source_backend") or source_tool)
-        source_label = _grasp_backend_label(source_backend)
-        active = policy.get("active_candidate")
-        if status == "exhausted" or not isinstance(active, dict):
-            return (
-                f"All {source_label} candidates were rejected. Observe and rerun "
-                f"{source_label} "
-                "instead of reusing an exhausted pose."
-            )
-        active_id = str(active.get("id") or "")
-        supplied_id = _parameters_grasp_candidate_id(parameters)
-        if tool_name == "camera_pose_to_world":
-            if _is_anyplace_pose(parameters):
-                return None
-            if source_tool in {"anygrasp", "grasp_pose_estimate"}:
-                return (
-                    "AnyGrasp candidates require compile_grasp_seed; "
-                    "camera_pose_to_world does not apply the GraspNet-to-EEF "
-                    "calibration."
-                )
-            if not supplied_id:
-                return (
-                    f"camera_pose_to_world must receive the active {source_label} "
-                    f"candidate {active_id!r}, including its id."
-                )
-            if supplied_id != active_id:
-                return (
-                    f"Greedy {source_label} policy requires the current active "
-                    f"candidate {active_id!r}; later candidates are available only "
-                    "after a candidate-linked safety or motion rejection."
-                )
-            return None
-        if tool_name == "compile_grasp_seed":
-            if source_tool not in {"anygrasp", "grasp_pose_estimate"}:
-                return (
-                    f"{source_label} candidates use camera_pose_to_world rather than "
-                    "the AnyGrasp-specific compile_grasp_seed calibration."
-                )
-            if supplied_id != active_id:
-                return (
-                    "compile_grasp_seed must receive the complete active AnyGrasp "
-                    f"candidate {active_id!r}."
-                )
+        unsafe = False
+        if tool_name == "gripper_control":
             try:
-                supplied_epoch = int(parameters.get("scene_epoch"))
+                unsafe = int(parameters.get("position")) == 0
             except (TypeError, ValueError):
-                supplied_epoch = -1
-            if supplied_epoch != self.scene_epoch():
-                return (
-                    "compile_grasp_seed must use the current host scene_epoch "
-                    f"{self.scene_epoch()}."
-                )
+                unsafe = False
+        elif tool_name in {"move_to", "follow_eef_trajectory"}:
+            compiled_id = str(mismatch.get("compiled_grasp_id") or "")
+            node = next(
+                (
+                    item
+                    for item in graph.get("nodes", [])
+                    if isinstance(item, dict)
+                    and item.get("kind") == "compiled_targeted_grasp"
+                    and str(item.get("compiled_grasp_id") or "") == compiled_id
+                ),
+                {},
+            )
+            contact = node.get("contact_pose") if isinstance(node, dict) else None
+            contact_xyz = contact.get("xyz") if isinstance(contact, dict) else None
+            poses = (
+                [parameters.get("target_pose")]
+                if tool_name == "move_to"
+                else parameters.get("trajectory", [])
+            )
+            unsafe = isinstance(poses, list) and any(
+                _pose_near_xyz(pose, contact_xyz, tolerance_m=0.08) for pose in poses
+            )
+        if not unsafe:
+            return None
+        bundle = self.grasp_input_bundle()
+        bundle_id = bundle.get("bundle_id") if isinstance(bundle, dict) else None
+        recovery = (
+            f" Call grasp_pose_estimate with bundle_id={bundle_id!r}, then compile a "
+            "current candidate before contact or gripper close."
+            if isinstance(bundle_id, str) and bundle_id
+            else " Re-segment, estimate, and compile a current grasp before contact."
+        )
+        return (
+            "compiled_grasp_target_superseded: compiled grasp "
+            f"{mismatch.get('compiled_grasp_id')!r} is bound to target evidence "
+            f"{mismatch.get('compiled_target_evidence_id')!r}, while the current "
+            f"selected target is {mismatch.get('current_target_evidence_id')!r}. "
+            "The old contact/close action was rejected; safe retreat and clearance "
+            "waypoints remain allowed." + recovery
+        )
+
+    def latest_compiled_contact_execution(self) -> JsonDict | None:
+        return _memory_fact_value(
+            self.facts.get(LATEST_COMPILED_CONTACT_EXECUTION_KEY)
+        )
+
+    def latest_compiled_clearance_execution(self) -> JsonDict | None:
+        return _memory_fact_value(
+            self.facts.get(LATEST_COMPILED_CLEARANCE_EXECUTION_KEY)
+        )
+
+    def _compiled_contact_clearance_gate_error(
+        self,
+        *,
+        tool_name: str,
+        parameters: JsonDict,
+    ) -> str | None:
+        """Prevent an explicitly failed clearance receipt authorizing contact.
+
+        Clearance remains optional and Agent-chosen. This check only applies when
+        the Agent already attempted the clearance waypoint for the same compiled
+        grasp and immediately depends on that current-robot-state receipt.
+        """
+
+        if tool_name != "move_to":
+            return None
+        target_pose = parameters.get("target_pose")
+        if not isinstance(target_pose, dict) or _compiled_grasp_pose_role(target_pose) != "contact":
+            return None
+        compiled_id = str(target_pose.get("compiled_grasp_id") or "")
+        receipt = self.latest_compiled_clearance_execution()
+        if (
+            not compiled_id
+            or not isinstance(receipt, dict)
+            or str(receipt.get("compiled_grasp_id") or "") != compiled_id
+        ):
             return None
         if (
-            source_tool in {"anygrasp", "grasp_pose_estimate"}
-            and tool_name in {"move_to", "follow_eef_trajectory"}
-            and self.grasp_execution() is None
+            _fact_epoch_value(receipt.get("object_scene_epoch"))
+            != self.object_scene_epoch()
+            or _fact_epoch_value(receipt.get("robot_motion_epoch"))
+            != self.robot_motion_epoch()
+        ):
+            return None
+        if receipt.get("reached_target") is True:
+            return None
+        position_error = receipt.get("position_error_m")
+        orientation_error = receipt.get("orientation_error_rad")
+        if (
+            _finite_number(position_error)
+            and _finite_number(orientation_error)
+            and float(position_error) <= COMPILED_CLEARANCE_POSITION_TOLERANCE_M
+            and float(orientation_error)
+            <= COMPILED_CLEARANCE_ORIENTATION_TOLERANCE_RAD
+        ):
+            return None
+        return (
+            "compiled_clearance_not_reached: contact motion was rejected because "
+            f"the current clearance execution for {compiled_id!r} explicitly reports "
+            f"reached_target=false, stop_reason={receipt.get('stop_reason')!r}, "
+            f"steps_executed={receipt.get('steps_executed')!r}, "
+            f"actual_eef_xyz={receipt.get('actual_xyz')!r}, "
+            f"position_error_m={receipt.get('position_error_m')!r}, "
+            f"orientation_error_rad={receipt.get('orientation_error_rad')!r}. "
+            "The clearance residual acceptance envelope is "
+            f"position<={COMPILED_CLEARANCE_POSITION_TOLERANCE_M:.3f}m and "
+            f"orientation<={COMPILED_CLEARANCE_ORIENTATION_TOLERANCE_RAD:.2f}rad. "
+            "A failed execution receipt cannot serve as a successful prerequisite. "
+            "Inspect the fresh agentview/wrist images and this receipt, then adjust "
+            "the waypoint/orientation, choose another candidate, or deliberately "
+            "replan from the measured EEF pose. Clearance is not a mandatory task "
+            "stage; this rejection only preserves the causal meaning of the "
+            "Agent-chosen failed waypoint."
+        )
+
+    def _compiled_contact_approach_gate_error(
+        self,
+        *,
+        tool_name: str,
+        parameters: JsonDict,
+    ) -> str | None:
+        """Reject a long, cross-axis sweep into a compiled contact anchor.
+
+        Endpoint IK and collision checks cannot establish that the final motion
+        enters an object between the fingers. A controller can reach the exact
+        contact xyz while the palm or one finger first pushes the object away.
+        For motions already inside the near-field radius, Agent-authored visual
+        corrections remain unrestricted by this check. Longer motions only need
+        to start inside a tube behind the contact pose along the compiled approach
+        vector; no semantic waypoint or task phase is required.
+        """
+
+        if tool_name != "move_to":
+            return None
+        target_pose = parameters.get("target_pose")
+        if (
+            not isinstance(target_pose, dict)
+            or _compiled_grasp_pose_role(target_pose) != "contact"
+        ):
+            return None
+        compiled_id = str(target_pose.get("compiled_grasp_id") or "")
+        compiled = self._compiled_grasp_artifact(compiled_id)
+        if not compiled_id or not isinstance(compiled, dict):
+            return None
+        current_xyz = self._latest_observed_eef_xyz()
+        target_xyz = target_pose.get("xyz")
+        approach = compiled.get("approach_world_xyz")
+        if (
+            not _finite_xyz(current_xyz)
+            or not _finite_xyz(target_xyz)
+            or not _finite_xyz(approach)
+        ):
+            return None
+
+        direction = [float(value) for value in approach[:3]]
+        direction_norm = math.sqrt(sum(value * value for value in direction))
+        if direction_norm <= 1e-9:
+            return None
+        direction = [value / direction_norm for value in direction]
+        delta = [
+            float(target_xyz[index]) - float(current_xyz[index]) for index in range(3)
+        ]
+        travel = math.sqrt(sum(value * value for value in delta))
+        if travel <= COMPILED_CONTACT_NEAR_FIELD_RADIUS_M:
+            return None
+        axial = sum(delta[index] * direction[index] for index in range(3))
+        lateral = math.sqrt(max(0.0, travel * travel - axial * axial))
+        cosine = axial / travel if travel > 1e-9 else 1.0
+        if (
+            axial > 0.0
+            and lateral <= COMPILED_CONTACT_APPROACH_CORRIDOR_RADIUS_M
+            and cosine >= COMPILED_CONTACT_APPROACH_MIN_COSINE
+        ):
+            return None
+
+        hover_pose = compiled.get("hover_pose")
+        hover_xyz = hover_pose.get("xyz") if isinstance(hover_pose, dict) else None
+        return (
+            "compiled_contact_approach_misaligned: the long final contact motion was "
+            "rejected because endpoint reachability and collision clearance do not "
+            "prove safe object-relative entry. "
+            f"current_eef_xyz={_rounded_xyz(current_xyz)}, "
+            f"contact_xyz={_rounded_xyz(target_xyz)}, "
+            f"approach_world_xyz={_rounded_xyz(direction)}, travel_m={travel:.4f}, "
+            f"axial_progress_m={axial:.4f}, lateral_offset_m={lateral:.4f} "
+            f"(limit={COMPILED_CONTACT_APPROACH_CORRIDOR_RADIUS_M:.3f}), "
+            f"direction_cosine={cosine:.4f} "
+            f"(minimum={COMPILED_CONTACT_APPROACH_MIN_COSINE:.2f}). "
+            "Move first to any IK- and collision-checked waypoint inside the approach "
+            "corridor behind the contact pose, observe there, then execute the contact; "
+            f"the compiled clearance reference is {_rounded_xyz(hover_xyz)}. This is a "
+            "geometric corridor contract, not a required hover/descend task stage. "
+            "If the current view invalidates this approach, choose or compile a better "
+            "candidate instead of forcing the endpoint."
+        )
+
+    def _latest_observed_eef_xyz(self) -> list[float] | None:
+        """Read event-derived measured EEF xyz, not host task progress."""
+
+        for event in reversed(self.events):
+            if event.event_type != "observation":
+                continue
+            robot = event.payload.get("robot")
+            eef_pose = robot.get("end_effector_pose") if isinstance(robot, dict) else None
+            xyz = eef_pose.get("xyz") if isinstance(eef_pose, dict) else None
+            if _finite_xyz(xyz):
+                return [float(value) for value in xyz[:3]]
+        return None
+
+    def _compiled_contact_orientation_gate_error(
+        self,
+        *,
+        tool_name: str,
+        parameters: JsonDict,
+    ) -> str | None:
+        """Reject contact entry while a large wrist rotation is still pending.
+
+        The check is purely geometric.  It does not require a named alignment
+        waypoint or remember task progress; it compares the latest measured EEF
+        orientation with the exact contact orientation that the Agent chose.
+        """
+
+        if tool_name != "move_to":
+            return None
+        target_pose = parameters.get("target_pose")
+        if (
+            not isinstance(target_pose, dict)
+            or _compiled_grasp_pose_role(target_pose) != "contact"
+        ):
+            return None
+        current_pose: JsonDict | None = None
+        for event in reversed(self.events):
+            if event.event_type != "observation":
+                continue
+            robot = event.payload.get("robot")
+            eef_pose = (
+                robot.get("end_effector_pose") if isinstance(robot, dict) else None
+            )
+            if isinstance(eef_pose, dict):
+                current_pose = eef_pose
+                break
+        if current_pose is None:
+            return None
+        current_rotation = _ik_orientation_rotation_matrix(current_pose)
+        target_rotation = _ik_orientation_rotation_matrix(target_pose)
+        delta_deg = _rotation_delta_deg(current_rotation, target_rotation)
+        if delta_deg is None:
+            return None
+        delta_rad = math.radians(delta_deg)
+        if delta_rad <= COMPILED_CONTACT_ENTRY_ORIENTATION_TOLERANCE_RAD:
+            return None
+
+        compiled_id = str(target_pose.get("compiled_grasp_id") or "")
+        return (
+            "compiled_contact_orientation_misaligned: contact motion was rejected "
+            "because the gripper would enter the object while a large wrist rotation "
+            "is still pending. "
+            f"compiled_grasp_id={compiled_id!r}, "
+            f"current_eef_quat_xyzw={current_pose.get('quat_xyzw')!r}, "
+            f"orientation_delta_rad={delta_rad:.4f} "
+            f"(limit={COMPILED_CONTACT_ENTRY_ORIENTATION_TOLERANCE_RAD:.2f}). "
+            "At any Agent-chosen collision-clear waypoint outside contact, preview and "
+            "execute the compiled orientation (or another compatible full pose), then "
+            "re-observe and retry contact. If that orientation is infeasible, select a "
+            "different candidate or perform a full wrist-view grasp re-estimate. This "
+            "is an object-entry geometry check, not a required alignment stage."
+        )
+
+    def _compiled_contact_close_gate_error(
+        self,
+        *,
+        tool_name: str,
+        parameters: JsonDict,
+    ) -> str | None:
+        if tool_name != "gripper_control":
+            return None
+        try:
+            closing = int(parameters.get("position")) == 0
+        except (TypeError, ValueError):
+            return None
+        if not closing:
+            return None
+        commanded = _memory_fact_value(self.facts.get(GRIPPER_COMMAND_STATE_KEY)) or {}
+        if commanded.get("position") == 0:
+            return None
+        provenance = _memory_fact_value(self.facts.get(GRASP_PROVENANCE_KEY)) or {}
+        compiled_id = str(provenance.get("compiled_grasp_id") or "")
+        if not compiled_id:
+            return None
+        if provenance.get("contact_geometry_invalidated_at_s"):
+            return (
+                "compiled_contact_geometry_invalidated: gripper close was rejected "
+                f"because active compiled grasp {compiled_id!r} was invalidated by "
+                f"{provenance.get('contact_geometry_invalidated_by')!r}. Re-observe, "
+                "select a current grasp candidate, compile new contact geometry, and "
+                "execute its contact before closing. Identity lineage remains available, "
+                "but released or abandoned contact coordinates are not authorization."
+            )
+        receipt = self.latest_compiled_contact_execution()
+        if not isinstance(receipt, dict):
+            return (
+                "compiled_contact_receipt_missing: gripper close was rejected because "
+                f"active compiled grasp {compiled_id!r} has no executed contact receipt. "
+                "Preview and execute a current contact pose first; safe observation, "
+                "clearance motion, target correction, or opening the gripper remain allowed."
+            )
+        receipt_id = str(receipt.get("compiled_grasp_id") or "")
+        if receipt_id != compiled_id:
+            receipt_target_id = str(receipt.get("target_evidence_id") or "")
+            active_target_id = str(provenance.get("target_evidence_id") or "")
+            receipt_anchor_id = str(receipt.get("target_identity_anchor_id") or "")
+            active_anchor_id = str(provenance.get("target_identity_anchor_id") or "")
+            same_target = bool(
+                receipt_target_id
+                and active_target_id
+                and receipt_target_id == active_target_id
+            ) or bool(
+                receipt_anchor_id
+                and active_anchor_id
+                and receipt_anchor_id == active_anchor_id
+            )
+            if not same_target:
+                return (
+                    "compiled_contact_receipt_mismatch: gripper close was rejected because "
+                    f"the latest executed contact belongs to {receipt_id!r} "
+                    f"(target={receipt_target_id or receipt_anchor_id or None!r}), while the "
+                    f"latest planning provenance is {compiled_id!r} "
+                    f"(target={active_target_id or active_anchor_id or None!r}). Close binds "
+                    "to the latest physically executed contact branch; re-observe and execute "
+                    "a contact for the intended target before closing."
+                )
+        receipt_object_epoch = _fact_epoch_value(receipt.get("object_scene_epoch"))
+        receipt_robot_epoch = _fact_epoch_value(receipt.get("robot_motion_epoch"))
+        if (
+            receipt_object_epoch != self.object_scene_epoch()
+            or receipt_robot_epoch != self.robot_motion_epoch()
         ):
             return (
-                "Raw AnyGrasp motion is blocked. Compile the active candidate with "
-                "compile_grasp_seed and follow the host-generated grasp_execution stages."
+                "compiled_contact_receipt_stale: gripper close was rejected because the "
+                f"contact receipt epochs object={receipt_object_epoch}, robot={receipt_robot_epoch} "
+                f"do not match current object={self.object_scene_epoch()}, "
+                f"robot={self.robot_motion_epoch()}. Re-observe and execute a current "
+                "contact motion; do not treat a prior endpoint as the current robot state."
             )
-        if supplied_id and supplied_id != active_id:
+        position_error = (
+            receipt.get("max_axis_position_error_m")
+            if _finite_number(receipt.get("max_axis_position_error_m"))
+            else receipt.get("position_error_m")
+        )
+        orientation_error = receipt.get("orientation_error_rad")
+        position_within_close_envelope = bool(
+            (
+                _finite_number(position_error)
+                and float(position_error) <= COMPILED_CONTACT_CLOSE_POSITION_TOLERANCE_M
+            )
+            or (
+                receipt.get("reached_target") is True
+                and not _finite_number(position_error)
+            )
+        )
+        orientation_within_close_envelope = bool(
+            not _finite_number(orientation_error)
+            or float(orientation_error)
+            <= COMPILED_CONTACT_CLOSE_ORIENTATION_TOLERANCE_RAD
+        )
+        if position_within_close_envelope and orientation_within_close_envelope:
+            # Collision belongs to the preceding arm motion. Closing actuates only
+            # the fingers, so that historical motion verdict stays visible but
+            # cannot by itself veto gripper_control.
+            return None
+        actual_xyz = receipt.get("actual_xyz")
+        return (
+            "compiled_contact_not_reached: gripper close was rejected because the latest "
+            f"contact execution for {receipt_id!r} is outside the independent close "
+            f"contact envelope: reached_target={str(receipt.get('reached_target')).lower()}, "
+            f"stop_reason={receipt.get('stop_reason')!r}, "
+            f"steps_executed={receipt.get('steps_executed')!r}, "
+            f"actual_eef_xyz={actual_xyz!r}, position_error_m={position_error!r} "
+            f"(limit={COMPILED_CONTACT_CLOSE_POSITION_TOLERANCE_M}), "
+            f"orientation_error_rad={orientation_error!r} "
+            f"(limit={COMPILED_CONTACT_CLOSE_ORIENTATION_TOLERANCE_RAD}). "
+            "Collision diagnostics from the preceding arm motion do not block the "
+            "finger-only close command. Inspect the fresh dual-view evidence, then adjust "
+            "or re-estimate only when the current EEF contact geometry is inadequate."
+        )
+
+    def _failed_attached_motion_release_gate_error(
+        self,
+        *,
+        tool_name: str,
+        parameters: JsonDict,
+    ) -> str | None:
+        """Do not treat a failed carrying motion as a reached release pose."""
+
+        if tool_name != "gripper_control":
+            return None
+        try:
+            opening = int(parameters.get("position")) == 1
+        except (TypeError, ValueError):
+            return None
+        if not opening:
+            return None
+        commanded = self.gripper_command_state() or {}
+        attachment = self.attachment_evidence() or {}
+        if commanded.get("position") != 0 or attachment.get("verdict") != "PASS":
+            return None
+        latest_motion: JsonDict | None = None
+        for row in reversed(self.transition_ledger()):
+            if row.get("tool") not in {"move_to", "follow_eef_trajectory"}:
+                continue
+            latest_motion = row
+            break
+        if not isinstance(latest_motion, dict) or latest_motion.get("verdict") != "FAIL":
+            return None
+        motion_evidence: JsonDict = {}
+        for event in reversed(self.events):
+            if event.event_type != "action":
+                continue
+            command = event.payload.get("command")
+            request = command.get("request") if isinstance(command, dict) else None
+            if not isinstance(request, dict) or request.get("name") not in {
+                "move_to",
+                "follow_eef_trajectory",
+            }:
+                continue
+            calls = command.get("tool_calls")
+            call = calls[0] if isinstance(calls, list) and calls else None
+            result = call.get("result") if isinstance(call, dict) else None
+            details = result.get("details") if isinstance(result, dict) else None
+            outputs = details.get("outputs") if isinstance(details, dict) else None
+            motion_evidence = dict(outputs) if isinstance(outputs, dict) else {}
+            break
+        motion_summary = motion_evidence.get("motion_summary")
+        motion_summary = motion_summary if isinstance(motion_summary, dict) else {}
+        collision = motion_summary.get("collision")
+        collision = collision if isinstance(collision, dict) else {}
+        pose_feedback = motion_evidence.get("pose_feedback")
+        pose_feedback = pose_feedback if isinstance(pose_feedback, dict) else {}
+        actual_xyz = pose_feedback.get("actual_xyz")
+        return (
+            "attached_release_after_failed_motion: gripper open was rejected because "
+            "independent evidence says the object is attached, while the latest carrying "
+            "motion explicitly failed and did not reach its requested endpoint. "
+            f"motion_tool={latest_motion.get('tool')!r}, "
+            f"motion_verdict={latest_motion.get('verdict')!r}, "
+            f"actual_eef_xyz={actual_xyz!r}, "
+            f"collision_geometry={[collision.get('geom1_name'), collision.get('geom2_name')]!r}. "
+            "Plan and execute a distinct collision-free pose from the actual EEF position "
+            "before releasing; a successful subsequent carrying motion clears this check. "
+            "The Agent remains free to choose the new waypoint and release pose."
+        )
+
+    def _compiled_grasp_adjustment_gate_error(
+        self,
+        *,
+        tool_name: str,
+        parameters: JsonDict,
+    ) -> str | None:
+        """Bound Agent-authored residuals around a compiled grasp reference.
+
+        This is an evidence/safety invariant, not a task-stage policy.  The
+        Agent supplies the final absolute world pose and preserves the compiled
+        pose provenance; the host derives every residual and owns the budget.
+        """
+
+        if tool_name != "move_to":
+            return None
+        target_pose = parameters.get("target_pose")
+        if not isinstance(target_pose, dict):
+            return None
+        compiled_id = str(target_pose.get("compiled_grasp_id") or "")
+        role = _compiled_grasp_pose_role(target_pose)
+        if not compiled_id or not role:
+            return None
+        compiled = self._compiled_grasp_artifact(compiled_id)
+        if not isinstance(compiled, dict):
             return (
-                f"Tool {tool_name!r} references {source_label} candidate {supplied_id!r}, "
-                f"but the current active candidate is {active_id!r}."
+                "compiled_grasp_adjustment_unresolved: move_to references compiled grasp "
+                f"{compiled_id!r}, but its host-owned pose evidence is unavailable. "
+                "Recompile from current grasp evidence instead of inventing an anchor."
+            )
+        current_compiled = self._latest_compiled_grasp_artifact()
+        current_id = str(current_compiled.get("compiled_grasp_id") or "")
+        if current_id and current_id != compiled_id:
+            return (
+                "compiled_grasp_adjustment_superseded: move_to references compiled grasp "
+                f"{compiled_id!r}, but the active compiled anchor is {current_id!r}. "
+                "Use the latest compiled pose and preserve its provenance fields."
+            )
+        compiled_epoch = _optional_int(compiled.get("scene_epoch"), default=-1)
+        if compiled_epoch != self.object_scene_epoch():
+            return (
+                "compiled_grasp_adjustment_stale: compiled grasp "
+                f"{compiled_id!r} belongs to object_scene_epoch {compiled_epoch}, while "
+                f"the current epoch is {self.object_scene_epoch()}. Re-observe and "
+                "recompile before contact refinement."
+            )
+        reference_pose = _compiled_grasp_reference_pose(compiled, role=role)
+        if not isinstance(reference_pose, dict):
+            return (
+                "compiled_grasp_adjustment_unresolved: compiled grasp "
+                f"{compiled_id!r} has no host reference for role {role!r}."
+            )
+        target_xyz = target_pose.get("xyz")
+        reference_xyz = reference_pose.get("xyz")
+        if not _finite_xyz(target_xyz) or not _finite_xyz(reference_xyz):
+            return (
+                "compiled_grasp_adjustment_invalid: adjusted move_to poses require "
+                "finite world-frame target_pose.xyz and compiled reference xyz values."
+            )
+        if str(target_pose.get("frame") or "") != "world":
+            return "compiled_grasp_adjustment_invalid: adjusted poses must remain world-frame."
+
+        reference_rotation = reference_pose.get("rotation_matrix")
+        if reference_rotation is not None:
+            requested_rotation = target_pose.get("rotation_matrix")
+            position_only_policy = _target_pose_has_no_orientation(target_pose)
+            if position_only_policy:
+                if not self._has_current_feasible_ik_pose_policy(parameters):
+                    return (
+                        "compiled_grasp_adjustment_unverified_orientation_policy: the "
+                        "requested compiled-grasp move omits an explicit orientation, "
+                        "so move_to would preserve the current wrist orientation. No "
+                        "current-epoch feasible IK receipt authorizes this exact xyz + "
+                        "preserve_current orientation policy. Call ik_preview_check for "
+                        "the same target_pose with preserve_current_orientation=true, "
+                        "then retry the position-only move; alternatively provide a "
+                        "rotation within the compiled anchor envelope."
+                    )
+                angle_deg = None
+            else:
+                angle_deg = _rotation_delta_deg(
+                    reference_rotation,
+                    requested_rotation,
+                )
+            if (
+                not position_only_policy
+                and (
+                    angle_deg is None
+                    or angle_deg > GRASP_REFERENCE_ORIENTATION_TOLERANCE_DEG
+                )
+            ):
+                rendered = "unknown" if angle_deg is None else f"{angle_deg:.2f} deg"
+                return (
+                    "compiled_grasp_adjustment_out_of_bounds: orientation residual is "
+                    f"{rendered}; preserve a valid rotation within "
+                    f"{GRASP_REFERENCE_ORIENTATION_TOLERANCE_DEG:.1f} deg of the anchor."
+                )
+
+        residual = [
+            float(target_xyz[index]) - float(reference_xyz[index]) for index in range(3)
+        ]
+        budget = self.grasp_adjustment_budget() or {}
+        if str(budget.get("compiled_grasp_id") or "") == compiled_id:
+            prior_residual_raw = budget.get("last_residual_xyz_m")
+            prior_residual = (
+                [float(value) for value in prior_residual_raw]
+                if _finite_xyz(prior_residual_raw)
+                else [0.0, 0.0, 0.0]
+            )
+            cumulative = _finite_nonnegative_float(
+                budget.get("cumulative_translation_m"),
+                default=0.0,
+            )
+        else:
+            prior_residual = [0.0, 0.0, 0.0]
+            cumulative = 0.0
+        step = math.sqrt(
+            sum((residual[index] - prior_residual[index]) ** 2 for index in range(3))
+        )
+        projected_cumulative = cumulative + step
+        if step > GRASP_ADJUSTMENT_STEP_LIMIT_M + GRASP_ADJUSTMENT_EPSILON_M:
+            return (
+                "compiled_grasp_adjustment_out_of_bounds: requested residual change is "
+                f"{step:.4f} m, exceeding the per-call limit of "
+                f"{GRASP_ADJUSTMENT_STEP_LIMIT_M:.3f} m. Last accepted residual is "
+                f"{_rounded_xyz(prior_residual)} m and requested residual is "
+                f"{_rounded_xyz(residual)} m. This is an offset-from-anchor budget, "
+                "not a limit on travel distance from the current EEF. To execute this "
+                f"compiled waypoint, call move_to with the exact host reference xyz "
+                f"{_rounded_xyz(reference_xyz)} m (or an adjustment within the residual "
+                "limit); do not split the approach into residual-sized increments. If "
+                "you intentionally need a far transit waypoint, omit compiled_grasp_id "
+                "and waypoint_role, remain outside the contact safety envelope, and "
+                "observe before using the compiled anchor."
+            )
+        if (
+            projected_cumulative
+            > GRASP_ADJUSTMENT_CUMULATIVE_LIMIT_M + GRASP_ADJUSTMENT_EPSILON_M
+        ):
+            remaining = max(0.0, GRASP_ADJUSTMENT_CUMULATIVE_LIMIT_M - cumulative)
+            return (
+                "compiled_grasp_adjustment_out_of_bounds: this increment would raise "
+                f"the cumulative residual path to {projected_cumulative:.4f} m, above "
+                f"the {GRASP_ADJUSTMENT_CUMULATIVE_LIMIT_M:.3f} m budget. Remaining "
+                f"translation budget is {remaining:.4f} m. Re-observe and compile a "
+                "new anchor if more correction is genuinely required."
             )
         return None
 
-    def grasp_execution_gate_error(
+    def _has_current_feasible_ik_pose_policy(self, parameters: JsonDict) -> bool:
+        """Return whether IK validated this exact pose policy in the current state."""
+
+        signature = _ik_pose_policy_signature(parameters)
+        if not signature:
+            return False
+        state = self.ik_preview_receipts() or {}
+        for receipt in reversed(state.get("receipts", []) or []):
+            if not isinstance(receipt, dict):
+                continue
+            if (
+                receipt.get("pose_policy_signature") != signature
+                and not ik_pose_policy_numerically_equivalent(receipt, parameters)
+            ):
+                continue
+            if not self._ik_receipt_authorizes_motion(receipt, parameters):
+                return False
+            if _fact_epoch_value(receipt.get("object_scene_epoch")) != self.object_scene_epoch():
+                return False
+            if _fact_epoch_value(receipt.get("robot_motion_epoch")) != self.robot_motion_epoch():
+                return False
+            return True
+        return False
+
+    def _ik_receipt_authorizes_motion(
+        self,
+        receipt: JsonDict,
+        parameters: JsonDict,
+    ) -> bool:
+        classification = str(receipt.get("classification") or "")
+        if classification == "feasible":
+            return True
+        if classification != "kinematically_feasible_collision_deferred":
+            return False
+        capabilities = self.controller_capabilities() or {}
+        return (
+            parameters.get("enable_collision_check") is True
+            and capabilities.get("motion_owns_trajectory_world_collision") is True
+            and str(receipt.get("reason_code") or "")
+            == "endpoint_collision_check_unavailable"
+        )
+
+    def _compiled_grasp_artifact(self, compiled_grasp_id: str) -> JsonDict | None:
+        for entry in reversed(list(self.artifacts.values())):
+            value = entry.get("value") if isinstance(entry, dict) else None
+            if (
+                isinstance(value, dict)
+                and value.get("type") == "compiled_grasp"
+                and str(value.get("compiled_grasp_id") or "") == compiled_grasp_id
+            ):
+                return value
+        return None
+
+    def resolve_compiled_contact_authorization(self, target_pose: object) -> JsonDict | None:
+        """Resolve a current compiled contact pose to host-owned safety evidence.
+
+        The returned object is carried privately by the simulator adapter.  It is
+        deliberately unavailable as an Agent parameter: preserving a
+        ``compiled_grasp_id`` and ``waypoint_role`` only requests resolution; it
+        cannot manufacture permission to contact arbitrary scene geometry.
+        """
+
+        if not isinstance(target_pose, dict):
+            return None
+        compiled_id = str(target_pose.get("compiled_grasp_id") or "").strip()
+        role = _compiled_grasp_pose_role(target_pose)
+        if not compiled_id or role != "contact":
+            return None
+        compiled = self._compiled_grasp_artifact(compiled_id)
+        if not isinstance(compiled, dict):
+            raise ValueError(
+                f"compiled grasp {compiled_id!r} is unavailable for contact authorization"
+            )
+        artifact_epoch = _optional_int(compiled.get("scene_epoch"), default=-1)
+        if artifact_epoch != self.object_scene_epoch():
+            raise ValueError(
+                f"compiled grasp {compiled_id!r} belongs to object_scene_epoch "
+                f"{artifact_epoch}, current={self.object_scene_epoch()}"
+            )
+        anchor = compiled.get("target_anchor_world_xyz")
+        if not _finite_xyz(anchor):
+            raise ValueError(
+                f"compiled grasp {compiled_id!r} has no finite target anchor"
+            )
+        provenance = _memory_fact_value(self.facts.get(GRASP_PROVENANCE_KEY))
+        if (
+            not isinstance(provenance, dict)
+            or str(provenance.get("compiled_grasp_id") or "") != compiled_id
+        ):
+            raise ValueError(
+                f"compiled grasp {compiled_id!r} is not the active grasp provenance"
+            )
+        if provenance.get("contact_geometry_invalidated_at_s"):
+            raise ValueError(
+                f"compiled grasp {compiled_id!r} contact geometry was invalidated by "
+                f"{provenance.get('contact_geometry_invalidated_by')!r}; compile a new "
+                "candidate before contact, close, or attachment probing"
+            )
+        return {
+            "schema_version": "openeta.contact_authorization.v1",
+            "compiled_grasp_id": compiled_id,
+            "waypoint_role": "grasp_contact",
+            "target_anchor_world_xyz": [float(value) for value in anchor[:3]],
+            "target_evidence_id": provenance.get("target_evidence_id"),
+            "object_scene_epoch": self.object_scene_epoch(),
+        }
+
+    def resolve_active_attachment_candidate(self) -> JsonDict | None:
+        """Bind close to the latest physically executed contact branch.
+
+        A later compile is planning evidence and does not move the robot.  A
+        current contact receipt therefore owns close binding when it names the
+        same target as the latest planning provenance.  The simulator may use
+        this to build a *tentative* carried-object collision proxy, but it is not
+        attachment proof and does not create task progress.
+        """
+
+        provenance = _memory_fact_value(self.facts.get(GRASP_PROVENANCE_KEY))
+        if not isinstance(provenance, dict):
+            return None
+        if provenance.get("contact_geometry_invalidated_at_s"):
+            return None
+        active_compiled_id = str(provenance.get("compiled_grasp_id") or "").strip()
+        receipt = self.latest_compiled_contact_execution()
+        if isinstance(receipt, dict) and (
+            _fact_epoch_value(receipt.get("object_scene_epoch"))
+            == self.object_scene_epoch()
+            and _fact_epoch_value(receipt.get("robot_motion_epoch"))
+            == self.robot_motion_epoch()
+        ):
+            receipt_compiled_id = str(receipt.get("compiled_grasp_id") or "").strip()
+            receipt_target_id = str(receipt.get("target_evidence_id") or "")
+            active_target_id = str(provenance.get("target_evidence_id") or "")
+            receipt_anchor_id = str(receipt.get("target_identity_anchor_id") or "")
+            active_anchor_id = str(provenance.get("target_identity_anchor_id") or "")
+            same_target = receipt_compiled_id == active_compiled_id or bool(
+                receipt_target_id
+                and active_target_id
+                and receipt_target_id == active_target_id
+            ) or bool(
+                receipt_anchor_id
+                and active_anchor_id
+                and receipt_anchor_id == active_anchor_id
+            )
+            compiled = self._compiled_grasp_artifact(receipt_compiled_id)
+            anchor = compiled.get("target_anchor_world_xyz") if isinstance(compiled, dict) else None
+            if (
+                same_target
+                and receipt_compiled_id
+                and isinstance(compiled, dict)
+                and _optional_int(compiled.get("scene_epoch"), default=-1)
+                == self.object_scene_epoch()
+                and _finite_xyz(anchor)
+            ):
+                return {
+                    "schema_version": "openeta.contact_authorization.v1",
+                    "compiled_grasp_id": receipt_compiled_id,
+                    "waypoint_role": "grasp_contact",
+                    "target_anchor_world_xyz": [float(value) for value in anchor[:3]],
+                    "target_evidence_id": receipt.get("target_evidence_id"),
+                    "object_scene_epoch": self.object_scene_epoch(),
+                }
+
+        compiled_id = active_compiled_id
+        if not compiled_id:
+            return None
+        compiled = self._compiled_grasp_artifact(compiled_id)
+        if not isinstance(compiled, dict):
+            raise ValueError(
+                f"active compiled grasp {compiled_id!r} is unavailable for attachment binding"
+            )
+        contact_pose = compiled.get("contact_pose")
+        if not isinstance(contact_pose, dict):
+            raise ValueError(
+                f"active compiled grasp {compiled_id!r} has no contact pose"
+            )
+        return self.resolve_compiled_contact_authorization(contact_pose)
+
+    def _latest_compiled_grasp_artifact(self) -> JsonDict:
+        for entry in reversed(list(self.artifacts.values())):
+            value = entry.get("value") if isinstance(entry, dict) else None
+            if isinstance(value, dict) and value.get("type") == "compiled_grasp":
+                return value
+        return {}
+
+    def motion_reconciliation_gate_error(self, *, tool_name: str) -> str | None:
+        """Block new actions until an unknown mutation is observed and reconciled."""
+
+        reconciliation = self.motion_reconciliation()
+        if not isinstance(reconciliation, dict) or reconciliation.get("status") not in {
+            "required",
+            "unresolved",
+        }:
+            return None
+        if tool_name == "observe":
+            return None
+        return (
+            "A simulator action has transport-unknown outcome. Observe the same "
+            "environment handle before issuing another action. Do not resend a "
+            "partial move because the original controller may still be running."
+        )
+
+    def ik_execution_gate_error(
+        self, *, tool_name: str, parameters: JsonDict
+    ) -> str | None:
+        """Require a current feasible IK receipt for the exact move pose policy.
+
+        This binds evidence to one endpoint and orientation policy; it does not
+        prescribe a task phase or choose a waypoint for the Agent.  Repairable,
+        inconclusive, stale, and hard-infeasible receipts remain useful
+        diagnostics, but none authorizes a world mutation.
+        """
+
+        if tool_name == "follow_eef_trajectory":
+            trajectory = parameters.get("trajectory")
+            if not isinstance(trajectory, list) or not trajectory:
+                return (
+                    "ik_preview_required: follow_eef_trajectory requires one to five "
+                    "host-resolved IK receipt targets."
+                )
+            for index, pose in enumerate(trajectory):
+                if not isinstance(pose, dict):
+                    return (
+                        "ik_preview_required: resolved trajectory waypoint "
+                        f"{index} is not a pose object."
+                    )
+                error = self.ik_execution_gate_error(
+                    tool_name="move_to",
+                    parameters={
+                        "target_pose": pose,
+                        "enable_collision_check": parameters.get(
+                            "enable_collision_check"
+                        ),
+                    },
+                )
+                if error:
+                    return f"trajectory_waypoint_{index}: {error}"
+            return None
+        if tool_name != "move_to":
+            return None
+        pose_signature = _ik_pose_policy_signature(parameters)
+        if not pose_signature:
+            return None
+        state = self.ik_preview_receipts() or {}
+        latest_matching: JsonDict | None = None
+        for receipt in reversed(state.get("receipts", []) or []):
+            if not isinstance(receipt, dict):
+                continue
+            if (
+                receipt.get("pose_policy_signature") != pose_signature
+                and not ik_pose_policy_numerically_equivalent(receipt, parameters)
+            ):
+                continue
+            latest_matching = receipt
+            receipt_object_epoch = _fact_epoch_value(receipt.get("object_scene_epoch"))
+            receipt_robot_epoch = _fact_epoch_value(receipt.get("robot_motion_epoch"))
+            current_epoch = (
+                receipt_object_epoch == self.object_scene_epoch()
+                and receipt_robot_epoch == self.robot_motion_epoch()
+            )
+            if not current_epoch:
+                break
+            classification = str(receipt.get("classification") or "")
+            if self._ik_receipt_authorizes_motion(receipt, parameters):
+                return None
+            if classification == "hard_infeasible":
+                return (
+                    "ik_target_hard_infeasible: the exact requested endpoint and "
+                    "orientation policy were rejected by current-epoch IK evidence "
+                    f"{receipt.get('receipt_id')!r}. Reason: "
+                    f"{receipt.get('reason_code') or 'hard infeasibility'}. Do not "
+                    "execute or replay this pose. Change xyz/orientation policy, use "
+                    "the returned repair candidate, or preview a separately proposed "
+                    "safe endpoint."
+                )
+            if classification == "kinematically_feasible_collision_deferred":
+                capabilities = self.controller_capabilities() or {}
+                return (
+                    "ik_collision_delegation_not_authorized: current-epoch IK evidence "
+                    f"{receipt.get('receipt_id')!r} found a valid joint solution, but "
+                    "endpoint collision proof was unavailable. This receipt authorizes "
+                    "move_to only when enable_collision_check=true and the environment "
+                    "controller capability explicitly owns per-step pre-actuation and "
+                    "post-step trajectory/world collision checking. Current request "
+                    f"enable_collision_check={parameters.get('enable_collision_check')!r}; "
+                    "controller motion_owns_trajectory_world_collision="
+                    f"{capabilities.get('motion_owns_trajectory_world_collision')!r}. "
+                    "Keep the exact pose, enable verified motion collision checking, "
+                    "or repair/redeploy the collision-capable controller."
+                )
+            return (
+                "ik_preview_not_feasible: current-epoch IK evidence "
+                f"{receipt.get('receipt_id')!r} classified this exact endpoint and "
+                f"orientation policy as {classification or 'unknown'!r} "
+                f"({receipt.get('reason_code') or 'no reason code'}). It is useful "
+                "repair evidence but does not authorize move_to. Adjust the proposal "
+                "and obtain a feasible IK preview for the exact replacement pose."
+            )
+
+        if isinstance(latest_matching, dict):
+            stale_note = (
+                " The latest matching receipt is stale: receipt epochs "
+                f"object={_fact_epoch_value(latest_matching.get('object_scene_epoch'))}, "
+                f"robot={_fact_epoch_value(latest_matching.get('robot_motion_epoch'))}; "
+                f"current epochs object={self.object_scene_epoch()}, "
+                f"robot={self.robot_motion_epoch()}."
+            )
+        else:
+            stale_note = " No matching IK receipt exists."
+        return (
+            "ik_preview_required: move_to requires a current-epoch feasible IK receipt "
+            "for the numerically equivalent target xyz and orientation policy "
+            "(explicit orientation or "
+            "preserve_current_orientation)."
+            + stale_note
+            + " Call ik_preview_check on this exact proposed pose, then execute it only "
+            "if the returned classification is feasible, or if it is explicitly "
+            "kinematically_feasible_collision_deferred and this environment declares "
+            "a verified per-step collision-owning motion controller. Endpoint IK does "
+            "not prove trajectory/world collision clearance; retain collision checking "
+            "on move_to."
+        )
+
+    def articulated_probe_action_gate_error(
         self,
         *,
         tool_name: str,
         parameters: JsonDict,
     ) -> str | None:
-        reconciliation = self.motion_reconciliation()
-        if isinstance(reconciliation, dict) and reconciliation.get("status") in {
-            "required",
-            "unresolved",
-        }:
-            if tool_name == "observe":
-                return None
-            return (
-                "A simulator action has transport-unknown outcome. Observe the same "
-                "environment handle before issuing another action. Do not resend a "
-                "partial move because the original controller may still be running."
-            )
-        execution = self.grasp_execution()
-        if not isinstance(execution, dict) or execution.get("status") != "required":
+        """Protect a frozen probe by evidence id, without imposing task order."""
+
+        marker = _articulated_probe_path_sha256(tool_name, parameters)
+        if not marker:
             return None
-        stage = str(execution.get("stage") or "")
-        if tool_name == "observe":
-            return None
-        if stage == "align":
-            if tool_name in {
-                "sam3",
-                "select_sam3_detection",
-                "retrieve_asset_reference",
-                "molmopoint",
-                "compute_wrist_alignment",
-            }:
-                return None
+        probe = self.articulated_attachment_probe()
+        if not isinstance(probe, dict) or str(probe.get("path_sha256") or "") != marker:
             return (
-                "The grasp is at safe hover and requires fresh wrist alignment. "
-                "Observe/segment the wrist view, then call compute_wrist_alignment."
+                "articulated_probe_unknown: the action references an unknown frozen "
+                "probe hash; call prepare_attachment_probe with current evidence."
             )
-        if stage == "prepare_probe":
-            if tool_name == "prepare_attachment_probe":
-                return None
+        if probe.get("status") != "prepared":
             return (
-                "The closed articulated handle requires prepare_attachment_probe. "
-                "Propose one bounded linear direction or short arc from the current "
-                "multi-view observation before any further world mutation."
+                "articulated_probe_replay: this frozen probe is no longer pending; "
+                "prepare a new evidence-bound probe instead of replaying it."
             )
-        if stage == "attachment":
-            if execution.get("attachment_mode") == "articulated_handle":
-                gate = self.attachment_gate() or {}
-                verdict = str(gate.get("verdict") or "UNKNOWN").upper()
-                assessment_count = int(gate.get("assessment_count") or 0)
-                refresh_required = gate.get("refresh_required") is True
-                refresh_completed = gate.get("unknown_refresh_completed") is True
-                if verdict == "UNKNOWN":
-                    if tool_name == "assess_attachment_probe" and (
-                        assessment_count == 0
-                        or (assessment_count == 1 and refresh_completed)
-                    ):
-                        return None
-                    if (
-                        tool_name == "observe"
-                        and assessment_count == 1
-                        and refresh_required
-                        and not refresh_completed
-                    ):
-                        return None
-            actions = execution.get("attachment_actions")
-            allowed = [
-                action
-                for action in (actions.values() if isinstance(actions, dict) else [])
-                if isinstance(action, dict)
-            ]
-            if any(
-                tool_name == action.get("name") and parameters == action.get("parameters")
-                for action in allowed
-            ):
-                return None
+        frozen = probe.get("frozen_motion")
+        if (
+            not isinstance(frozen, dict)
+            or str(frozen.get("name") or "") != tool_name
+            or not _articulated_probe_motion_equivalent(
+                frozen.get("parameters"),
+                parameters,
+            )
+        ):
             return (
-                "Attachment evidence is pending. Keep the gripper closed and use only "
-                "the host-owned action for the current verdict. Articulated UNKNOWN "
-                "permits one fresh observation; portable-object PASS uses full lift, "
-                "and structured FAIL permits the exact recovery open."
+                "articulated_probe_tampered: preview every frozen probe waypoint and "
+                "execute the resulting receipt id(s) without editing endpoint or path."
             )
-        if stage == "probe":
-            articulated_probe = self.articulated_attachment_probe()
-            articulated_required = (
-                articulated_probe.get("required_action")
-                if isinstance(articulated_probe, dict)
-                else None
-            )
-            if (
-                isinstance(articulated_required, dict)
-                and articulated_probe.get("status") == "required"
-                and tool_name == articulated_required.get("name")
-                and parameters == articulated_required.get("parameters")
-            ):
-                return None
-            probe = self.grasp_lift_probe()
-            required_parameters = (
-                probe.get("required_parameters") if isinstance(probe, dict) else None
-            )
-            if (
-                isinstance(required_parameters, dict)
-                and probe.get("status") == "required"
-                and tool_name == "move_to"
-                and parameters == required_parameters
-            ):
-                return None
-            return (
-                "The attachment probe requires the exact host-generated motion "
-                "parameters while keeping the gripper closed."
-            )
-        required = execution.get("required_action")
-        if not isinstance(required, dict):
-            return "The host-generated grasp execution obligation is malformed."
-        return grasp_reference_action_error(
-            stage=stage,
-            tool_name=tool_name,
-            parameters=parameters,
-            required_action=required,
-        )
+        return None
 
     def resolve_sam3_selection(
         self,
@@ -1184,16 +3832,52 @@ class AgentMemory:
         result_id: str,
         detection_id: str,
         selection_source: str,
+        evidence_role: str = "",
         confidence: float | None = None,
         reason: str = "",
         target_geometry_family: str = "",
+        identity_anchor_id: str = "",
+        identity_relation: str = "",
     ) -> JsonDict:
         pending = self.pending_sam3_selection()
         if pending is None:
             raise ValueError("No SAM3 detection selection is pending.")
         expected_result_id = str(pending.get("result_id") or "")
         if not result_id or result_id != expected_result_id:
-            raise ValueError("select_sam3_detection requires the exact pending sam3_result_id.")
+            candidates = pending.get("candidates")
+            candidate_ids = (
+                [
+                    str(candidate.get("id") or "")
+                    for candidate in candidates
+                    if isinstance(candidate, dict) and candidate.get("id")
+                ]
+                if isinstance(candidates, list)
+                else []
+            )
+            raise ValueError(
+                "select_sam3_detection requires the exact pending sam3_result_id; "
+                f"expected={expected_result_id!r}, received={str(result_id or '')!r}. "
+                "Retry selection without rerunning SAM3; "
+                f"available detection_ids={candidate_ids!r}."
+            )
+        pending_role = _normalize_sam3_evidence_role(pending.get("evidence_role"))
+        requested_role = (
+            _normalize_sam3_evidence_role(evidence_role) if evidence_role else pending_role
+        )
+        if requested_role != pending_role:
+            raise ValueError(
+                "select_sam3_detection evidence_role must match the pending SAM3 result."
+            )
+        identity_conflict = pending.get("identity_conflict")
+        if pending_role == DEFAULT_SAM3_EVIDENCE_ROLE and isinstance(
+            identity_conflict, dict
+        ):
+            raise ValueError(
+                "target_identity_conflict: the host-owned asset/reference verifier "
+                f"reported {identity_conflict.get('decision')!r} for the exact points "
+                "used by this SAM3 result. Reject these detections or gather a new "
+                "view; a generic semantic label cannot override exact-instance evidence."
+            )
         candidates = pending.get("candidates")
         if not isinstance(candidates, list):
             candidates = []
@@ -1218,11 +3902,14 @@ class AgentMemory:
             {
                 "result_id": result_id,
                 "source_image": pending.get("source_image"),
+                "source_packet_id": pending.get("source_packet_id"),
+                "source_observation": pending.get("source_observation"),
                 "target_prompt": pending.get("target_prompt"),
                 "segmentation_mode": pending.get("segmentation_mode"),
                 "selection_source": selection_source or "main_agent_vlm",
                 "selection_confidence": confidence,
                 "selection_reason": reason,
+                "evidence_role": pending_role,
                 "selected_at_s": time.time(),
                 "scene_epoch": _optional_int(
                     pending.get("scene_epoch"),
@@ -1232,11 +3919,20 @@ class AgentMemory:
         )
         if geometry_family and geometry_family != "unknown":
             selected["target_geometry_family"] = geometry_family
-        self.facts.pop(PENDING_SAM3_SELECTION_KEY, None)
-        self.facts[SELECTED_SAM3_DETECTION_KEY] = _memory_fact_entry(
+        self._capture_target_identity_anchor(
             selected,
+            identity_anchor_id=identity_anchor_id,
+            identity_relation=identity_relation,
+            reason=reason,
+        )
+        self.facts.pop(PENDING_SAM3_SELECTION_KEY, None)
+        self._store_selected_sam3_detection(
+            selected,
+            evidence_role=pending_role,
             source="select_sam3_detection",
         )
+        self._refresh_wrist_alignment_bundle()
+        self._remove_sam3_no_detection(evidence_role=pending_role)
         self.facts.pop(TARGET_LOCALIZATION_BUDGET_KEY, None)
         self.record(
             "sam3_detection_selected",
@@ -1245,6 +3941,7 @@ class AgentMemory:
                 "detection_id": detection_id,
                 "selection_source": selected["selection_source"],
                 "selection_confidence": confidence,
+                "evidence_role": pending_role,
             },
         )
         self._save_working_memory()
@@ -1269,16 +3966,23 @@ class AgentMemory:
         no_detection = {
             "result_id": result_id,
             "source_image": pending.get("source_image"),
+            "source_packet_id": pending.get("source_packet_id"),
+            "source_observation": pending.get("source_observation"),
             "target_prompt": pending.get("target_prompt"),
             "reason": "semantic_candidates_rejected",
             "segmentation_mode": pending.get("segmentation_mode"),
             "rejected_detection_ids": rejected_ids,
             "rejection_reason": rejection_reason,
+            "evidence_role": _normalize_sam3_evidence_role(
+                pending.get("evidence_role")
+            ),
         }
         self.facts.pop(PENDING_SAM3_SELECTION_KEY, None)
-        self.facts.pop(SELECTED_SAM3_DETECTION_KEY, None)
-        self.facts[SAM3_NO_DETECTION_KEY] = _memory_fact_entry(
+        role = str(no_detection["evidence_role"])
+        self._remove_selected_sam3_detection(evidence_role=role)
+        self._store_sam3_no_detection(
             no_detection,
+            evidence_role=role,
             source="reject_sam3_detections",
         )
         self.record("sam3_detections_rejected", dict(no_detection))
@@ -1290,76 +3994,22 @@ class AgentMemory:
         *,
         tool_name: str,
         parameters: JsonDict,
-        world_mutating: bool = False,
     ) -> str | None:
-        no_detection = self.sam3_no_detection()
-        reference_failure = _memory_fact_value(
-            self.facts.get(REFERENCE_LOCALIZATION_FAILURE_KEY)
-        )
-        if (
-            tool_name == "retrieve_asset_reference"
-            and isinstance(no_detection, dict)
-            and isinstance(reference_failure, dict)
-            and str(reference_failure.get("sam3_result_id") or "")
-            == str(no_detection.get("result_id") or "")
-        ):
-            return (
-                "Object-memory localization already failed for the current empty SAM3 "
-                "result. Use molmopoint on sam3_no_detection.source_image, then feed its "
-                "exact pixel point to SAM3; do not retry retrieve_asset_reference until "
-                "a new SAM3 result or changed scene exists."
-            )
-        localization = self.pending_reference_localization()
-        if localization is not None:
-            required_parameter = str(localization.get("required_parameter") or "roi_bbox_xyxy")
-            if tool_name != "sam3":
-                return (
-                    "Reference-guided target localization is pending. The next "
-                    f"perception action must call SAM3 with {required_parameter}."
-                )
-            expected_image = str(localization.get("scene_image") or "")
-            if str(parameters.get("image") or "") != expected_image:
-                return (
-                    "Reference-guided SAM3 must use the exact scene image from the "
-                    "pending asset-reference result."
-                )
-            if required_parameter == "positive_points":
-                expected_points = localization.get("positive_points")
-                if parameters.get("positive_points") != expected_points:
-                    return (
-                        "Reference-guided SAM3 requires the exact positive_points "
-                        "returned by the isolated reference localizer."
-                    )
-            else:
-                bbox = parameters.get("roi_bbox_xyxy")
-                if not isinstance(bbox, list) or len(bbox) != 4:
-                    return (
-                        "Reference-guided SAM3 requires roi_bbox_xyxy in original-image "
-                        "pixel coordinates."
-                    )
-        pending = self.pending_sam3_selection()
         mode = str(parameters.get("mode") or "targeted").strip().lower()
-        if pending is not None and tool_name == "anygrasp" and mode != "scene":
-            return (
-                "Targeted AnyGrasp is blocked until the pending SAM3 candidates are "
-                "resolved with select_sam3_detection."
-            )
-        if pending is not None and tool_name == "graspgenx":
-            return (
-                "GraspGenX is blocked until the pending SAM3 candidates are resolved "
-                "with select_sam3_detection."
-            )
-        if pending is not None and world_mutating:
-            return (
-                "World-mutating tools are blocked while a SAM3 detection selection "
-                "obligation is pending."
-            )
         if tool_name not in {"anygrasp", "graspgenx"}:
             return None
         if tool_name == "anygrasp" and mode == "scene":
             return None
         selected = self.selected_sam3_detection()
         if selected is None:
+            pending = self.pending_sam3_selection()
+            if isinstance(pending, dict):
+                return (
+                    f"{tool_name} cannot consume an unverified segmentation mask: "
+                    f"SAM3 result {pending.get('result_id')!r} still has unresolved "
+                    "target identity. Inspect the candidate evidence and explicitly "
+                    "record the selected detection, or reject all candidates."
+                )
             return None
         expected_mask = str(selected.get("mask_ref") or "")
         if tool_name == "graspgenx":
@@ -1378,6 +4028,297 @@ class AgentMemory:
             return "GraspGenX must use the mask_ref from the recorded select_sam3_detection result."
         return None
 
+    def gate_repair_bundle(
+        self,
+        *,
+        code: str,
+        reason: str,
+        requested_tool: str,
+        requested_parameters: JsonDict,
+    ) -> JsonDict:
+        """Return executable, host-grounded recovery choices for a hard rejection."""
+
+        options: list[JsonDict] = [
+            {
+                "tool": "observe",
+                "parameters": {},
+                "reason": "refresh visual and measured robot evidence without mutating the world",
+            }
+        ]
+        if code == "ik_preview_required":
+            target_pose = requested_parameters.get("target_pose")
+            if isinstance(target_pose, dict):
+                preview_parameters: JsonDict = {
+                    "target_pose": dict(target_pose),
+                    "check_endpoint_collision": True,
+                }
+                if _target_pose_has_no_orientation(target_pose):
+                    preview_parameters["preserve_current_orientation"] = True
+                if "tolerance" in requested_parameters:
+                    preview_parameters["position_tolerance_m"] = requested_parameters[
+                        "tolerance"
+                    ]
+                if "ori_tolerance" in requested_parameters:
+                    preview_parameters["orientation_tolerance_rad"] = requested_parameters[
+                        "ori_tolerance"
+                    ]
+                options.append(
+                    {
+                        "tool": "ik_preview_check",
+                        "parameters": preview_parameters,
+                        "reason": (
+                            "preview the exact requested endpoint and orientation policy; "
+                            "a feasible current-epoch receipt can authorize this move"
+                        ),
+                    }
+                )
+        elif code == "ik_collision_delegation_not_authorized":
+            capabilities = self.controller_capabilities() or {}
+            if capabilities.get("motion_owns_trajectory_world_collision") is True:
+                options.append(
+                    {
+                        "tool": requested_tool,
+                        "parameters": {
+                            **dict(requested_parameters),
+                            "enable_collision_check": True,
+                        },
+                        "reason": (
+                            "reuse the exact current-epoch kinematic solution while "
+                            "delegating trajectory/world collision proof to the "
+                            "declared per-step collision-owning motion controller"
+                        ),
+                    }
+                )
+        elif code in {
+            "ik_target_hard_infeasible",
+            "ik_preview_not_feasible",
+            "compiled_grasp_adjustment_unverified_orientation_policy",
+        }:
+            target_pose = requested_parameters.get("target_pose")
+            if isinstance(target_pose, dict):
+                position_only_pose = {
+                    key: value
+                    for key, value in target_pose.items()
+                    if key
+                    not in {
+                        "rotation_matrix",
+                        "quat_xyzw",
+                        "quaternion",
+                        "rotvec",
+                        "roll",
+                        "pitch",
+                        "yaw",
+                    }
+                }
+                options.append(
+                    {
+                        "tool": "ik_preview_check",
+                        "parameters": {
+                            "target_pose": position_only_pose,
+                            "preserve_current_orientation": True,
+                            **(
+                                {
+                                    "position_tolerance_m": requested_parameters[
+                                        "position_tolerance_m"
+                                    ]
+                                }
+                                if "position_tolerance_m" in requested_parameters
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "orientation_tolerance_rad": requested_parameters[
+                                        "ori_tolerance"
+                                    ]
+                                }
+                                if "ori_tolerance" in requested_parameters
+                                else {}
+                            ),
+                        },
+                        "reason": (
+                            "preview the same position with current wrist orientation; "
+                            "this is a new proposal, not authorization for the rejected rotation"
+                        ),
+                    }
+                )
+        localization = self.pending_reference_localization()
+        if isinstance(localization, dict):
+            required_parameter = str(
+                localization.get("required_parameter") or "roi_bbox_xyxy"
+            )
+            parameters: JsonDict = {
+                "source_packet_id": localization.get("source_packet_id"),
+                "prompt": localization.get("target_object") or "target object",
+            }
+            if localization.get("camera_frame_id"):
+                parameters["camera_frame_id"] = localization["camera_frame_id"]
+            required_value = localization.get(required_parameter)
+            if required_value is not None:
+                # ``positive_points`` is the evidence-bundle field retained
+                # for asset-reference compatibility.  The public SAM3 tool
+                # contract calls the same value ``points``.  Emit the public
+                # spelling here so repair guidance can be executed verbatim.
+                if required_parameter == "positive_points":
+                    parameters["mode"] = "points"
+                    parameters["points"] = required_value
+                    parameters.pop("prompt", None)
+                else:
+                    parameters[required_parameter] = required_value
+            options.append(
+                {
+                    "tool": "sam3",
+                    "parameters": parameters,
+                    "reason": "consume the active reference-localization evidence",
+                }
+            )
+        no_detection = self.sam3_no_detection()
+        if isinstance(no_detection, dict):
+            packet_id = str(no_detection.get("source_packet_id") or "").strip()
+            frame_id = str(no_detection.get("frame_id") or "").strip()
+            source_observation = no_detection.get("source_observation")
+            source_observation = (
+                source_observation if isinstance(source_observation, dict) else {}
+            )
+            object_epoch = no_detection.get("object_scene_epoch")
+            if object_epoch is None:
+                object_epoch = no_detection.get("scene_epoch")
+            if object_epoch is None:
+                object_epoch = source_observation.get("object_scene_epoch")
+            robot_epoch = no_detection.get("robot_motion_epoch")
+            if robot_epoch is None:
+                robot_epoch = source_observation.get("robot_motion_epoch")
+            if (
+                packet_id
+                and frame_id
+                and object_epoch is not None
+                and robot_epoch is not None
+                and _fact_epoch_value(object_epoch) == self.object_scene_epoch()
+                and _fact_epoch_value(robot_epoch) == self.robot_motion_epoch()
+            ):
+                target = str(no_detection.get("target_prompt") or "target object")
+                if code == "same_view_packet_mismatch" and requested_tool == "sam3":
+                    exact_sam3 = dict(requested_parameters)
+                    exact_sam3["source_packet_id"] = packet_id
+                    exact_sam3["camera_frame_id"] = frame_id
+                    options.append(
+                        {
+                            "tool": "sam3",
+                            "parameters": exact_sam3,
+                            "reason": (
+                                "retry the Agent-authored point prompt against the exact "
+                                "immutable SAM3 no-detection view"
+                            ),
+                        }
+                    )
+                else:
+                    prompt = (
+                        str(requested_parameters.get("prompt") or "").strip()
+                        if requested_tool == "molmopoint"
+                        else ""
+                    )
+                    options.append(
+                        {
+                            "tool": "molmopoint",
+                            "parameters": {
+                                "sources": [
+                                    {
+                                        "source_packet_id": packet_id,
+                                        "camera_frame_id": frame_id,
+                                    }
+                                ],
+                                "prompt": prompt or f"Point to the {target} in Image 1.",
+                            },
+                            "reason": (
+                                "preserve the exact immutable SAM3 no-detection view for "
+                                "same-view point grounding"
+                            ),
+                        }
+                    )
+        pending = self.pending_sam3_selection()
+        if isinstance(pending, dict):
+            result_id = str(pending.get("result_id") or "")
+            evidence_role = _normalize_sam3_evidence_role(pending.get("evidence_role"))
+            candidates = pending.get("candidates")
+            for candidate in (
+                candidates if isinstance(candidates, list) else []
+            )[:8]:
+                if not isinstance(candidate, dict) or not candidate.get("id"):
+                    continue
+                options.append(
+                    {
+                        "tool": "select_sam3_detection",
+                        "parameters": {
+                            "sam3_result_id": result_id,
+                            "detection_id": candidate.get("id"),
+                            "evidence_role": evidence_role,
+                            "reason": "select after visual identity verification",
+                        },
+                        "evidence": {
+                            "score": candidate.get("score"),
+                            "mask_ref": candidate.get("mask_ref"),
+                        },
+                    }
+                )
+            if result_id:
+                options.append(
+                    {
+                        "tool": "reject_sam3_detections",
+                        "parameters": {
+                            "sam3_result_id": result_id,
+                            "reason": "none of the candidates matches the task target",
+                        },
+                        "reason": "use only after visual rejection of every candidate",
+                    }
+                )
+        for public in (self.grasp_input_bundle(), self.anyplace_input_bundle()):
+            if not isinstance(public, dict) or public.get("status") != "ready":
+                continue
+            call_parameters = public.get("call_parameters")
+            if isinstance(call_parameters, dict):
+                options.append(
+                    {
+                        "tool": public.get("tool"),
+                        "parameters": dict(call_parameters),
+                        "reason": "use the active host-resolved provenance bundle",
+                    }
+                )
+        stale_evidence = [
+            node
+            for node in self.provenance_evidence_graph().get("nodes", [])
+            if isinstance(node, dict)
+            and str(node.get("freshness") or "").startswith("stale")
+        ]
+        return {
+            "schema_version": "openeta.gate_repair.v1",
+            # Reserved, deliberately schema-free extension namespace. v1 tools
+            # must not infer keys or semantics until a concrete repair case is
+            # reviewed and assigned a versioned extension contract.
+            "extensions": {},
+            "code": code,
+            "violated_invariant": reason,
+            "requested_call": {
+                "tool": requested_tool,
+                "parameters": dict(requested_parameters),
+            },
+            "evidence_ids": [
+                str(node.get("evidence_id"))
+                for node in self.provenance_evidence_graph().get("nodes", [])
+                if isinstance(node, dict) and node.get("evidence_id")
+            ],
+            "allowed_next_calls": options,
+            "stale_evidence": stale_evidence,
+            "recent_source_packets": self.recent_observation_packet_refs(),
+            "latest_ik_preview": (self.ik_preview_receipts() or {}).get("latest"),
+            "execution_evidence": {
+                "latest_compiled_clearance_execution": (
+                    self.latest_compiled_clearance_execution()
+                ),
+                "latest_compiled_contact_execution": (
+                    self.latest_compiled_contact_execution()
+                ),
+            },
+        }
+
     def _capture_sam3_selection_state(self, action: EnvAction) -> None:
         command = action.command if isinstance(action.command, dict) else {}
         for call in command.get("tool_calls", []) or []:
@@ -1395,7 +4336,6 @@ class AgentMemory:
             detections = outputs.get("detections")
             if not isinstance(detections, list):
                 continue
-            self.facts.pop(GRASP_REESTIMATION_KEY, None)
             candidates = [
                 dict(candidate) for candidate in detections if isinstance(candidate, dict)
             ]
@@ -1407,7 +4347,12 @@ class AgentMemory:
                 selection_bundle = {}
             parameters = details.get("parameters")
             if not isinstance(parameters, dict):
+                parameters = call.get("parameters")
+            if not isinstance(parameters, dict):
                 parameters = {}
+            evidence_role = _normalize_sam3_evidence_role(
+                outputs.get("evidence_role") or parameters.get("evidence_role")
+            )
             source_camera_role = str(
                 outputs.get("source_camera_role")
                 or details.get("source_camera_role")
@@ -1421,19 +4366,24 @@ class AgentMemory:
                     if source_camera_role
                     else None
                 )
-                or parameters.get("frame_id")
+                or parameters.get("camera_frame_id")
             )
             base = {
                 "result_id": result_id,
                 "target_prompt": outputs.get("prompt") or parameters.get("prompt"),
-                "source_image": outputs.get("source_image") or parameters.get("image"),
+                "source_image": outputs.get("source_image"),
+                "source_packet_id": outputs.get("source_packet_id"),
+                "source_observation": outputs.get("source_observation"),
                 "frame_id": source_frame_id,
                 "ranking": outputs.get("ranking") or "score_descending",
                 "candidate_count": len(candidates),
                 "candidates": candidates,
                 "selection_bundle": dict(selection_bundle),
                 "segmentation_mode": outputs.get("segmentation_mode"),
+                "evidence_role": evidence_role,
                 "scene_epoch": self.scene_epoch(),
+                "object_scene_epoch": self.object_scene_epoch(),
+                "robot_motion_epoch": self.robot_motion_epoch(),
             }
             if source_camera_role:
                 base["camera_role"] = source_camera_role
@@ -1441,18 +4391,29 @@ class AgentMemory:
             asset_reference = self.target_asset_reference()
             if isinstance(asset_reference, dict):
                 verification = asset_reference.get("exact_instance_verification")
+                supplied_points = parameters.get("points")
+                if supplied_points is None:
+                    supplied_points = parameters.get("positive_points")
                 if (
                     isinstance(verification, dict)
-                    and str(verification.get("decision") or "").lower() == "match"
-                    and str(parameters.get("image") or "")
-                    == str(asset_reference.get("scene_image") or "")
-                    and parameters.get("positive_points") == asset_reference.get("positive_points")
+                    and str(parameters.get("source_packet_id") or "")
+                    == str(asset_reference.get("source_packet_id") or "")
+                    and (
+                        not asset_reference.get("camera_frame_id")
+                        or str(parameters.get("camera_frame_id") or "")
+                        == str(asset_reference.get("camera_frame_id") or "")
+                    )
+                    and asset_reference.get("positive_points") is not None
+                    and supplied_points == asset_reference.get("positive_points")
                 ):
-                    base["reference_verification"] = dict(verification)
+                    decision = str(verification.get("decision") or "").lower()
+                    if decision == "match":
+                        base["reference_verification"] = dict(verification)
+                    elif decision in {"mismatch", "abstain"}:
+                        base["identity_conflict"] = dict(verification)
             self.facts.pop(PENDING_SAM3_SELECTION_KEY, None)
-            self.facts.pop(SELECTED_SAM3_DETECTION_KEY, None)
             if candidates:
-                self.facts.pop(SAM3_NO_DETECTION_KEY, None)
+                self._remove_sam3_no_detection(evidence_role=evidence_role)
                 self.facts[PENDING_SAM3_SELECTION_KEY] = _memory_fact_entry(
                     base,
                     source="sam3",
@@ -1462,65 +4423,24 @@ class AgentMemory:
                     {
                         "result_id": result_id,
                         "candidate_count": len(candidates),
+                        "evidence_role": evidence_role,
                         "verification_scope": (
                             "single_detection" if len(candidates) == 1 else "multiple_detections"
                         ),
                     },
                 )
             else:
-                self.facts[SAM3_NO_DETECTION_KEY] = _memory_fact_entry(
+                self._remove_selected_sam3_detection(evidence_role=evidence_role)
+                self._store_sam3_no_detection(
                     base,
+                    evidence_role=evidence_role,
                     source="sam3",
                 )
-                self._capture_grasp_fallback_segmentation_failure(base)
-                self.record("sam3_no_detection", {"result_id": result_id})
+                self.record(
+                    "sam3_no_detection",
+                    {"result_id": result_id, "evidence_role": evidence_role},
+                )
             self._save_working_memory()
-
-    def _capture_grasp_fallback_segmentation_failure(self, sam3_result: JsonDict) -> None:
-        policy = self.grasp_candidate_policy()
-        if not isinstance(policy, dict) or policy.get("fallback_required") is not True:
-            return
-        target_prompt = str(sam3_result.get("target_prompt") or "").strip()
-        fallback_prompt = str(policy.get("fallback_target_prompt") or "").strip()
-        if target_prompt and fallback_prompt and target_prompt != fallback_prompt:
-            return
-        source_image = str(sam3_result.get("source_image") or "")
-        if not source_image:
-            return
-        attempts = _grasp_fallback_attempts(policy)
-        max_gripper_width = _policy_max_gripper_width(
-            policy,
-            default=float(
-                self._active_grasp_calibration_capabilities()["max_gripper_width_m"]
-            ),
-        )
-        _append_grasp_fallback_attempt(
-            attempts,
-            {
-                "backend": str(policy.get("source_backend") or "anygrasp"),
-                "camera_frame_id": _camera_frame_for_source_image(
-                    policy,
-                    source_image,
-                ),
-                "source_rgb": source_image,
-                "outcome": "segmentation_no_detection",
-                "raw_candidate_count": 0,
-                "width_limit_m": max_gripper_width,
-            },
-        )
-        policy["fallback_attempts"] = attempts
-        self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-            policy,
-            source="grasp_width_fallback",
-        )
-        self.record(
-            "grasp_estimation_fallback_camera_exhausted",
-            {
-                "backend": str(policy.get("source_backend") or "anygrasp"),
-                "source_rgb": source_image,
-                "reason": "segmentation_no_detection",
-            },
-        )
 
     def _capture_reference_localization_state(self, action: EnvAction) -> None:
         command = action.command if isinstance(action.command, dict) else {}
@@ -1655,6 +4575,9 @@ class AgentMemory:
                 ]
                 if not scene_image or not reference_images:
                     continue
+                source_reference = self.observation_packet_reference_for_path(scene_image)
+                if not source_reference:
+                    continue
                 positive_points = bundle.get("positive_points")
                 if not isinstance(positive_points, list):
                     positive_points = outputs.get("positive_points")
@@ -1662,13 +4585,16 @@ class AgentMemory:
                 if not isinstance(bbox_xyxy, list):
                     bbox_xyxy = outputs.get("bbox_xyxy")
                 point_prompt = isinstance(positive_points, list) and bool(positive_points)
+                ranked_candidates = bundle.get("ranked_candidates")
+                if not isinstance(ranked_candidates, list):
+                    ranked_candidates = []
                 localizer = outputs.get("localizer")
                 if not isinstance(localizer, dict):
                     localizer = {}
                 verification = localizer.get("verification")
                 exact_instance_verification = (
                     {
-                        "decision": "match",
+                        "decision": str(verification.get("decision") or "").lower(),
                         "confidence": verification.get("confidence"),
                         "reason": verification.get("reason"),
                         "candidate_crop": verification.get("candidate_crop"),
@@ -1677,18 +4603,25 @@ class AgentMemory:
                         "grasp_geometry_family": verification.get("grasp_geometry_family"),
                     }
                     if isinstance(verification, dict)
-                    and str(verification.get("decision") or "").lower() == "match"
+                    and str(verification.get("decision") or "").lower()
+                    in {"match", "mismatch", "abstain"}
                     else None
                 )
                 obligation = {
                     "environment": outputs.get("environment") or bundle.get("environment"),
                     "target_object": outputs.get("target_object") or bundle.get("target_object"),
                     "scene_image": scene_image,
+                    **source_reference,
                     "reference_images": reference_images,
                     "marked_scene_image": bundle.get("marked_scene_image_ref")
                     or outputs.get("marked_scene_image"),
                     "positive_points": positive_points if point_prompt else None,
                     "bbox_xyxy": bbox_xyxy,
+                    "candidate_policy": bundle.get("candidate_policy"),
+                    "ranked_candidates": ranked_candidates,
+                    "requires_downstream_confirmation": bool(
+                        bundle.get("requires_downstream_confirmation")
+                    ),
                     "localization_bundle": dict(bundle),
                     "exact_instance_verification": exact_instance_verification,
                     "required_next_tool": "sam3",
@@ -1710,15 +4643,23 @@ class AgentMemory:
                             bundle.get("memory_resolution") or outputs.get("memory_resolution")
                         ),
                         "scene_image": scene_image,
+                        **source_reference,
                         "reference_images": reference_images,
                         "positive_points": positive_points if point_prompt else None,
                         "bbox_xyxy": bbox_xyxy,
+                        "candidate_policy": bundle.get("candidate_policy"),
+                        "ranked_candidates": ranked_candidates,
+                        "requires_downstream_confirmation": bool(
+                            bundle.get("requires_downstream_confirmation")
+                        ),
                         "exact_instance_verification": exact_instance_verification,
                     },
                     source=name,
                 )
                 self.facts.pop(PENDING_SAM3_SELECTION_KEY, None)
-                self.facts.pop(SELECTED_SAM3_DETECTION_KEY, None)
+                self._remove_selected_sam3_detection(
+                    evidence_role=DEFAULT_SAM3_EVIDENCE_ROLE
+                )
                 self.record(
                     "asset_reference_localization_required",
                     {
@@ -1767,10 +4708,14 @@ class AgentMemory:
                     normalized.append({"x": float(x), "y": float(y), "label": 1})
                 if not scene_image or not normalized:
                     continue
+                source_reference = self.observation_packet_reference_for_path(scene_image)
+                if not source_reference:
+                    continue
                 obligation = {
                     "environment": None,
                     "target_object": no_detection.get("target_prompt"),
                     "scene_image": scene_image,
+                    **source_reference,
                     "reference_images": [],
                     "marked_scene_image": None,
                     "positive_points": normalized,
@@ -1789,7 +4734,9 @@ class AgentMemory:
                 )
                 self.facts.pop(REFERENCE_LOCALIZATION_FAILURE_KEY, None)
                 self.facts.pop(PENDING_SAM3_SELECTION_KEY, None)
-                self.facts.pop(SELECTED_SAM3_DETECTION_KEY, None)
+                self._remove_selected_sam3_detection(
+                    evidence_role=DEFAULT_SAM3_EVIDENCE_ROLE
+                )
                 self.record(
                     "molmopoint_localization_required",
                     {
@@ -1809,13 +4756,22 @@ class AgentMemory:
                 parameters = {}
             pending = self.pending_reference_localization() or {}
             required_parameter = str(pending.get("required_parameter") or "roi_bbox_xyxy")
+            supplied_points = parameters.get("points")
+            if supplied_points is None:
+                supplied_points = parameters.get("positive_points")
             geometry_matches = (
-                parameters.get("positive_points") == pending.get("positive_points")
+                supplied_points == pending.get("positive_points")
                 if required_parameter == "positive_points"
                 else parameters.get("roi_bbox_xyxy") is not None
             )
             if (
-                str(parameters.get("image") or "") == str(pending.get("scene_image") or "")
+                str(parameters.get("source_packet_id") or "")
+                == str(pending.get("source_packet_id") or "")
+                and (
+                    not pending.get("camera_frame_id")
+                    or str(parameters.get("camera_frame_id") or "")
+                    == str(pending.get("camera_frame_id") or "")
+                )
                 and geometry_matches
             ):
                 self.facts.pop(PENDING_REFERENCE_LOCALIZATION_KEY, None)
@@ -1823,1261 +4779,14 @@ class AgentMemory:
                     "asset_reference_localization_resolved",
                     {
                         "target_object": pending.get("target_object"),
-                        required_parameter: parameters.get(required_parameter),
+                        required_parameter: (
+                            supplied_points
+                            if required_parameter == "positive_points"
+                            else parameters.get(required_parameter)
+                        ),
                     },
                 )
                 self._save_working_memory()
-
-    def _capture_anygrasp_candidate_policy(self, action: EnvAction) -> None:
-        command = action.command if isinstance(action.command, dict) else {}
-        for call in command.get("tool_calls", []) or []:
-            source_tool = str(call.get("name") or "") if isinstance(call, dict) else ""
-            if not isinstance(call, dict) or source_tool not in {
-                "grasp_pose_estimate",
-                "anygrasp",
-                "graspgenx",
-                "contact_graspnet",
-            }:
-                continue
-            result = call.get("result")
-            if not isinstance(result, dict) or not bool(result.get("success")):
-                continue
-            details = result.get("details")
-            if not isinstance(details, dict):
-                continue
-            outputs = details.get("outputs")
-            if not isinstance(outputs, dict):
-                outputs = details
-            source_backend = str(outputs.get("selected_backend") or source_tool)
-            candidates_value = outputs.get("grasp_candidates")
-            if not isinstance(candidates_value, list):
-                continue
-            raw_candidates = [
-                dict(candidate)
-                for candidate in candidates_value
-                if isinstance(candidate, dict) and str(candidate.get("id") or "")
-            ]
-            if not raw_candidates:
-                continue
-            capabilities = self._active_grasp_calibration_capabilities()
-            max_gripper_width = float(capabilities["max_gripper_width_m"])
-            width_rejections = [
-                candidate
-                for candidate in raw_candidates
-                if not _candidate_fits_gripper(
-                    candidate,
-                    max_gripper_width_m=max_gripper_width,
-                )
-            ]
-            candidates = [
-                candidate
-                for candidate in raw_candidates
-                if _candidate_fits_gripper(
-                    candidate,
-                    max_gripper_width_m=max_gripper_width,
-                )
-            ]
-            candidates.sort(key=_grasp_candidate_sort_key)
-            for rank, candidate in enumerate(candidates):
-                candidate["rank"] = rank
-            result_id = str(outputs.get("result_id") or "")
-            if not result_id:
-                result_id = f"{source_tool}-{int(time.time() * 1000)}"
-            selected_target = self.selected_sam3_detection()
-            source = outputs.get("source")
-            if not isinstance(source, dict):
-                source = {}
-            source_rgb = str(outputs.get("source_rgb") or source.get("rgb") or "")
-            source_depth = str(outputs.get("source_depth") or source.get("depth") or "")
-            camera_frame_id = str(
-                outputs.get("camera_frame_id") or source.get("camera_frame_id") or ""
-            )
-            if not camera_frame_id:
-                camera_frame_id = self._latest_camera_frame_for_source_image(
-                    source_rgb,
-                    scene_epoch=self.scene_epoch(),
-                )
-            previous_policy = self.grasp_candidate_policy()
-            existing_recovery = self.grasp_estimation_recovery()
-            target_prompt = (
-                str(selected_target.get("target_prompt") or "").strip()
-                if isinstance(selected_target, dict)
-                else ""
-            )
-            matching_recovery = (
-                isinstance(existing_recovery, dict)
-                and bool(target_prompt)
-                and str(existing_recovery.get("target_prompt") or "").strip()
-                == target_prompt
-            )
-            previous_prompt = (
-                str(previous_policy.get("fallback_target_prompt") or "").strip()
-                if isinstance(previous_policy, dict)
-                else ""
-            )
-            fallback_attempts = (
-                _grasp_fallback_attempts(previous_policy)
-                if target_prompt and target_prompt == previous_prompt
-                else []
-            )
-            all_candidates_over_width = bool(raw_candidates) and len(width_rejections) == len(
-                raw_candidates
-            )
-            if all_candidates_over_width:
-                _append_grasp_fallback_attempt(
-                    fallback_attempts,
-                    {
-                        "backend": source_backend,
-                        "camera_frame_id": camera_frame_id,
-                        "source_rgb": source_rgb,
-                        "outcome": "all_candidates_over_width",
-                        "raw_candidate_count": len(raw_candidates),
-                        "width_limit_m": max_gripper_width,
-                    },
-                )
-            policy = {
-                "result_id": result_id,
-                "source_tool": source_tool,
-                "source_backend": source_backend,
-                "ranking": "score_descending",
-                "status": "active" if candidates else "exhausted",
-                "candidate_count": len(candidates),
-                "raw_candidate_count": len(raw_candidates),
-                "active_rank": 0 if candidates else None,
-                "active_candidate": candidates[0] if candidates else None,
-                "remaining_candidate_ids": [
-                    str(candidate.get("id")) for candidate in candidates[1:]
-                ],
-                "candidates": candidates,
-                "source_rgb": source_rgb,
-                "source_depth": source_depth,
-                "camera_frame_id": camera_frame_id,
-                "grasp_source": dict(source),
-                "physical_width_limit_m": max_gripper_width,
-                "grasp_calibration_id": capabilities["calibration_id"],
-                "grasp_calibration_profile_path": capabilities["profile_path"],
-                "candidate_attempt_count": 0,
-                "max_candidate_attempts": GRASP_CANDIDATE_MAX_ATTEMPTS,
-                "candidate_fallback": False,
-                "rejected_candidates": [
-                    {
-                        "candidate_id": candidate.get("id"),
-                        "rank": candidate.get("rank"),
-                        "score": candidate.get("score"),
-                        "reason": (
-                            "candidate width exceeds calibration "
-                            f"max_gripper_width_m {max_gripper_width:.4f} m"
-                        ),
-                        "source": "physical_gripper_width_filter",
-                    }
-                    for candidate in width_rejections
-                ],
-                "scene_epoch": self.scene_epoch(),
-                "activated_at_s": time.time(),
-            }
-            if target_prompt:
-                policy["fallback_target_prompt"] = target_prompt
-            if fallback_attempts:
-                policy["fallback_attempts"] = fallback_attempts
-            if all_candidates_over_width:
-                seed_candidate = min(raw_candidates, key=_grasp_candidate_sort_key)
-                policy.update(
-                    {
-                        "exhaustion_reason": "physical_gripper_width_filter",
-                        "fallback_required": True,
-                        "refinement_seed_candidate": dict(seed_candidate),
-                    }
-                )
-            elif candidates and matching_recovery:
-                policy["recovery_lineage"] = {
-                    "recovery_id": existing_recovery.get("recovery_id"),
-                    "trigger_class": existing_recovery.get("trigger_class"),
-                    "trigger_scope": existing_recovery.get("trigger_scope"),
-                    "source_result_id": existing_recovery.get("source_result_id"),
-                }
-            if isinstance(selected_target, dict) and str(outputs.get("mode") or "targeted") == (
-                "targeted"
-            ):
-                policy["target_detection"] = dict(selected_target)
-                geometry_family = str(
-                    selected_target.get("target_geometry_family") or ""
-                ).strip()
-                if geometry_family:
-                    policy["compile_hints"] = {
-                        "target_geometry_family": geometry_family,
-                    }
-                handle_policy = _articulated_handle_candidate_policy(
-                    candidates=candidates,
-                    selected_target=selected_target,
-                    task=_active_task_text(self),
-                    source_tool=source_tool,
-                    source_rgb=source_rgb,
-                    source_mask=str(
-                        outputs.get("target_mask")
-                        or outputs.get("object_mask")
-                        or source.get("object_mask")
-                        or ""
-                    ),
-                    camera_frame_id=camera_frame_id,
-                    scene_epoch=self.scene_epoch(),
-                    camera_extrinsics=self._latest_camera_extrinsics(
-                        camera_frame_id=camera_frame_id,
-                        scene_epoch=self.scene_epoch(),
-                    ),
-                )
-                if handle_policy is not None:
-                    policy.update(handle_policy)
-            previous_release = self.placement_release()
-            if isinstance(previous_release, dict) and str(
-                previous_release.get("status") or ""
-            ) in {"retreated", "failed", "invalidated"}:
-                self.facts.pop(PLACEMENT_RELEASE_KEY, None)
-                self.record(
-                    "placement_release_cleared_for_new_grasp",
-                    {
-                        "previous_candidate_id": previous_release.get("candidate_id"),
-                        "previous_placement_pose_id": previous_release.get(
-                            "placement_pose_id"
-                        ),
-                        "new_result_id": result_id,
-                    },
-                )
-            self.facts.pop(LEGACY_ANYGRASP_CANDIDATE_POLICY_KEY, None)
-            self.facts.pop(GRASP_REESTIMATION_KEY, None)
-            self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-                policy,
-                source=source_tool,
-            )
-            if all_candidates_over_width:
-                self._schedule_grasp_estimation_recovery(
-                    policy=policy,
-                    seed_candidate=policy.get("refinement_seed_candidate"),
-                    source=dict(source),
-                    rejection={
-                        "source": "physical_gripper_width_filter",
-                        "reason": "all candidates exceed the physical gripper width limit",
-                        "recovery_class": "perception_refinable",
-                        "recovery_scope": "view",
-                    },
-                )
-            elif candidates and isinstance(existing_recovery, dict):
-                self.facts.pop(GRASP_ESTIMATION_RECOVERY_KEY, None)
-                self.record(
-                    (
-                        "grasp_estimation_recovery_completed"
-                        if matching_recovery
-                        else "grasp_estimation_recovery_superseded"
-                    ),
-                    {
-                        "recovery_id": existing_recovery.get("recovery_id"),
-                        "result_id": result_id,
-                        "candidate_count": len(candidates),
-                        "source_backend": source_backend,
-                        "camera_frame_id": camera_frame_id,
-                    },
-                )
-            self.record(
-                f"{source_tool}_candidate_activated",
-                {
-                    "result_id": result_id,
-                    "candidate_id": candidates[0].get("id") if candidates else None,
-                    "rank": 0 if candidates else None,
-                    "score": candidates[0].get("score") if candidates else None,
-                    "candidate_count": len(candidates),
-                    "width_rejection_count": len(width_rejections),
-                },
-            )
-            self._save_working_memory()
-
-    def _latest_camera_extrinsics(
-        self,
-        *,
-        camera_frame_id: str,
-        scene_epoch: int,
-    ) -> JsonDict | None:
-        if not camera_frame_id:
-            return None
-        for event in reversed(self.events):
-            if event.event_type != "observation":
-                continue
-            try:
-                observed_epoch = int(event.payload.get("scene_epoch"))
-            except (TypeError, ValueError):
-                continue
-            if observed_epoch != scene_epoch:
-                continue
-            calibrations = event.payload.get("runtime_camera_calibrations")
-            if not isinstance(calibrations, list):
-                continue
-            for calibration in calibrations:
-                if not isinstance(calibration, dict):
-                    continue
-                if str(calibration.get("frame_id") or "") != camera_frame_id:
-                    continue
-                extrinsics = calibration.get("extrinsics")
-                return dict(extrinsics) if isinstance(extrinsics, dict) else None
-        return None
-
-    def _latest_camera_frame_for_source_image(
-        self,
-        source_image: str,
-        *,
-        scene_epoch: int,
-    ) -> str:
-        if not source_image:
-            return ""
-        for event in reversed(self.events):
-            if event.event_type != "observation":
-                continue
-            try:
-                observed_epoch = int(event.payload.get("scene_epoch"))
-            except (TypeError, ValueError):
-                continue
-            if observed_epoch != scene_epoch:
-                continue
-            sources = event.payload.get("runtime_camera_sources")
-            if not isinstance(sources, list):
-                continue
-            for source in sources:
-                if not isinstance(source, dict):
-                    continue
-                if str(source.get("rgb_path") or "") == source_image:
-                    return str(source.get("frame_id") or "")
-        return ""
-
-    def _advance_anygrasp_candidate_after_rejection(self, action: EnvAction) -> bool:
-        policy = self.grasp_candidate_policy()
-        if policy is None or str(policy.get("status") or "") not in {"active", "accepted"}:
-            return False
-        active = policy.get("active_candidate")
-        if not isinstance(active, dict):
-            return False
-        active_candidate_id = str(active.get("id") or "")
-        rejection = _wrist_reference_localization_rejection(
-            action,
-            active_candidate_id=active_candidate_id,
-            execution=self.grasp_execution(),
-        )
-        if rejection is None:
-            rejection = _host_stage_precontact_review_rejection(
-                action,
-                active_candidate_id=active_candidate_id,
-                execution=self.grasp_execution(),
-            )
-        if rejection is None:
-            if str(policy.get("status") or "") == "accepted":
-                rejection = _candidate_linked_grasp_outcome_rejection(
-                    action,
-                    active_candidate_id=active_candidate_id,
-                    lift_probe=self.grasp_lift_probe(),
-                    articulated_probe=self.articulated_attachment_probe(),
-                    attachment_gate=self.attachment_gate(),
-                    execution=self.grasp_execution(),
-                )
-            else:
-                rejection = _candidate_linked_rejection(
-                    action,
-                    active_candidate_id=active_candidate_id,
-                    artifacts=self.artifacts,
-                    final_refinable_fallback=(
-                        policy.get("final_refinable_fallback") is True
-                    ),
-                )
-        if rejection is None:
-            return False
-
-        advanced = self._apply_anygrasp_candidate_rejection(
-            policy=policy,
-            active=active,
-            rejection=rejection,
-        )
-        # Retained ranked candidates are already in the same perception packet;
-        # switch directly to the next candidate. Only an exhausted queue needs a
-        # fresh observation and alternate-view re-estimation.
-        if advanced and isinstance(policy.get("reestimate_required"), dict):
-            self._schedule_grasp_recovery(
-                xyz=self._action_end_effector_xyz(action),
-                rejection=rejection,
-                candidate_id=active_candidate_id,
-            )
-            recovery_class = _grasp_estimation_recovery_class(rejection)
-            if (
-                str(policy.get("status") or "") == "exhausted"
-                and policy.get("final_refinable_fallback") is not True
-                and recovery_class in {"perception_refinable", "uncertain_review"}
-            ):
-                rejection = {
-                    **rejection,
-                    "recovery_class": recovery_class,
-                    "recovery_scope": "candidate",
-                }
-                policy.update(
-                    {
-                        "fallback_required": True,
-                        "exhaustion_reason": recovery_class,
-                        "refinement_seed_candidate": dict(active),
-                    }
-                )
-                attempts = _grasp_fallback_attempts(policy)
-                _append_grasp_fallback_attempt(
-                    attempts,
-                    {
-                        "backend": str(policy.get("source_backend") or "anygrasp"),
-                        "camera_frame_id": policy.get("camera_frame_id"),
-                        "source_rgb": policy.get("source_rgb"),
-                        "outcome": f"all_candidates_{recovery_class}",
-                        "raw_candidate_count": policy.get("raw_candidate_count"),
-                    },
-                )
-                policy["fallback_attempts"] = attempts
-                self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-                    policy,
-                    source="grasp_estimation_recovery",
-                )
-                self._schedule_grasp_estimation_recovery(
-                    policy=policy,
-                    seed_candidate=_highest_refinable_candidate(policy) or active,
-                    source=_policy_grasp_source(policy),
-                    rejection=rejection,
-                )
-        return advanced
-
-    def _schedule_grasp_recovery(
-        self,
-        *,
-        xyz: object,
-        rejection: JsonDict,
-        candidate_id: str,
-    ) -> bool:
-        if str(rejection.get("source") or "") not in {
-            "candidate_motion_rejected",
-            "independent_grasp_outcome_rejected",
-            "reconciled_candidate_motion_rejected",
-            "safety_check_rejected",
-            "grasp_seed_geometry_rejected",
-            "independent_precontact_review_rejected",
-            "independent_host_stage_review_rejected",
-            "wrist_reference_localization_rejected",
-            "articulated_attachment_assessment_failed",
-        }:
-            return False
-        target_detection = (self.grasp_candidate_policy() or {}).get("target_detection")
-        target_detection = target_detection if isinstance(target_detection, dict) else {}
-        previous_view = str(target_detection.get("frame_id") or "agentview")
-        recovery = {
-            "schema_version": "openeta.grasp_recovery.v1",
-            "status": "required",
-            "candidate_id": candidate_id,
-            "rejection_source": rejection.get("source"),
-            "rejection_reason": rejection.get("reason"),
-            "purpose": (
-                "candidate_reestimate"
-                if isinstance(
-                    (self.grasp_candidate_policy() or {}).get("reestimate_required"),
-                    dict,
-                )
-                else "candidate_fallback"
-            ),
-            "reestimate_strategy": "alternate_camera_view",
-            "previous_view": previous_view,
-            "observation_views": ["agentview", "wrist", "render"],
-            "scene_epoch": self.scene_epoch(),
-            "required_action": {
-                "name": "observe",
-                "parameters": {},
-            },
-            "created_at_s": time.time(),
-        }
-        self.facts[GRASP_RECOVERY_KEY] = _memory_fact_entry(
-            recovery,
-            source="structured_candidate_rejection",
-        )
-        self.record("grasp_recovery_required", dict(recovery))
-        return True
-
-    def _advance_grasp_recovery(self, action: EnvAction) -> bool:
-        recovery = self.grasp_recovery()
-        if not isinstance(recovery, dict) or recovery.get("status") != "required":
-            return False
-        required = recovery.get("required_action")
-        if not isinstance(required, dict) or not _action_matches(action, required):
-            return False
-        name = str(required.get("name") or "")
-        call = _tool_call(action, name)
-        if not isinstance(call, dict):
-            return False
-        completed = _call_result_success(call) and not _motion_call_rejects_candidate(call)
-        recovery.update(
-            {
-                "status": "completed" if completed else "failed",
-                "completed_at_s": time.time(),
-                "scene_epoch": self.scene_epoch(),
-                "result": {
-                    "tool": name,
-                    "reached_target": completed,
-                    "reason": "" if completed else _call_failure_reason(call),
-                },
-            }
-        )
-        self.facts[GRASP_RECOVERY_KEY] = _memory_fact_entry(
-            recovery,
-            source="candidate_reestimate_observation",
-        )
-        self.record(
-            "grasp_recovery_completed" if completed else "grasp_recovery_failed",
-            dict(recovery),
-        )
-        if completed and recovery.get("purpose") == "candidate_reestimate":
-            reestimate = (self.grasp_candidate_policy() or {}).get("reestimate_required")
-            if isinstance(reestimate, dict):
-                reestimate.update(
-                    {
-                        "status": "pending_observation",
-                        "recovery_completed_at_s": time.time(),
-                        "previous_view": recovery.get("previous_view"),
-                        "reestimate_strategy": recovery.get("reestimate_strategy"),
-                    }
-                )
-                self.facts[GRASP_REESTIMATION_KEY] = _memory_fact_entry(
-                    reestimate,
-                    source="candidate_reestimate_recovery_completed",
-                )
-                self.record("grasp_reestimate_observation_required", dict(reestimate))
-        return True
-
-    def _schedule_grasp_estimation_recovery(
-        self,
-        *,
-        policy: JsonDict,
-        seed_candidate: object,
-        source: object,
-        rejection: JsonDict,
-    ) -> bool:
-        trigger_class = str(rejection.get("recovery_class") or "")
-        if trigger_class not in {"perception_refinable", "uncertain_review"}:
-            return False
-        if not isinstance(seed_candidate, dict):
-            return False
-        target_prompt = str(policy.get("fallback_target_prompt") or "").strip()
-        if not target_prompt:
-            return False
-        existing = self.grasp_estimation_recovery()
-        same_target = (
-            isinstance(existing, dict)
-            and str(existing.get("target_prompt") or "").strip() == target_prompt
-        )
-        if same_target and isinstance(existing, dict) and existing.get("status") == "blocked":
-            return False
-        recovery_id = (
-            str(existing.get("recovery_id") or "")
-            if same_target and isinstance(existing, dict)
-            else ""
-        ) or f"grasp-refinement-{uuid4()}"
-        recovery: JsonDict = {
-            "schema_version": "openeta.grasp_estimation_recovery.v1",
-            "status": "required",
-            "recovery_id": recovery_id,
-            "trigger_class": trigger_class,
-            "trigger_scope": str(rejection.get("recovery_scope") or "candidate"),
-            "trigger_source": rejection.get("source"),
-            "trigger_reason": rejection.get("reason"),
-            "source_result_id": policy.get("result_id"),
-            "source_backend": policy.get("source_backend"),
-            "source_camera_frame_id": policy.get("camera_frame_id"),
-            "source_rgb": policy.get("source_rgb"),
-            "target_prompt": target_prompt,
-            "seed_candidate": dict(seed_candidate),
-            "created_scene_epoch": self.scene_epoch(),
-            "created_at_s": time.time(),
-        }
-        fallback_candidates = (
-            [
-                dict(item)
-                for item in existing.get("fallback_candidates", [])
-                if isinstance(item, dict)
-            ]
-            if same_target and isinstance(existing, dict)
-            else []
-        )
-        candidate_entry = {
-            "candidate": dict(seed_candidate),
-            "source_result_id": policy.get("result_id"),
-            "source_tool": policy.get("source_tool"),
-            "source_backend": policy.get("source_backend"),
-            "camera_frame_id": policy.get("camera_frame_id"),
-            "source_rgb": policy.get("source_rgb"),
-            "source_depth": policy.get("source_depth"),
-            "source": dict(source) if isinstance(source, dict) else {},
-            "target_detection": (
-                dict(policy["target_detection"])
-                if isinstance(policy.get("target_detection"), dict)
-                else {}
-            ),
-            "trigger_class": trigger_class,
-            "grasp_calibration": {
-                "calibration_id": policy.get("grasp_calibration_id"),
-                "profile_path": policy.get("grasp_calibration_profile_path"),
-                "max_gripper_width_m": policy.get("physical_width_limit_m"),
-            },
-        }
-        _append_refinable_fallback_candidate(fallback_candidates, candidate_entry)
-        recovery["fallback_candidates"] = fallback_candidates
-        if (
-            same_target
-            and isinstance(existing, dict)
-            and existing.get("hover_completed_scene_epoch") is not None
-        ):
-            for key in (
-                "ik_passed",
-                "collision_check_passed",
-                "hover_completed_scene_epoch",
-                "hover_target_pose",
-                "last_failure",
-            ):
-                if key in existing:
-                    recovery[key] = existing[key]
-        if (
-            str(rejection.get("source") or "") == "wrist_reference_localization_rejected"
-            or str(rejection.get("grasp_stage") or "") == "align"
-        ):
-            recovery["hover_completed_scene_epoch"] = self.scene_epoch()
-        self.facts[GRASP_ESTIMATION_RECOVERY_KEY] = _memory_fact_entry(
-            recovery,
-            source="structured_grasp_estimation_rejection",
-        )
-        self.record("grasp_estimation_recovery_required", dict(recovery))
-        return True
-
-    def _advance_grasp_estimation_recovery(self, action: EnvAction) -> bool:
-        recovery = self.grasp_estimation_recovery()
-        if not isinstance(recovery, dict) or recovery.get("status") != "required":
-            return False
-        command = action.command if isinstance(action.command, dict) else {}
-        request = command.get("request")
-        if not isinstance(request, dict):
-            return False
-        name = str(request.get("name") or "")
-        parameters = request.get("parameters")
-        if not isinstance(parameters, dict) or not _is_grasp_estimation_recovery_action(
-            name,
-            parameters,
-            recovery=recovery,
-        ):
-            return False
-        call = _tool_call(action, name)
-        if not isinstance(call, dict):
-            return False
-        outputs = _tool_call_outputs(call)
-        success = _call_result_success(call)
-        if name == "ik_preview_check":
-            passed = success and outputs.get("feasible") is True
-            recovery["ik_passed"] = passed
-        elif name == "obstacle_avoidance":
-            passed = success and outputs.get("clear") is True
-            recovery["collision_check_passed"] = passed
-        elif name == "move_to":
-            passed = success and not _motion_call_rejects_candidate(call)
-            if passed:
-                recovery["hover_completed_scene_epoch"] = self.scene_epoch()
-        else:
-            return False
-        if not passed:
-            recovery.update(
-                {
-                    "status": "blocked",
-                    "last_failure": {
-                        "tool": name,
-                        "reason": _call_failure_reason(call),
-                        "hard_rejection": (
-                            "ik_unreachable"
-                            if name == "ik_preview_check"
-                            else (
-                                "collision_or_unsafe_path"
-                                if name == "obstacle_avoidance"
-                                else "refinement_hover_motion_failed"
-                            )
-                        ),
-                    },
-                    "completed_at_s": time.time(),
-                }
-            )
-        self.facts[GRASP_ESTIMATION_RECOVERY_KEY] = _memory_fact_entry(
-            recovery,
-            source="grasp_estimation_recovery_check",
-        )
-        self.record(
-            (
-                "grasp_estimation_recovery_blocked"
-                if recovery.get("status") == "blocked"
-                else "grasp_estimation_recovery_advanced"
-            ),
-            {
-                "recovery_id": recovery.get("recovery_id"),
-                "tool": name,
-                "passed": passed,
-                "scene_epoch": self.scene_epoch(),
-            },
-        )
-        return True
-
-    def _action_end_effector_xyz(self, action: EnvAction) -> object:
-        call = _tool_call(action, "move_to") or _tool_call(action, "follow_eef_trajectory")
-        outputs = _tool_call_outputs(call) if isinstance(call, dict) else {}
-        motion = outputs.get("motion_summary")
-        end = motion.get("end") if isinstance(motion, dict) else None
-        xyz = end.get("xyz") if isinstance(end, dict) else None
-        return xyz if _finite_xyz(xyz) else self._latest_observed_end_effector_xyz()
-
-    def _latest_observed_end_effector_xyz(self) -> object:
-        for event in reversed(self.events):
-            if event.event_type != "observation":
-                continue
-            robot = event.payload.get("robot")
-            pose = robot.get("end_effector_pose") if isinstance(robot, dict) else None
-            xyz = pose.get("xyz") if isinstance(pose, dict) else None
-            if _finite_xyz(xyz):
-                return xyz
-        return None
-
-    def _apply_anygrasp_candidate_rejection(
-        self,
-        *,
-        policy: JsonDict,
-        active: JsonDict,
-        rejection: JsonDict,
-    ) -> bool:
-        """Advance one ranked candidate from linked deterministic evidence."""
-
-        if policy.get("interaction_family") == "articulated_handle":
-            return self._apply_articulated_handle_candidate_rejection(
-                policy=policy,
-                active=active,
-                rejection=rejection,
-            )
-
-        candidates = policy.get("candidates")
-        if not isinstance(candidates, list):
-            candidates = []
-        current_rank = int(policy.get("active_rank") or 0)
-        rejected = policy.get("rejected_candidates")
-        if not isinstance(rejected, list):
-            rejected = []
-        rejected.append(
-            {
-                "candidate_id": active.get("id"),
-                "rank": current_rank,
-                "score": active.get("score"),
-                "reason": rejection.get("reason"),
-                "source": rejection.get("source"),
-                "recovery_class": _grasp_estimation_recovery_class(rejection),
-                "rejected_at_s": time.time(),
-            }
-        )
-        attempts = int(policy.get("candidate_attempt_count") or 0) + 1
-        max_attempts = int(
-            policy.get("max_candidate_attempts") or GRASP_CANDIDATE_MAX_ATTEMPTS
-        )
-        retry_exhausted = attempts >= max_attempts
-        next_rank = current_rank + 1
-        next_candidate = (
-            dict(candidates[next_rank])
-            if not retry_exhausted
-            and next_rank < len(candidates)
-            and isinstance(candidates[next_rank], dict)
-            else None
-        )
-        source_tool = str(policy.get("source_tool") or "grasp_pose_estimate")
-        policy.update(
-            {
-                "status": "active" if next_candidate is not None else "exhausted",
-                "active_rank": next_rank if next_candidate is not None else None,
-                "active_candidate": next_candidate,
-                "remaining_candidate_ids": [
-                    str(candidate.get("id"))
-                    for candidate in candidates[next_rank + 1 :]
-                    if isinstance(candidate, dict)
-                ]
-                if next_candidate is not None
-                else [],
-                "rejected_candidates": rejected,
-                "candidate_attempt_count": attempts,
-                "last_candidate_attempt": {
-                    "candidate_id": active.get("id"),
-                    "attempt_count": attempts,
-                    "max_attempts": max_attempts,
-                    "retry_exhausted": retry_exhausted,
-                },
-                "last_rejection": dict(rejection),
-            }
-        )
-        if next_candidate is None:
-            # Once the bounded candidate budget is exhausted, keep the highest
-            # scoring candidate only when compilation rejected a strategy-level
-            # geometry preference. Motion, safety, and structured perception
-            # rejections must continue through recovery instead of reviving a pose
-            # that was already shown to be unusable.
-            fallback_candidate = (
-                dict(candidates[0])
-                if candidates and isinstance(candidates[0], dict)
-                else None
-            )
-            recovery_class = _grasp_estimation_recovery_class(rejection)
-            score_fallback_allowed = (
-                str(rejection.get("source") or "") == "grasp_seed_geometry_rejected"
-                and recovery_class == "none"
-                and policy.get("final_refinable_fallback") is not True
-            )
-            if (
-                fallback_candidate is not None
-                and policy.get("candidate_fallback") is not True
-                and score_fallback_allowed
-            ):
-                fallback_candidate["candidate_fallback"] = True
-                policy.update(
-                    {
-                        "status": "active",
-                        "active_rank": int(fallback_candidate.get("rank") or 0),
-                        "active_candidate": fallback_candidate,
-                        "remaining_candidate_ids": [],
-                        "candidate_fallback": True,
-                        "fallback_reason": "all_ranked_candidates_failed",
-                        "fallback_selected_at_s": time.time(),
-                    }
-                )
-                policy.pop("reestimate_required", None)
-                self.facts.pop(GRASP_REESTIMATION_KEY, None)
-                self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-                    policy,
-                    source=f"{source_tool}_score_fallback",
-                )
-                self.record(
-                    f"{source_tool}_candidate_fallback_activated",
-                    {
-                        "result_id": policy.get("result_id"),
-                        "candidate_id": fallback_candidate.get("id"),
-                        "rank": fallback_candidate.get("rank"),
-                        "score": fallback_candidate.get("score"),
-                        "attempt_count": attempts,
-                        "max_attempts": max_attempts,
-                        "reason": "all_ranked_candidates_failed",
-                        "alignment_filter_bypassed": True,
-                    },
-                )
-                return True
-            if policy.get("final_refinable_fallback") is True:
-                policy.pop("reestimate_required", None)
-                self.facts.pop(GRASP_REESTIMATION_KEY, None)
-                self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-                    policy,
-                    source=f"{source_tool}_final_fallback_exhausted",
-                )
-                self.record(
-                    f"{source_tool}_final_fallback_exhausted",
-                    {
-                        "result_id": policy.get("result_id"),
-                        "candidate_id": active.get("id"),
-                        "attempt_count": attempts,
-                        "reason": rejection.get("reason"),
-                    },
-                )
-                return True
-            policy["reestimate_required"] = {
-                "status": "pending_recovery",
-                "reason": (
-                    "candidate_retry_limit_exceeded"
-                    if retry_exhausted
-                    else "ranked_candidate_queue_exhausted"
-                ),
-                "candidate_id": active.get("id"),
-                "attempt_count": attempts,
-                "max_attempts": max_attempts,
-                "scene_epoch": self.scene_epoch(),
-                "created_at_s": time.time(),
-                "target_prompt": ((policy.get("target_detection") or {}).get("target_prompt")),
-                "source_image": ((policy.get("target_detection") or {}).get("source_image")),
-            }
-            self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-                policy,
-                source=f"{source_tool}_reestimate_required",
-            )
-            self.facts[GRASP_REESTIMATION_KEY] = _memory_fact_entry(
-                dict(policy["reestimate_required"]),
-                source=f"{source_tool}_reestimate_required",
-            )
-            self.record(
-                f"{source_tool}_reestimate_required",
-                dict(policy["reestimate_required"]),
-            )
-            return True
-        policy.pop("accepted_candidate", None)
-        policy.pop("accepted_at_s", None)
-        self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-            policy,
-            source=f"{source_tool}_greedy_fallback",
-        )
-        self.record(
-            f"{source_tool}_candidate_rejected",
-            {
-                "result_id": policy.get("result_id"),
-                "candidate_id": active.get("id"),
-                "rank": current_rank,
-                "reason": rejection.get("reason"),
-                "source": rejection.get("source"),
-                "next_candidate_id": (
-                    next_candidate.get("id") if isinstance(next_candidate, dict) else None
-                ),
-                "exhausted": next_candidate is None,
-            },
-        )
-        if next_candidate is not None:
-            self.record(
-                f"{source_tool}_candidate_activated",
-                {
-                    "result_id": policy.get("result_id"),
-                    "candidate_id": next_candidate.get("id"),
-                    "rank": next_rank,
-                    "score": next_candidate.get("score"),
-                    "activation_source": "previous_candidate_rejected",
-                },
-            )
-        return True
-
-    def _apply_articulated_handle_candidate_rejection(
-        self,
-        *,
-        policy: JsonDict,
-        active: JsonDict,
-        rejection: JsonDict,
-    ) -> bool:
-        """Advance bounded top/front/side queues before one score fallback."""
-
-        candidates_value = policy.get("candidates")
-        candidates = (
-            [dict(candidate) for candidate in candidates_value if isinstance(candidate, dict)]
-            if isinstance(candidates_value, list)
-            else []
-        )
-        by_id = {str(candidate.get("id") or ""): candidate for candidate in candidates}
-        active_id = str(active.get("id") or "")
-        active_mode = str(policy.get("active_approach_mode") or active.get("approach_mode") or "")
-        rejected = policy.get("rejected_candidates")
-        if not isinstance(rejected, list):
-            rejected = []
-        rejected.append(
-            {
-                "candidate_id": active_id,
-                "rank": active.get("rank"),
-                "score": active.get("score"),
-                "approach_mode": active_mode,
-                "reason": rejection.get("reason"),
-                "source": rejection.get("source"),
-                "recovery_class": _grasp_estimation_recovery_class(rejection),
-                "rejected_at_s": time.time(),
-            }
-        )
-        attempts = int(policy.get("candidate_attempt_count") or 0) + 1
-        mode_attempts = int(policy.get("mode_attempt_count") or 0) + 1
-        max_mode_attempts = int(
-            policy.get("mode_max_candidate_attempts") or GRASP_CANDIDATE_MAX_ATTEMPTS
-        )
-        policy.update(
-            {
-                "rejected_candidates": rejected,
-                "candidate_attempt_count": attempts,
-                "mode_attempt_count": mode_attempts,
-                "last_candidate_attempt": {
-                    "candidate_id": active_id,
-                    "attempt_count": attempts,
-                    "mode_attempt_count": mode_attempts,
-                    "max_mode_attempts": max_mode_attempts,
-                    "approach_mode": active_mode,
-                },
-                "last_rejection": dict(rejection),
-            }
-        )
-        source_tool = str(policy.get("source_tool") or "grasp_pose_estimate")
-        if policy.get("candidate_fallback") is True:
-            return self._mark_articulated_handle_reestimate_required(
-                policy=policy,
-                active=active,
-                attempts=attempts,
-                source_tool=source_tool,
-            )
-
-        queues = policy.get("approach_mode_queues")
-        mode_order = policy.get("approach_mode_order")
-        if not isinstance(queues, dict) or not isinstance(mode_order, list):
-            return self._mark_articulated_handle_reestimate_required(
-                policy=policy,
-                active=active,
-                attempts=attempts,
-                source_tool=source_tool,
-            )
-        queue = queues.get(active_mode)
-        queue = [str(value) for value in queue] if isinstance(queue, list) else []
-        current_mode_rank = int(policy.get("active_mode_rank") or 0)
-        next_mode_rank = current_mode_rank + 1
-        next_candidate: JsonDict | None = None
-        next_mode = active_mode
-        activation_source = "previous_candidate_rejected"
-        if mode_attempts < max_mode_attempts and next_mode_rank < len(queue):
-            next_candidate = by_id.get(queue[next_mode_rank])
-        else:
-            try:
-                active_mode_index = [str(value) for value in mode_order].index(active_mode)
-            except ValueError:
-                active_mode_index = -1
-            for value in mode_order[active_mode_index + 1 :]:
-                candidate_ids = queues.get(value)
-                if not isinstance(candidate_ids, list) or not candidate_ids:
-                    continue
-                candidate = by_id.get(str(candidate_ids[0]))
-                if candidate is None:
-                    continue
-                next_mode = str(value)
-                next_mode_rank = 0
-                next_candidate = candidate
-                mode_attempts = 0
-                activation_source = "approach_mode_degraded"
-                break
-
-        if next_candidate is not None:
-            next_candidate = dict(next_candidate)
-            next_queue = queues.get(next_mode)
-            next_queue = (
-                [str(value) for value in next_queue]
-                if isinstance(next_queue, list)
-                else []
-            )
-            policy.update(
-                {
-                    "status": "active",
-                    "active_approach_mode": next_mode,
-                    "active_mode_rank": next_mode_rank,
-                    "active_rank": int(next_candidate.get("rank") or 0),
-                    "active_candidate": next_candidate,
-                    "remaining_candidate_ids": next_queue[next_mode_rank + 1 :],
-                    "mode_attempt_count": mode_attempts,
-                    "compile_hints": {
-                        "target_geometry_family": "articulated_handle",
-                        "approach_mode": next_mode,
-                        "strategy_id": _articulated_handle_strategy_id(next_mode),
-                    },
-                }
-            )
-            policy.pop("accepted_candidate", None)
-            policy.pop("accepted_at_s", None)
-            self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-                policy,
-                source=f"{source_tool}_articulated_handle_fallback",
-            )
-            self.record(
-                f"{source_tool}_candidate_rejected",
-                {
-                    "result_id": policy.get("result_id"),
-                    "candidate_id": active_id,
-                    "rank": active.get("rank"),
-                    "approach_mode": active_mode,
-                    "reason": rejection.get("reason"),
-                    "source": rejection.get("source"),
-                    "next_candidate_id": next_candidate.get("id"),
-                    "next_approach_mode": next_mode,
-                    "activation_source": activation_source,
-                },
-            )
-            self.record(
-                f"{source_tool}_candidate_activated",
-                {
-                    "result_id": policy.get("result_id"),
-                    "candidate_id": next_candidate.get("id"),
-                    "rank": next_candidate.get("rank"),
-                    "score": next_candidate.get("score"),
-                    "approach_mode": next_mode,
-                    "activation_source": activation_source,
-                },
-            )
-            return True
-
-        fallback_candidate = dict(candidates[0]) if candidates else None
-        if fallback_candidate is not None:
-            fallback_mode = str(fallback_candidate.get("approach_mode") or "side")
-            fallback_candidate.update(
-                {
-                    "candidate_fallback": True,
-                    "fallback_reason": "all_approach_modes_failed",
-                }
-            )
-            policy.update(
-                {
-                    "status": "active",
-                    "active_approach_mode": fallback_mode,
-                    "active_mode_rank": None,
-                    "active_rank": int(fallback_candidate.get("rank") or 0),
-                    "active_candidate": fallback_candidate,
-                    "remaining_candidate_ids": [],
-                    "candidate_fallback": True,
-                    "fallback_reason": "all_approach_modes_failed",
-                    "fallback_selected_at_s": time.time(),
-                    "compile_hints": {
-                        "target_geometry_family": "articulated_handle",
-                        "approach_mode": fallback_mode,
-                        "strategy_id": _articulated_handle_strategy_id(fallback_mode),
-                        "candidate_fallback": True,
-                        "fallback_reason": "all_approach_modes_failed",
-                    },
-                }
-            )
-            policy.pop("reestimate_required", None)
-            self.facts.pop(GRASP_REESTIMATION_KEY, None)
-            self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-                policy,
-                source=f"{source_tool}_articulated_handle_score_fallback",
-            )
-            self.record(
-                f"{source_tool}_candidate_fallback_activated",
-                {
-                    "result_id": policy.get("result_id"),
-                    "candidate_id": fallback_candidate.get("id"),
-                    "rank": fallback_candidate.get("rank"),
-                    "score": fallback_candidate.get("score"),
-                    "reason": "all_approach_modes_failed",
-                    "approach_mode": fallback_mode,
-                    "alignment_filter_bypassed": True,
-                },
-            )
-            return True
-        return self._mark_articulated_handle_reestimate_required(
-            policy=policy,
-            active=active,
-            attempts=attempts,
-            source_tool=source_tool,
-        )
-
-    def _mark_articulated_handle_reestimate_required(
-        self,
-        *,
-        policy: JsonDict,
-        active: JsonDict,
-        attempts: int,
-        source_tool: str,
-    ) -> bool:
-        policy["status"] = "exhausted"
-        policy["active_candidate"] = None
-        policy["active_rank"] = None
-        policy["remaining_candidate_ids"] = []
-        policy["reestimate_required"] = {
-            "status": "pending_recovery",
-            "reason": "articulated_handle_fallback_failed",
-            "candidate_id": active.get("id"),
-            "attempt_count": attempts,
-            "scene_epoch": self.scene_epoch(),
-            "created_at_s": time.time(),
-            "target_prompt": ((policy.get("target_detection") or {}).get("target_prompt")),
-            "source_image": ((policy.get("target_detection") or {}).get("source_image")),
-        }
-        self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-            policy,
-            source=f"{source_tool}_reestimate_required",
-        )
-        self.facts[GRASP_REESTIMATION_KEY] = _memory_fact_entry(
-            dict(policy["reestimate_required"]),
-            source=f"{source_tool}_reestimate_required",
-        )
-        self.record(
-            f"{source_tool}_reestimate_required",
-            dict(policy["reestimate_required"]),
-        )
-        return True
-
-    def _capture_compiled_grasp(self, action: EnvAction) -> bool:
-        call = _successful_tool_call(action, "compile_grasp_seed")
-        if call is None:
-            return False
-        outputs = _tool_call_outputs(call)
-        if outputs.get("schema_version") != "openeta.compiled_grasp_seed.v1":
-            return False
-        policy = self.anygrasp_candidate_policy() or {}
-        active = policy.get("active_candidate")
-        if not isinstance(active, dict):
-            return False
-        candidate_id = str(outputs.get("candidate_id") or "")
-        if candidate_id != str(active.get("id") or ""):
-            return False
-        if _optional_int(outputs.get("scene_epoch"), default=-1) != self.scene_epoch():
-            return False
-        compile_hints: JsonDict = {
-            field: outputs.get(field)
-            for field in (
-                "target_geometry_family",
-                "strategy_id",
-                "pregrasp_distance_m",
-                "approach_mode",
-                "fallback_reason",
-            )
-            if outputs.get(field) not in (None, "")
-        }
-        if outputs.get("candidate_fallback") is True:
-            compile_hints["candidate_fallback"] = True
-        if compile_hints:
-            policy["compile_hints"] = compile_hints
-            self.facts.pop(LEGACY_ANYGRASP_CANDIDATE_POLICY_KEY, None)
-            self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-                policy,
-                source="compile_grasp_seed",
-            )
-        hover = outputs.get("hover_pose")
-        gripper_state = self.gripper_command_state() or {}
-        already_open = gripper_state.get("position") == 1
-        if already_open and isinstance(hover, dict):
-            initial_stage = "hover"
-            required_action = {
-                "name": "move_to",
-                "parameters": {"target_pose": _pose_for_epoch(hover, self.scene_epoch())},
-            }
-        else:
-            initial_stage = "open"
-            required_action = {
-                "name": "gripper_control",
-                "parameters": {"position": 1},
-            }
-        execution = {
-            "schema_version": "openeta.grasp_execution.v1",
-            "status": "required",
-            "stage": initial_stage,
-            "candidate_id": candidate_id,
-            "compiled_grasp_id": outputs.get("compiled_grasp_id"),
-            "scene_epoch": self.scene_epoch(),
-            "compiled_grasp": dict(outputs),
-            "required_action": required_action,
-            "transition_conditions": {
-                "hover": (
-                    "reach the host pose offset at least 0.15 m opposite "
-                    "approach_world_xyz before wrist alignment"
-                ),
-                "close": (
-                    "acknowledge binary gripper position=0; this confirms only the "
-                    "latched command, never object attachment"
-                ),
-            },
-            "created_at_s": time.time(),
-        }
-        self.facts[GRASP_EXECUTION_KEY] = _memory_fact_entry(
-            execution,
-            source="compile_grasp_seed",
-        )
-        self.facts.pop(ATTACHMENT_GATE_KEY, None)
-        self.facts.pop(GRASP_LIFT_PROBE_KEY, None)
-        self.facts.pop(ARTICULATED_ATTACHMENT_PROBE_KEY, None)
-        self.record(
-            "grasp_execution_started",
-            {
-                "candidate_id": candidate_id,
-                "compiled_grasp_id": outputs.get("compiled_grasp_id"),
-                "calibration_status": outputs.get("calibration_status"),
-                "scene_epoch": self.scene_epoch(),
-            },
-        )
-        return True
 
     def _capture_articulated_attachment_probe(self, action: EnvAction) -> bool:
         call = _successful_tool_call(action, "prepare_attachment_probe")
@@ -3086,52 +4795,37 @@ class AgentMemory:
         outputs = _tool_call_outputs(call)
         if outputs.get("schema_version") != "openeta.articulated_attachment_probe.v1":
             return False
-        execution = self.grasp_execution()
-        policy = self.grasp_candidate_policy()
-        if (
-            not isinstance(execution, dict)
-            or execution.get("status") != "required"
-            or execution.get("stage") != "prepare_probe"
-            or not isinstance(policy, dict)
-            or policy.get("interaction_family") != "articulated_handle"
-        ):
-            return False
-        if str(outputs.get("candidate_id") or "") != str(execution.get("candidate_id") or ""):
-            return False
-        if str(outputs.get("compiled_grasp_id") or "") != str(
-            execution.get("compiled_grasp_id") or ""
-        ):
-            return False
         if _optional_int(outputs.get("scene_epoch"), default=-1) != self.scene_epoch():
             return False
-        required_action = outputs.get("required_action")
-        if not isinstance(required_action, dict):
+        probe_id = str(outputs.get("probe_id") or "")
+        compiled_grasp_id = str(outputs.get("compiled_grasp_id") or "")
+        if not probe_id or not compiled_grasp_id:
             return False
-        name = str(required_action.get("name") or "")
-        parameters = required_action.get("parameters")
+        graph = self.provenance_evidence_graph()
+        if not any(
+            isinstance(node, dict)
+            and node.get("kind") == "compiled_targeted_grasp"
+            and node.get("freshness") == "current_object_scene"
+            and str(node.get("compiled_grasp_id") or "") == compiled_grasp_id
+            for node in graph.get("nodes", [])
+        ):
+            return False
+        frozen_motion = outputs.get("frozen_motion")
+        if not isinstance(frozen_motion, dict):
+            return False
+        name = str(frozen_motion.get("name") or "")
+        parameters = frozen_motion.get("parameters")
         if name not in {"move_to", "follow_eef_trajectory"} or not isinstance(
             parameters, dict
         ):
             return False
         probe = {
             **dict(outputs),
-            "status": "required",
+            "status": "prepared",
             "prepared_at_s": time.time(),
         }
-        execution.update(
-            {
-                "stage": "probe",
-                "scene_epoch": self.scene_epoch(),
-                "required_action": {"name": name, "parameters": dict(parameters)},
-                "probe_kind": "articulated_attachment",
-            }
-        )
         self.facts[ARTICULATED_ATTACHMENT_PROBE_KEY] = _memory_fact_entry(
             probe,
-            source="prepare_attachment_probe",
-        )
-        self.facts[GRASP_EXECUTION_KEY] = _memory_fact_entry(
-            execution,
             source="prepare_attachment_probe",
         )
         self.record("articulated_attachment_probe_prepared", dict(probe))
@@ -3139,21 +4833,29 @@ class AgentMemory:
 
     def _capture_articulated_attachment_probe_result(self, action: EnvAction) -> bool:
         probe = self.articulated_attachment_probe()
-        if not isinstance(probe, dict) or probe.get("status") != "required":
+        if not isinstance(probe, dict) or probe.get("status") != "prepared":
             return False
-        required = probe.get("required_action")
-        if not isinstance(required, dict):
+        frozen_motion = probe.get("frozen_motion")
+        if not isinstance(frozen_motion, dict):
             return False
         command = action.command if isinstance(action.command, dict) else {}
         request = command.get("request")
         if not isinstance(request, dict):
             return False
-        name = str(required.get("name") or "")
-        parameters = required.get("parameters")
+        name = str(frozen_motion.get("name") or "")
+        parameters = frozen_motion.get("parameters")
+        request_parameters = request.get("parameters")
+        resolved_request_parameters = self._resolve_executed_motion_reference_for_probe(
+            name=name,
+            parameters=request_parameters,
+        )
         if (
             str(request.get("name") or "") != name
             or not isinstance(parameters, dict)
-            or request.get("parameters") != parameters
+            or not _articulated_probe_motion_equivalent(
+                parameters,
+                resolved_request_parameters,
+            )
         ):
             return False
         call = _tool_call(action, name)
@@ -3188,64 +4890,1589 @@ class AgentMemory:
             source="runtime_articulated_attachment_probe",
         )
         self.record("articulated_attachment_probe_completed", dict(probe))
-        execution = self.grasp_execution()
-        if isinstance(execution, dict) and execution.get("stage") == "probe":
-            self._advance_articulated_probe_to_attachment(execution)
         return True
 
-    def _capture_wrist_alignment(self, action: EnvAction) -> bool:
-        execution = self.grasp_execution()
-        if not isinstance(execution, dict) or execution.get("stage") != "align":
-            return False
-        call = _successful_tool_call(action, "compute_wrist_alignment")
+    def _capture_grasp_provenance(self, action: EnvAction) -> bool:
+        """Bind a compiled candidate to its host-captured targeted RGB-D packet."""
+
+        call = _successful_tool_call(action, "compile_grasp_seed")
         if call is None:
             return False
         outputs = _tool_call_outputs(call)
-        if outputs.get("schema_version") != "openeta.wrist_alignment.v1":
+        if outputs.get("schema_version") != "openeta.compiled_grasp_seed.v1":
             return False
-        if outputs.get("compiled_grasp_id") != execution.get("compiled_grasp_id"):
-            return False
-        if _optional_int(outputs.get("scene_epoch"), default=-1) != self.scene_epoch():
-            return False
-        aligned_pose = outputs.get("aligned_hover_pose")
-        adjusted_contact = outputs.get("adjusted_contact_pose")
-        adjusted_precontact = outputs.get("adjusted_precontact_pose")
-        if not isinstance(aligned_pose, dict) or not isinstance(adjusted_contact, dict):
-            return False
-        execution.update(
-            {
-                "stage": "align_move",
-                "scene_epoch": self.scene_epoch(),
-                "alignment": dict(outputs),
-                "adjusted_contact_pose": dict(adjusted_contact),
-                "adjusted_precontact_pose": (
-                    dict(adjusted_precontact)
-                    if isinstance(adjusted_precontact, dict)
-                    else None
-                ),
-                "required_action": {
-                    "name": "move_to",
-                    "parameters": {
-                        "target_pose": _pose_for_epoch(aligned_pose, self.scene_epoch())
+        command = action.command if isinstance(action.command, dict) else {}
+        request = command.get("request")
+        parameters = request.get("parameters") if isinstance(request, dict) else None
+        executed_parameters = call.get("parameters")
+        candidate_id = str(outputs.get("candidate_id") or "")
+        public_parameters = parameters if isinstance(parameters, dict) else {}
+        grasp_result_id = str(public_parameters.get("grasp_result_id") or "")
+        requested_candidate_id = str(public_parameters.get("candidate_id") or "")
+        candidate: object = None
+        if grasp_result_id and requested_candidate_id:
+            try:
+                candidate_resolution = self.resolve_grasp_candidate_input(
+                    grasp_result_id=grasp_result_id,
+                    candidate_id=requested_candidate_id,
+                )
+            except ValueError as exc:
+                self.record(
+                    "grasp_provenance_unresolved",
+                    {
+                        "candidate_id": requested_candidate_id,
+                        "compiled_grasp_id": outputs.get("compiled_grasp_id"),
+                        "reason": "short_reference_resolution_failed",
+                        "message": str(exc),
                     },
+                )
+                return False
+            resolved_parameters = candidate_resolution.get("parameters")
+            if isinstance(resolved_parameters, dict):
+                candidate = resolved_parameters.get("camera_pose")
+        elif isinstance(executed_parameters, dict):
+            # Compatibility for host-created actions that predate planner-facing
+            # short references. New Agent actions retain only result/candidate ids.
+            candidate = executed_parameters.get(
+                "camera_pose", executed_parameters.get("candidate")
+            )
+        if not isinstance(candidate, dict) or str(candidate.get("id") or "") != candidate_id:
+            return False
+        matched = self._targeted_grasp_artifact_for_candidate(candidate)
+        if matched is None:
+            self.record(
+                "grasp_provenance_unresolved",
+                {
+                    "candidate_id": candidate_id,
+                    "compiled_grasp_id": outputs.get("compiled_grasp_id"),
+                    "reason": "candidate_not_found_in_host_grasp_evidence",
                 },
-            }
+            )
+            return False
+        artifact_key, artifact = matched
+        artifact_epoch = _fact_epoch_value(artifact.get("scene_epoch"))
+        if artifact_epoch != self.object_scene_epoch():
+            self.record(
+                "grasp_provenance_unresolved",
+                {
+                    "candidate_id": candidate_id,
+                    "compiled_grasp_id": outputs.get("compiled_grasp_id"),
+                    "reason": "targeted_grasp_evidence_is_stale",
+                    "evidence_object_scene_epoch": artifact_epoch,
+                    "current_object_scene_epoch": self.object_scene_epoch(),
+                },
+            )
+            return False
+        source_value = artifact.get("selected_grasp_source")
+        source = dict(source_value) if isinstance(source_value, dict) else {}
+        for source_key, artifact_field in (
+            ("rgb", "source_rgb"),
+            ("depth", "source_depth"),
+            ("object_mask", "target_mask"),
+        ):
+            if not isinstance(source.get(source_key), str) or not source[source_key]:
+                value = artifact.get(artifact_field)
+                if isinstance(value, str) and value:
+                    source[source_key] = value
+        if str(source.get("mode") or "") != "targeted" or any(
+            not isinstance(source.get(key), str) or not source[key]
+            for key in ("rgb", "depth", "object_mask")
+        ):
+            return False
+        source.setdefault("source_tool", artifact.get("source_tool") or artifact.get("tool"))
+        source.setdefault("source_backend", artifact.get("source_backend"))
+        selected_target = self.selected_sam3_detection()
+        target_evidence_id = ""
+        if (
+            isinstance(selected_target, dict)
+            and _same_memory_artifact_path(
+                selected_target.get("mask_ref"), source.get("object_mask")
+            )
+        ):
+            target_evidence_id = (
+                f"sam3:{selected_target.get('result_id')}:{selected_target.get('id')}"
+            )
+        evidence_payload = {
+            "candidate": candidate,
+            "source": source,
+            "compiled_grasp_id": outputs.get("compiled_grasp_id"),
+            "artifact_key": artifact_key,
+            "object_scene_epoch": self.object_scene_epoch(),
+            "target_evidence_id": target_evidence_id,
+            "target_identity_anchor_id": (
+                selected_target.get("identity_anchor_id")
+                if isinstance(selected_target, dict)
+                else None
+            ),
+        }
+        evidence_id = "grasp:" + hashlib.sha256(
+            json.dumps(evidence_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:20]
+        provenance = {
+            "schema_version": "openeta.grasp_provenance.v1",
+            "evidence_id": evidence_id,
+            "candidate_id": candidate_id,
+            "candidate": dict(candidate),
+            "source": source,
+            "artifact_key": artifact_key,
+            "result_id": artifact.get("result_id"),
+            "target_evidence_id": target_evidence_id or None,
+            "target_identity_anchor_id": (
+                selected_target.get("identity_anchor_id")
+                if isinstance(selected_target, dict)
+                else None
+            ),
+            "compiled_grasp_id": outputs.get("compiled_grasp_id"),
+            "object_scene_epoch": self.object_scene_epoch(),
+            "robot_motion_epoch": self.robot_motion_epoch(),
+            "created_at_s": time.time(),
+        }
+        existing = _memory_fact_value(self.facts.get(GRASP_PROVENANCE_KEY))
+        if isinstance(existing, dict) and existing.get("evidence_id") == evidence_id:
+            return False
+        switched_from = (
+            str(existing.get("evidence_id") or "")
+            if isinstance(existing, dict)
+            else ""
         )
-        self.facts[GRASP_EXECUTION_KEY] = _memory_fact_entry(
-            execution,
-            source="compute_wrist_alignment",
+        recovery_branch = bool(
+            switched_from
+            and self._gripper_close_attempted_since_provenance(switched_from)
+        )
+        self.facts[GRASP_PROVENANCE_KEY] = _memory_fact_entry(
+            provenance,
+            source="compile_grasp_seed_evidence_graph",
         )
         self.record(
-            "grasp_wrist_alignment_ready",
+            "grasp_provenance_bound",
             {
-                "candidate_id": execution.get("candidate_id"),
-                "alignment_id": outputs.get("alignment_id"),
-                "correction_world_xyz": outputs.get("correction_world_xyz"),
+                "evidence_id": evidence_id,
+                "candidate_id": candidate_id,
+                "compiled_grasp_id": outputs.get("compiled_grasp_id"),
+                "artifact_key": artifact_key,
+                "previous_evidence_id": switched_from or None,
+                "recovery_branch": recovery_branch,
+                # Durable resolver evidence.  This remains in the event log,
+                # not the bounded Agent projection, and lets a later wrist
+                # refinement reuse an earlier fixed-camera source safely.
+                "provenance": dict(provenance),
+            },
+        )
+        if switched_from:
+            self.record(
+                "grasp_provenance_switched",
+                {
+                    "previous_evidence_id": switched_from,
+                    "evidence_id": evidence_id,
+                    "compiled_grasp_id": outputs.get("compiled_grasp_id"),
+                    "recovery_branch": recovery_branch,
+                },
+            )
+        return True
+
+    def _gripper_close_attempted_since_provenance(self, evidence_id: str) -> bool:
+        """Return whether the active grasp branch had an acknowledged close attempt.
+
+        A failed grasp is normally opened before the Agent selects a replacement
+        candidate.  Looking only at the current latched gripper state therefore
+        loses the recovery signal and prevents the bounded episode turn extension
+        from activating.  Scan only events after the matching provenance binding,
+        so a close from an older branch cannot grant recovery budget here.
+        """
+
+        expected = str(evidence_id or "").strip()
+        if not expected:
+            return False
+        for event in reversed(self.events):
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            if (
+                event.event_type == "grasp_provenance_bound"
+                and str(payload.get("evidence_id") or "") == expected
+            ):
+                return False
+            if (
+                event.event_type == "gripper_command_state_changed"
+                and payload.get("position") == 0
+                and payload.get("latched") is True
+            ):
+                return True
+        return False
+
+    def _record_new_targeted_grasp_evidence(self, action: EnvAction) -> bool:
+        """Record a new proposal without deactivating the active grasp branch.
+
+        Perception is immutable evidence, not an instruction to switch execution
+        branches.  The active provenance changes only when the Agent explicitly
+        compiles a candidate from the new result.
+        """
+
+        call = None
+        for name in ("grasp_pose_estimate", "anygrasp", "graspgenx"):
+            call = _successful_tool_call(action, name)
+            if call is not None:
+                break
+        if call is None:
+            return False
+        outputs = _tool_call_outputs(call)
+        source = outputs.get("source")
+        if not isinstance(source, dict) or source.get("mode") != "targeted":
+            return False
+        active = _memory_fact_value(self.facts.get(GRASP_PROVENANCE_KEY)) or {}
+        self.record(
+            "targeted_grasp_evidence_available",
+            {
+                "active_evidence_id": active.get("evidence_id"),
+                "new_grasp_result_id": outputs.get("result_id"),
+                "activation": "compile_grasp_seed",
+            },
+        )
+        return False
+
+    def _targeted_grasp_artifact_for_candidate(
+        self,
+        candidate: JsonDict,
+    ) -> tuple[str, JsonDict] | None:
+        for artifact_key, entry in sorted(
+            self.artifacts.items(),
+            key=lambda item: float(item[1].get("timestamp_s") or 0.0)
+            if isinstance(item[1], dict)
+            else 0.0,
+            reverse=True,
+        ):
+            artifact = entry.get("value") if isinstance(entry, dict) else None
+            if not isinstance(artifact, dict) or artifact.get("type") != "grasp_candidates":
+                continue
+            source = artifact.get("selected_grasp_source")
+            if not isinstance(source, dict) or source.get("mode") != "targeted":
+                continue
+            candidates = artifact.get("grasp_candidates")
+            if not isinstance(candidates, list):
+                continue
+            if any(
+                isinstance(item, dict) and _same_grasp_candidate(item, candidate)
+                for item in candidates
+            ):
+                return artifact_key, artifact
+            # The Agent-facing working-memory projection keeps only a small
+            # preview.  Advisor-selected or code-selected IDs may legitimately
+            # refer to a later candidate, so provenance must resolve against the
+            # complete immutable host artifact rather than treating projection
+            # truncation as evidence loss.
+            complete_reference = artifact.get("complete_outputs_artifact")
+            if not isinstance(complete_reference, dict):
+                continue
+            try:
+                complete_outputs = load_structured_tool_output(
+                    complete_reference,
+                    expected_tool=str(artifact.get("tool") or ""),
+                    expected_result_id=str(artifact.get("result_id") or ""),
+                    allowed_root=self.artifact_root,
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            complete_candidates = complete_outputs.get("grasp_candidates")
+            if isinstance(complete_candidates, list) and any(
+                isinstance(item, dict) and _same_grasp_candidate(item, candidate)
+                for item in complete_candidates
+            ):
+                return artifact_key, artifact
+        return None
+
+    def _refresh_grasp_input_bundle(self) -> bool:
+        """Compile selected mask and aligned RGB-D provenance into one opaque input."""
+
+        selected = self.selected_sam3_detection()
+        previous = _memory_fact_value(self.facts.get(GRASP_INPUT_BUNDLES_KEY)) or {}
+        bundles = dict(previous.get("bundles") or {}) if isinstance(previous, dict) else {}
+        public: JsonDict = {
+            "schema_version": "openeta.grasp_input_bundle.v1",
+            "status": "awaiting_target_selection",
+            "tool": "grasp_pose_estimate",
+        }
+        active_bundle_id = ""
+        if isinstance(selected, dict):
+            source = selected.get("source_observation")
+            source = source if isinstance(source, dict) else {}
+            rgb = source.get("rgb") or selected.get("source_image")
+            depth = source.get("depth")
+            intrinsics = source.get("intrinsics")
+            frame_id = source.get("frame_id") or selected.get("frame_id")
+            mask_ref = selected.get("mask_ref")
+            selected_epoch = _optional_int(selected.get("scene_epoch"), default=-1)
+            public.update(
+                {
+                    "sam3_result_id": selected.get("result_id"),
+                    "detection_id": selected.get("id"),
+                    "source_packet_id": source.get("packet_id")
+                    or selected.get("source_packet_id"),
+                    "object_scene_epoch": selected_epoch,
+                }
+            )
+            if selected_epoch != self.object_scene_epoch():
+                public.update(
+                    {
+                        "status": "stale_object_scene",
+                        "recovery": "segment the target on a current observation packet",
+                    }
+                )
+            elif not (
+                isinstance(rgb, str)
+                and rgb
+                and isinstance(depth, str)
+                and depth
+                and isinstance(mask_ref, str)
+                and mask_ref
+                and isinstance(frame_id, str)
+                and frame_id
+                and isinstance(intrinsics, dict)
+                and all(key in intrinsics for key in ("fx", "fy", "cx", "cy", "scale"))
+                and _same_memory_artifact_path(rgb, selected.get("source_image"))
+            ):
+                public.update(
+                    {
+                        "status": "source_packet_incomplete",
+                        "recovery": "rerun SAM3 from an observation with aligned RGB-D metadata",
+                    }
+                )
+            else:
+                try:
+                    mask_quality = assess_target_mask_quality(
+                        mask_ref,
+                        depth_path=depth,
+                    )
+                except (OSError, ValueError) as exc:
+                    public.update(
+                        {
+                            "status": "target_mask_quality_unavailable",
+                            "recovery": (
+                                "segment the target again on a current aligned RGB-D packet"
+                            ),
+                            "diagnostic": {
+                                "code": "target_mask_quality_check_failed",
+                                "error_type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                        }
+                    )
+                    mask_quality = None
+                if isinstance(mask_quality, dict):
+                    public["target_mask_quality"] = mask_quality
+                if isinstance(mask_quality, dict) and mask_quality.get(
+                    "usable_for_targeted_geometry"
+                ) is not True:
+                    public.update(
+                        {
+                            "status": "requires_better_view",
+                            "semantic_outcome": "requires_better_view",
+                            "recovery": (
+                                "move to a target-facing view where the complete object "
+                                "is visible, then observe and segment the same instance"
+                            ),
+                            "recovery_options": [
+                                {
+                                    "action": "propose_wrist_viewpoints",
+                                    "reason": (
+                                        "use a calibrated target-facing wrist observation "
+                                        "pose when a compiled grasp and fresh wrist packet exist"
+                                    ),
+                                },
+                                {
+                                    "action": "segment_from_scene_primary",
+                                    "reason": (
+                                        "return to the latest global agentview when the "
+                                        "target is outside the current wrist field of view"
+                                    ),
+                                },
+                            ],
+                        }
+                    )
+                if mask_quality is None or mask_quality.get(
+                    "usable_for_targeted_geometry"
+                ) is not True:
+                    parameters = None
+                else:
+                    calibration_capabilities = (
+                        self._active_grasp_calibration_capabilities()
+                    )
+                    hints = {
+                        "depth_cutoff_factor": target_depth_cutoff_factor(
+                            depth_path=depth,
+                            mask_path=mask_ref,
+                            intrinsics=intrinsics,
+                        ),
+                        "max_gripper_width_m": float(
+                            calibration_capabilities["max_gripper_width_m"]
+                        ),
+                        "execution_reference_point": str(
+                            calibration_capabilities["execution_reference_point"]
+                        ),
+                    }
+                    source_extrinsics = source.get("extrinsics")
+                    if isinstance(source_extrinsics, dict) and source_extrinsics:
+                        try:
+                            hints["up_direction_camera"] = world_up_direction_camera(
+                                source_extrinsics
+                            )
+                        except GraspGeometryError:
+                            pass
+                    parameters = {
+                        "mode": "targeted",
+                        "source_packet_id": source.get("packet_id")
+                        or selected.get("source_packet_id"),
+                        "rgb": rgb,
+                        "depth": depth,
+                        "object_mask": {
+                            "mask_ref": mask_ref,
+                            "source_image": rgb,
+                            "result_id": selected.get("result_id"),
+                            "detection_id": selected.get("id"),
+                            "quality": mask_quality,
+                        },
+                        "intrinsics": dict(intrinsics),
+                        "camera_frame_id": frame_id,
+                        "scene_epoch": selected_epoch,
+                        "hints": hints,
+                    }
+                    geometry_family = str(
+                        selected.get("target_geometry_family") or ""
+                    ).strip()
+                    if geometry_family:
+                        parameters["target_geometry_family"] = geometry_family
+                if parameters is not None and selected.get("dense_grasp_retry_required") is True:
+                    parameters["hints"]["dense_sampling"] = True
+                if parameters is None:
+                    state = {
+                        "schema_version": "openeta.grasp_input_bundle_store.v1",
+                        "active_bundle_id": "",
+                        "public": public,
+                        "bundles": bundles,
+                    }
+                    comparable_previous = (
+                        json.loads(json.dumps(previous)) if isinstance(previous, dict) else {}
+                    )
+                    comparable_state = json.loads(json.dumps(state))
+                    for candidate_state in (comparable_previous, comparable_state):
+                        for value in (candidate_state.get("bundles") or {}).values():
+                            if isinstance(value, dict):
+                                value.pop("created_at_s", None)
+                    if comparable_previous == comparable_state:
+                        return False
+                    self.facts[GRASP_INPUT_BUNDLES_KEY] = _memory_fact_entry(
+                        state,
+                        source="host_provenance_bundle_resolver",
+                    )
+                    self.record(
+                        "grasp_input_bundle_updated",
+                        {
+                            "status": public.get("status"),
+                            "bundle_id": None,
+                            "target_evidence_id": public.get("target_evidence_id"),
+                        },
+                    )
+                    return True
+                target_evidence_id = (
+                    f"sam3:{selected.get('result_id')}:{selected.get('id')}"
+                )
+                identity = {
+                    "target_evidence_id": target_evidence_id,
+                    "parameters": parameters,
+                }
+                active_bundle_id = "grasp:" + hashlib.sha256(
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:20]
+                bundles[active_bundle_id] = {
+                    "schema_version": "openeta.grasp_input_bundle.v1",
+                    "bundle_id": active_bundle_id,
+                    "parameters": parameters,
+                    "target_evidence_id": target_evidence_id,
+                    "object_scene_epoch": self.object_scene_epoch(),
+                    "created_at_s": time.time(),
+                }
+                public.update(
+                    {
+                        "status": "ready",
+                        "bundle_id": active_bundle_id,
+                        "call_parameters": {"bundle_id": active_bundle_id},
+                        "target_evidence_id": target_evidence_id,
+                        "target_geometry_family": selected.get(
+                            "target_geometry_family"
+                        ),
+                    }
+                )
+        state = {
+            "schema_version": "openeta.grasp_input_bundle_store.v1",
+            "active_bundle_id": active_bundle_id,
+            "public": public,
+            "bundles": bundles,
+        }
+        comparable_previous = json.loads(json.dumps(previous)) if isinstance(previous, dict) else {}
+        comparable_state = json.loads(json.dumps(state))
+        for candidate_state in (comparable_previous, comparable_state):
+            for value in (candidate_state.get("bundles") or {}).values():
+                if isinstance(value, dict):
+                    value.pop("created_at_s", None)
+        if comparable_previous == comparable_state:
+            return False
+        self.facts[GRASP_INPUT_BUNDLES_KEY] = _memory_fact_entry(
+            state,
+            source="host_provenance_bundle_resolver",
+        )
+        self.record(
+            "grasp_input_bundle_updated",
+            {
+                "status": public.get("status"),
+                "bundle_id": active_bundle_id or None,
+                "target_evidence_id": public.get("target_evidence_id"),
             },
         )
         return True
 
-    def _record_successful_world_mutation(self, action: EnvAction) -> bool:
+    def _capture_target_identity_anchor(
+        self,
+        selected: JsonDict,
+        *,
+        identity_anchor_id: str = "",
+        identity_relation: str = "",
+        reason: str = "",
+    ) -> bool:
+        if str(selected.get("evidence_role") or DEFAULT_SAM3_EVIDENCE_ROLE) != (
+            DEFAULT_SAM3_EVIDENCE_ROLE
+        ):
+            return False
+        existing = self.target_identity_anchor()
+        if isinstance(existing, dict):
+            existing_id = str(existing.get("anchor_id") or "")
+            exact_same_evidence = all(
+                str(selected.get(key) or "") == str(existing.get(anchor_key) or "")
+                for key, anchor_key in (
+                    ("source_packet_id", "source_packet_id"),
+                    ("result_id", "sam3_result_id"),
+                    ("id", "detection_id"),
+                )
+            )
+            if exact_same_evidence and not identity_relation:
+                selected["identity_anchor_id"] = existing_id
+                selected["identity_continuity"] = "same_detection_evidence"
+                return False
+            supplied_id = str(identity_anchor_id or "").strip()
+            relation = str(identity_relation or "").strip().lower()
+            if supplied_id != existing_id:
+                raise ValueError(
+                    "target_identity_confirmation_required: this target selection "
+                    "comes from different detection evidence. Copy the exact active "
+                    f"identity_anchor_id={existing_id!r} and set identity_relation to "
+                    "'same_instance' after cross-view visual comparison, or to "
+                    "'replace_misidentified_anchor' when the earlier selection was "
+                    "wrong. The host will not silently bind a new mask to the old instance."
+                )
+            if relation == "same_instance":
+                selected["identity_anchor_id"] = existing_id
+                selected["identity_continuity"] = "agent_confirmed_same_instance"
+                self.record(
+                    "target_identity_continuity_confirmed",
+                    {
+                        "anchor_id": existing_id,
+                        "source_packet_id": selected.get("source_packet_id"),
+                        "sam3_result_id": selected.get("result_id"),
+                        "detection_id": selected.get("id"),
+                        "reason": reason,
+                    },
+                )
+                return False
+            if relation != "replace_misidentified_anchor":
+                raise ValueError(
+                    "target_identity_confirmation_required: identity_relation must be "
+                    "'same_instance' or 'replace_misidentified_anchor' for new target "
+                    "detection evidence."
+                )
+            verification = existing.get("exact_instance_verification")
+            if isinstance(verification, dict) and str(
+                verification.get("decision") or ""
+            ).lower() == "match":
+                raise ValueError(
+                    "target_identity_rebind_forbidden: the active anchor has an exact "
+                    "reference match. Gather new exact-instance verifier evidence before "
+                    "replacing it; generic semantic appearance is insufficient."
+                )
+            if len(str(reason or "").strip()) < 8:
+                raise ValueError(
+                    "target_identity_rebind_requires_reason: explain the visual evidence "
+                    "showing why the previous anchor was a misidentification."
+                )
+            self.facts.pop(TARGET_IDENTITY_ANCHOR_KEY, None)
+            created = self._capture_target_identity_anchor(selected)
+            selected["identity_continuity"] = "anchor_replaced_after_misidentification"
+            selected["replaced_identity_anchor_id"] = existing_id
+            self.record(
+                "target_identity_anchor_replaced",
+                {
+                    "previous_anchor_id": existing_id,
+                    "new_anchor_id": selected.get("identity_anchor_id"),
+                    "reason": reason,
+                },
+            )
+            return created
+        asset = self.target_asset_reference() or {}
+        identity = {
+            "target_prompt": selected.get("target_prompt"),
+            "sam3_result_id": selected.get("result_id"),
+            "detection_id": selected.get("id"),
+            "source_packet_id": selected.get("source_packet_id"),
+            "frame_id": selected.get("frame_id"),
+            "mask_ref": selected.get("mask_ref"),
+            "reference_images": asset.get("reference_images", []),
+            "exact_instance_verification": selected.get("reference_verification"),
+        }
+        anchor_id = "target:" + hashlib.sha256(
+            json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:20]
+        anchor = {
+            "schema_version": "openeta.target_identity_anchor.v1",
+            "anchor_id": anchor_id,
+            **identity,
+            "created_at_s": time.time(),
+            "policy": (
+                "later localizers propose positions; they do not silently replace this instance"
+            ),
+        }
+        selected["identity_anchor_id"] = anchor_id
+        selected["identity_continuity"] = "anchor_created"
+        self.facts[TARGET_IDENTITY_ANCHOR_KEY] = _memory_fact_entry(
+            anchor, source="confirmed_target_selection"
+        )
+        self.record("target_identity_anchor_created", dict(anchor))
+        return True
+
+    def _refresh_wrist_alignment_bundle(self) -> bool:
+        selected = self.selected_sam3_detection()
+        previous = _memory_fact_value(self.facts.get(WRIST_ALIGNMENT_BUNDLES_KEY)) or {}
+        bundles = dict(previous.get("bundles") or {}) if isinstance(previous, dict) else {}
+        public: JsonDict = {
+            "schema_version": "openeta.wrist_alignment_input_bundle.v1",
+            "status": "awaiting_wrist_target_selection",
+            "tool": "compute_wrist_alignment",
+        }
+        active_bundle_id = ""
+        if isinstance(selected, dict):
+            source = selected.get("source_observation")
+            source = source if isinstance(source, dict) else {}
+            frame_id = str(source.get("frame_id") or selected.get("frame_id") or "")
+            role = str(source.get("role") or selected.get("camera_role") or "")
+            source_object_epoch = _optional_int(
+                source.get("object_scene_epoch"),
+                default=_optional_int(selected.get("scene_epoch"), default=-1),
+            )
+            source_robot_epoch = _optional_int(
+                source.get("robot_motion_epoch"), default=-1
+            )
+            current_object_epoch = self.object_scene_epoch()
+            current_robot_epoch = self.robot_motion_epoch()
+            public.update(
+                {
+                    "source_packet_id": source.get("packet_id")
+                    or selected.get("source_packet_id"),
+                    "camera_frame_id": frame_id,
+                    "camera_role": role or None,
+                    "object_scene_epoch": source_object_epoch,
+                    "robot_motion_epoch": source_robot_epoch,
+                }
+            )
+            if not _is_wrist_camera(frame_id, role):
+                public["status"] = "selected_target_is_not_wrist_view"
+            elif source_object_epoch != current_object_epoch:
+                public.update(
+                    {
+                        "status": "stale_object_scene",
+                        "recovery": "segment the target on a current wrist observation packet",
+                    }
+                )
+            elif source_robot_epoch != current_robot_epoch:
+                public.update(
+                    {
+                        "status": "stale_robot_motion",
+                        "recovery": (
+                            "observe fresh wrist RGB-D after the latest robot motion, "
+                            "then segment and select the same target instance"
+                        ),
+                    }
+                )
+            else:
+                provenance = _memory_fact_value(self.facts.get(GRASP_PROVENANCE_KEY)) or {}
+                compiled_id = str(provenance.get("compiled_grasp_id") or "")
+                compiled = self._compiled_grasp_artifact(compiled_id) if compiled_id else None
+                provenance_anchor_id = str(
+                    provenance.get("target_identity_anchor_id") or ""
+                )
+                selected_anchor_id = str(selected.get("identity_anchor_id") or "")
+                public.update(
+                    {
+                        "target_identity_anchor_id": selected_anchor_id or None,
+                        "compiled_target_identity_anchor_id": (
+                            provenance_anchor_id or None
+                        ),
+                    }
+                )
+                if provenance_anchor_id and selected_anchor_id != provenance_anchor_id:
+                    public.update(
+                        {
+                            "status": "target_identity_mismatch",
+                            "recovery": (
+                                "select the same target instance and explicitly confirm "
+                                "cross-view identity continuity before wrist alignment"
+                            ),
+                        }
+                    )
+                    parameters = None
+                else:
+                    budget = self.grasp_adjustment_budget() or {}
+                    parameters = {
+                        "compiled_grasp": compiled,
+                        "target_mask": selected.get("mask_ref"),
+                        "depth": source.get("depth"),
+                        "intrinsics": source.get("intrinsics"),
+                        "camera_extrinsics": source.get("extrinsics"),
+                        "current_eef_pose": source.get("current_eef_pose"),
+                        "scene_epoch": current_object_epoch,
+                        "source_object_scene_epoch": source_object_epoch,
+                        "current_object_scene_epoch": current_object_epoch,
+                        "source_robot_motion_epoch": source_robot_epoch,
+                        "current_robot_motion_epoch": current_robot_epoch,
+                        "residual_budget": budget,
+                    }
+                if parameters is None:
+                    missing = []
+                else:
+                    missing = [
+                        key
+                        for key, value in parameters.items()
+                        if value in (None, "", {}) and key != "residual_budget"
+                    ]
+                if parameters is None:
+                    pass
+                elif missing:
+                    public.update(
+                        {
+                            "status": "source_packet_incomplete",
+                            "missing_inputs": missing,
+                            "recovery": (
+                                "observe fresh wrist RGB-D with calibrated camera and measured EEF pose"
+                            ),
+                        }
+                    )
+                else:
+                    target_evidence_id = (
+                        f"sam3:{selected.get('result_id')}:{selected.get('id')}"
+                    )
+                    identity = {
+                        "target_evidence_id": target_evidence_id,
+                        "compiled_grasp_id": compiled_id,
+                        "source_packet_id": public.get("source_packet_id"),
+                        "target_identity_anchor_id": selected_anchor_id or None,
+                        "object_scene_epoch": current_object_epoch,
+                        "robot_motion_epoch": current_robot_epoch,
+                        "parameters": parameters,
+                    }
+                    active_bundle_id = "wrist_alignment:" + hashlib.sha256(
+                        json.dumps(
+                            identity,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()[:20]
+                    bundles[active_bundle_id] = {
+                        "schema_version": "openeta.wrist_alignment_input_bundle.v1",
+                        "bundle_id": active_bundle_id,
+                        "parameters": parameters,
+                        "target_evidence_id": target_evidence_id,
+                        "compiled_grasp_id": compiled_id,
+                        "object_scene_epoch": current_object_epoch,
+                        "robot_motion_epoch": current_robot_epoch,
+                        "target_identity_anchor_id": selected_anchor_id or None,
+                        "created_at_s": time.time(),
+                    }
+                    public.update(
+                        {
+                            "status": "ready",
+                            "bundle_id": active_bundle_id,
+                            "call_parameters": {"bundle_id": active_bundle_id},
+                            "target_evidence_id": target_evidence_id,
+                            "compiled_grasp_id": compiled_id,
+                            "object_scene_epoch": current_object_epoch,
+                            "robot_motion_epoch": current_robot_epoch,
+                        }
+                    )
+        state = {
+            "schema_version": "openeta.wrist_alignment_bundle_store.v1",
+            "active_bundle_id": active_bundle_id,
+            "public": public,
+            "bundles": bundles,
+        }
+        comparable_previous = json.loads(json.dumps(previous)) if isinstance(previous, dict) else {}
+        comparable_state = json.loads(json.dumps(state))
+        for candidate_state in (comparable_previous, comparable_state):
+            for value in (candidate_state.get("bundles") or {}).values():
+                if isinstance(value, dict):
+                    value.pop("created_at_s", None)
+        if comparable_previous == comparable_state:
+            return False
+        self.facts[WRIST_ALIGNMENT_BUNDLES_KEY] = _memory_fact_entry(
+            state, source="host_wrist_alignment_bundle_resolver"
+        )
+        self.record(
+            "wrist_alignment_bundle_updated",
+            {"status": public.get("status"), "bundle_id": active_bundle_id or None},
+        )
+        return True
+
+    def _rebase_anyplace_grasp_to_fixed_camera(
+        self,
+        bundles: JsonDict,
+        *,
+        grasp: JsonDict,
+        placement_evidence_id: str,
+    ) -> JsonDict | None:
+        """Re-express a wrist grasp in a prior fixed-camera AnyPlace source.
+
+        AnyPlace requires object and placement masks plus the selected grasp in
+        one camera geometry.  Re-running fixed-camera grasp estimation after a
+        successful wrist refinement discards the better contact geometry and
+        can create a source-repair loop.  A prior same-target bundle already
+        owns aligned fixed-camera RGB-D and masks, so calibrated packet
+        extrinsics are sufficient to express the wrist grasp in that frame.
+        """
+
+        source = grasp.get("source")
+        candidate = grasp.get("candidate")
+        anchor_id = str(grasp.get("target_identity_anchor_id") or "")
+        if (
+            not isinstance(source, dict)
+            or not isinstance(candidate, dict)
+            or not anchor_id
+            or not _is_moving_camera_frame(
+                _camera_frame_hint(source, source.get("rgb"))
+            )
+        ):
+            return None
+        source_reference = self.observation_packet_reference_for_path(source.get("rgb"))
+        if not source_reference:
+            return None
+        try:
+            source_packet = self.resolve_observation_packet(
+                str(source_reference.get("source_packet_id") or ""),
+                str(source_reference.get("camera_frame_id") or ""),
+                require_files=False,
+            )
+        except ObservationPacketResolutionError:
+            return None
+        source_extrinsics = source_packet.get("extrinsics")
+        if not isinstance(source_extrinsics, dict) or not source_extrinsics:
+            return None
+
+        current_object_epoch = self.object_scene_epoch()
+        fixed_sources: list[tuple[JsonDict, JsonDict]] = []
+        # The Agent may choose near-field refinement before it has segmented a
+        # receptacle or materialized AnyPlace.  Compile events retain the full
+        # host-owned provenance off-context, so the earlier same-target fixed
+        # camera can still supply aligned object geometry without prescribing
+        # an action order. Prefer this canonical grasp lineage over a derived
+        # AnyPlace bundle: using the latest bundle as its own rebase source
+        # recursively changed source_bundle_id and therefore the next bundle's
+        # content-addressed identity after every unrelated action.
+        for event in reversed(self.events):
+            if event.event_type != "grasp_provenance_bound":
+                continue
+            historical = event.payload.get("provenance")
+            if (
+                not isinstance(historical, dict)
+                or historical.get("target_identity_anchor_id") != anchor_id
+                or historical.get("object_scene_epoch") != current_object_epoch
+            ):
+                continue
+            target_source = historical.get("source")
+            if not isinstance(target_source, dict):
+                continue
+            fixed_sources.append(
+                (
+                    target_source,
+                    {
+                        "source_bundle_id": None,
+                        "source_grasp_evidence_id": historical.get("evidence_id"),
+                    },
+                )
+            )
+
+        # Retained bundles remain a fallback when no durable fixed-camera grasp
+        # provenance is available (for example, restored legacy sessions).
+        for bundle_id, prior in reversed(list(bundles.items())):
+            if (
+                not isinstance(prior, dict)
+                or prior.get("placement_evidence_id") != placement_evidence_id
+                or prior.get("target_identity_anchor_id") != anchor_id
+                or prior.get("object_scene_epoch") != current_object_epoch
+            ):
+                continue
+            parameters = prior.get("parameters")
+            selected_grasp = (
+                parameters.get("selected_grasp")
+                if isinstance(parameters, dict)
+                else None
+            )
+            target_source = (
+                selected_grasp.get("source")
+                if isinstance(selected_grasp, dict)
+                else None
+            )
+            if not isinstance(target_source, dict):
+                continue
+            fixed_sources.append(
+                (
+                    target_source,
+                    {
+                        "source_bundle_id": bundle_id,
+                        "source_grasp_evidence_id": prior.get("grasp_evidence_id"),
+                    },
+                )
+            )
+
+        seen_target_sources: set[tuple[str, str]] = set()
+        for target_source, source_lineage in fixed_sources:
+            target_frame = _camera_frame_hint(target_source, target_source.get("rgb"))
+            if not target_frame or _is_moving_camera_frame(target_frame):
+                continue
+            target_key = (target_frame, str(target_source.get("rgb") or ""))
+            if target_key in seen_target_sources:
+                continue
+            seen_target_sources.add(target_key)
+            target_reference = self.observation_packet_reference_for_path(
+                target_source.get("rgb")
+            )
+            if not target_reference:
+                continue
+            try:
+                target_packet = self.resolve_observation_packet(
+                    str(target_reference.get("source_packet_id") or ""),
+                    str(target_reference.get("camera_frame_id") or ""),
+                    require_files=False,
+                )
+            except ObservationPacketResolutionError:
+                continue
+            target_extrinsics = target_packet.get("extrinsics")
+            if not isinstance(target_extrinsics, dict) or not target_extrinsics:
+                continue
+            try:
+                rebased_candidate = rebase_camera_grasp_candidate(
+                    candidate,
+                    source_camera_extrinsics=source_extrinsics,
+                    target_camera_extrinsics=target_extrinsics,
+                )
+            except GraspGeometryError:
+                continue
+            rebased_source = dict(target_source)
+            for key in (
+                "source_tool",
+                "source_backend",
+                "gripper_name",
+            ):
+                if source.get(key) is not None:
+                    rebased_source[key] = source[key]
+            if source.get("up_direction_camera") is not None:
+                try:
+                    rebased_source["up_direction_camera"] = rebase_camera_direction(
+                        source["up_direction_camera"],
+                        source_camera_extrinsics=source_extrinsics,
+                        target_camera_extrinsics=target_extrinsics,
+                    )
+                except GraspGeometryError:
+                    continue
+            rebased_source["mode"] = "targeted"
+            provenance = {
+                "schema_version": "openeta.cross_camera_grasp_rebase.v1",
+                "mode": "calibrated_world_invariant",
+                "source_packet_id": source_reference.get("source_packet_id"),
+                "source_camera_frame_id": source_reference.get("camera_frame_id"),
+                "target_packet_id": target_reference.get("source_packet_id"),
+                "target_camera_frame_id": target_reference.get("camera_frame_id"),
+                "source_candidate_id": candidate.get("id"),
+                **source_lineage,
+                "target_identity_anchor_id": anchor_id,
+            }
+            rebased_source["cross_camera_rebase"] = dict(provenance)
+            rebased_candidate["cross_camera_rebase"] = dict(provenance)
+            return {
+                "candidate": rebased_candidate,
+                "source": rebased_source,
+                "provenance": provenance,
+            }
+        return None
+
+    def _refresh_anyplace_input_bundle(self) -> bool:
+        """Join compatible grasp and placement evidence without exposing raw parameters."""
+
+        previous = _memory_fact_value(self.facts.get(ANYPLACE_INPUT_BUNDLES_KEY)) or {}
+        previous_active_id = (
+            str(previous.get("active_bundle_id") or "")
+            if isinstance(previous, dict)
+            else ""
+        )
+        previous_bundles = previous.get("bundles") if isinstance(previous, dict) else None
+        previous_active = (
+            previous_bundles.get(previous_active_id)
+            if isinstance(previous_bundles, dict) and previous_active_id
+            else None
+        )
+        grasp = _memory_fact_value(self.facts.get(GRASP_PROVENANCE_KEY))
+        if not isinstance(grasp, dict):
+            return False
+        if (
+            isinstance(previous_active, dict)
+            and previous_active.get("materialized") is True
+            and previous_active.get("grasp_evidence_id") == grasp.get("evidence_id")
+        ):
+            # A successful AnyPlace result is a frozen placement plan.  Later
+            # attachment-verification segmentation must not rewrite its source
+            # packet or silently rebind it to a newer object-scene epoch.
+            return False
+        source = grasp.get("source")
+        candidate = grasp.get("candidate")
+        if not isinstance(source, dict) or not isinstance(candidate, dict):
+            return False
+        expected_image = source.get("rgb")
+        placement = self.selected_sam3_detection("placement_region")
+        bundles = dict(previous.get("bundles") or {}) if isinstance(previous, dict) else {}
+        public: JsonDict = {
+            "schema_version": "openeta.anyplace_input_bundle.v1",
+            "status": "awaiting_placement_region",
+            "tool": "anyplace",
+            "required_source_image": expected_image,
+            "grasp_evidence_id": grasp.get("evidence_id"),
+        }
+        active_bundle_id = ""
+        target = self.selected_sam3_detection()
+        if isinstance(target, dict) and not _same_memory_artifact_path(
+            target.get("mask_ref"), source.get("object_mask")
+        ):
+            public.update(
+                {
+                    "status": "target_grasp_mismatch",
+                    "selected_target_mask": target.get("mask_ref"),
+                    "recovery": (
+                        "run targeted grasp estimation and compile against the selected target"
+                    ),
+                }
+            )
+        elif isinstance(placement, dict):
+            mask_ref = placement.get("mask_ref")
+            source_image = placement.get("source_image")
+            placement_evidence_id = _placement_evidence_id(placement)
+            public["placement_evidence_id"] = placement_evidence_id
+            same_source_path = _same_memory_artifact_path(source_image, expected_image)
+            identical_source_content = (
+                not same_source_path
+                and _same_memory_artifact_content(source_image, expected_image)
+            )
+            source_matches = same_source_path or identical_source_content
+            reusable_placement = (
+                None
+                if source_matches
+                else _reusable_fixed_camera_placement(
+                    bundles,
+                    placement_evidence_id=placement_evidence_id,
+                    expected_source=source,
+                )
+            )
+            grasp_rebase = None
+            if not source_matches:
+                grasp_rebase = self._rebase_anyplace_grasp_to_fixed_camera(
+                    bundles,
+                    grasp=grasp,
+                    placement_evidence_id=placement_evidence_id,
+                )
+                if isinstance(grasp_rebase, dict):
+                    candidate = grasp_rebase["candidate"]
+                    source = grasp_rebase["source"]
+                    expected_image = source.get("rgb")
+                    public["required_source_image"] = expected_image
+                    source_matches = _same_memory_artifact_path(
+                        source_image, expected_image
+                    )
+            if not source_matches and reusable_placement is None:
+                expected_frame = _camera_frame_hint(source, expected_image)
+                placement_observation = placement.get("source_observation")
+                placement_observation = (
+                    placement_observation
+                    if isinstance(placement_observation, dict)
+                    else {}
+                )
+                placement_frame = _camera_frame_hint(
+                    placement_observation,
+                    source_image,
+                )
+                # AnyPlace requires grasp/object/placement inputs to share one
+                # camera geometry. A wrist camera commonly cannot see the
+                # receptacle at all. If placement evidence already comes from
+                # a fixed scene camera, rebase the grasp evidence onto that
+                # camera instead of prescribing an impossible wrist SAM call.
+                rebase_grasp_to_fixed_camera = bool(
+                    _is_moving_camera_frame(expected_frame)
+                    and placement_frame
+                    and not _is_moving_camera_frame(placement_frame)
+                )
+                if rebase_grasp_to_fixed_camera:
+                    repair_source_image = source_image
+                    repair_parameters = {
+                        "prompt": (
+                            target.get("target_prompt")
+                            if isinstance(target, dict)
+                            else None
+                        )
+                        or "target object",
+                        "evidence_role": DEFAULT_SAM3_EVIDENCE_ROLE,
+                    }
+                    recovery = (
+                        "segment the target object on the fixed placement camera, "
+                        "select it, estimate a grasp from its host bundle, and compile "
+                        "that candidate; keep the current placement-region selection"
+                    )
+                    required_source_image = source_image
+                else:
+                    repair_source_image = expected_image
+                    repair_parameters = {
+                        "prompt": placement.get("target_prompt") or "placement region",
+                        "evidence_role": "placement_region",
+                    }
+                    recovery = (
+                        "segment the placement region on required_source_image and "
+                        "select that SAM3 detection"
+                    )
+                    required_source_image = expected_image
+                repair_reference = self.observation_packet_reference_for_path(
+                    repair_source_image
+                )
+                if repair_reference:
+                    repair_parameters.update(repair_reference)
+                    public.update(
+                        {
+                            "status": "placement_source_mismatch",
+                            "required_source_image": required_source_image,
+                            "provided_source_image": source_image,
+                            "recovery": recovery,
+                            "repair_call": {
+                                "tool": "sam3",
+                                "parameters": repair_parameters,
+                            },
+                        }
+                    )
+                else:
+                    public.update(
+                        {
+                            "status": "source_packet_unresolvable",
+                            "required_source_image": required_source_image,
+                            "provided_source_image": source_image,
+                            "recovery": (
+                                "observe again because the required source artifact is not "
+                                "owned by any indexed observation packet"
+                            ),
+                        }
+                    )
+            elif not isinstance(source.get("intrinsics"), dict) or any(
+                candidate.get(key) is None
+                for key in (
+                    "id",
+                    "translation_xyz",
+                    "rotation_matrix",
+                    "gripper_tip_position_xyz",
+                    "depth",
+                    "width",
+                    "height",
+                )
+            ):
+                public.update(
+                    {
+                        "status": "grasp_evidence_incomplete",
+                        "recovery": (
+                            "rerun targeted grasp estimation and compile a complete candidate"
+                        ),
+                    }
+                )
+            elif isinstance(mask_ref, str) and mask_ref:
+                direct_frame_reuse = bool(identical_source_content)
+                effective_source_image = (
+                    expected_image
+                    if reusable_placement or direct_frame_reuse
+                    else source_image
+                )
+                parameters = {
+                    "rgb": source.get("rgb"),
+                    "depth": source.get("depth"),
+                    "object_mask": source.get("object_mask"),
+                    "placement_region_mask": {
+                        "mask_ref": mask_ref,
+                        "source_image": effective_source_image,
+                    },
+                    "intrinsics": source.get("intrinsics"),
+                    "selected_grasp": {
+                        "candidate": candidate,
+                        "source": source,
+                    },
+                }
+                identity = {
+                    "grasp_evidence_id": grasp.get("evidence_id"),
+                    "placement_evidence_id": placement_evidence_id,
+                    "parameters": parameters,
+                }
+                active_bundle_id = "anyplace:" + hashlib.sha256(
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:20]
+                bundles[active_bundle_id] = {
+                    "schema_version": "openeta.anyplace_input_bundle.v1",
+                    "bundle_id": active_bundle_id,
+                    "parameters": parameters,
+                    "grasp_evidence_id": grasp.get("evidence_id"),
+                    "placement_evidence_id": placement_evidence_id,
+                    "target_identity_anchor_id": grasp.get(
+                        "target_identity_anchor_id"
+                    ),
+                    "grasp_rebase": (
+                        grasp_rebase.get("provenance")
+                        if isinstance(grasp_rebase, dict)
+                        else None
+                    ),
+                    "placement_evidence_reuse": (
+                        {
+                            "mode": (
+                                "identical_frame_content"
+                                if direct_frame_reuse
+                                else "fixed_camera_identity"
+                            ),
+                            "evidence_source_image": source_image,
+                            "effective_source_image": expected_image,
+                            "source_bundle_id": (
+                                reusable_placement.get("bundle_id")
+                                if isinstance(reusable_placement, dict)
+                                else None
+                            ),
+                        }
+                        if isinstance(reusable_placement, dict) or direct_frame_reuse
+                        else None
+                    ),
+                    "object_scene_epoch": self.object_scene_epoch(),
+                    "created_at_s": time.time(),
+                }
+                public.update(
+                    {
+                        "status": "ready",
+                        "bundle_id": active_bundle_id,
+                        "call_parameters": {"bundle_id": active_bundle_id},
+                        "object_scene_epoch": self.object_scene_epoch(),
+                    }
+                )
+                if isinstance(reusable_placement, dict) or direct_frame_reuse:
+                    public["placement_evidence_reuse"] = {
+                        "mode": (
+                            "identical_frame_content"
+                            if direct_frame_reuse
+                            else "fixed_camera_identity"
+                        ),
+                        "evidence_source_image": source_image,
+                        "effective_source_image": expected_image,
+                        "reason": (
+                            "the selected placement frame is byte-identical to the grasp "
+                            "source frame; rebind the mask to the exact grasp RGB-D packet"
+                            if direct_frame_reuse
+                            else "placement region is unchanged on the same fixed scene "
+                            "camera; reuse the selected mask while rebinding aligned RGB-D "
+                            "for the new grasp source"
+                        ),
+                    }
+                if isinstance(grasp_rebase, dict):
+                    public["grasp_rebase"] = dict(grasp_rebase["provenance"])
+        state = {
+            "schema_version": "openeta.anyplace_input_bundle_store.v1",
+            "active_bundle_id": active_bundle_id,
+            "public": public,
+            "bundles": bundles,
+        }
+        comparable_previous = (
+            json.loads(json.dumps(previous)) if isinstance(previous, dict) else {}
+        )
+        for value in (comparable_previous.get("bundles") or {}).values():
+            if isinstance(value, dict):
+                value.pop("created_at_s", None)
+        comparable_state = json.loads(json.dumps(state))
+        for value in (comparable_state.get("bundles") or {}).values():
+            if isinstance(value, dict):
+                value.pop("created_at_s", None)
+        if comparable_previous == comparable_state:
+            return False
+        self.facts[ANYPLACE_INPUT_BUNDLES_KEY] = _memory_fact_entry(
+            state,
+            source="host_provenance_bundle_resolver",
+        )
+        self.record(
+            "anyplace_input_bundle_updated",
+            {
+                "status": public.get("status"),
+                "bundle_id": active_bundle_id or None,
+                "grasp_evidence_id": grasp.get("evidence_id"),
+                "placement_evidence_id": public.get("placement_evidence_id"),
+            },
+        )
+        return True
+
+    def _capture_anyplace_bundle_materialization(self, action: EnvAction) -> bool:
+        """Freeze a successful AnyPlace result as an attachment-bound placement plan."""
+
+        call = _successful_tool_call(action, "anyplace")
+        if call is None:
+            return False
+        outputs = _tool_call_outputs(call)
+        candidates = outputs.get("placement_candidates")
+        if not isinstance(candidates, list) or not any(
+            isinstance(candidate, dict) for candidate in candidates
+        ):
+            return False
+        command = action.command if isinstance(action.command, dict) else {}
+        request = command.get("request")
+        request_parameters = (
+            request.get("parameters") if isinstance(request, dict) else None
+        )
+        call_parameters = call.get("parameters")
+        bundle_id = ""
+        for parameters in (request_parameters, call_parameters):
+            if not isinstance(parameters, dict):
+                continue
+            candidate_id = parameters.get("bundle_id")
+            if isinstance(candidate_id, str) and candidate_id.strip():
+                bundle_id = candidate_id.strip()
+                break
+        state = _memory_fact_value(self.facts.get(ANYPLACE_INPUT_BUNDLES_KEY))
+        if not isinstance(state, dict):
+            return False
+        active_id = str(state.get("active_bundle_id") or "")
+        if not bundle_id:
+            bundle_id = active_id
+        if not bundle_id or bundle_id != active_id:
+            return False
+        bundles = dict(state.get("bundles") or {})
+        bundle = bundles.get(bundle_id)
+        if not isinstance(bundle, dict):
+            return False
+        current_epoch = self.object_scene_epoch()
+        result_identity = {
+            "bundle_id": bundle_id,
+            "result_id": outputs.get("result_id"),
+            "raw_output_ref": outputs.get("raw_output_ref"),
+            "placement_candidates": candidates,
+        }
+        materialized_result_id = str(outputs.get("result_id") or "").strip()
+        if not materialized_result_id:
+            materialized_result_id = "anyplace-result:" + hashlib.sha256(
+                json.dumps(
+                    result_identity,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+        updated_bundle = {
+            **bundle,
+            "materialized": True,
+            "materialized_result_id": materialized_result_id,
+            "placement_candidates": [
+                dict(candidate) for candidate in candidates if isinstance(candidate, dict)
+            ],
+            "freshness_scope": "attachment_bound_plan",
+            "input_object_scene_epoch": _fact_epoch_value(
+                bundle.get("object_scene_epoch")
+            ),
+            "valid_through_object_scene_epoch": current_epoch,
+            "materialized_at_s": time.time(),
+        }
+        if (
+            bundle.get("materialized") is True
+            and bundle.get("materialized_result_id") == materialized_result_id
+        ):
+            return False
+        bundles[bundle_id] = updated_bundle
+        public_value = state.get("public")
+        public = dict(public_value) if isinstance(public_value, dict) else {}
+        public.update(
+            {
+                "status": "ready",
+                "bundle_id": bundle_id,
+                "call_parameters": {"bundle_id": bundle_id},
+                "materialized": True,
+                "materialized_result_id": materialized_result_id,
+                "freshness_scope": "attachment_bound_plan",
+                "input_object_scene_epoch": updated_bundle[
+                    "input_object_scene_epoch"
+                ],
+                "valid_through_object_scene_epoch": current_epoch,
+            }
+        )
+        self.facts[ANYPLACE_INPUT_BUNDLES_KEY] = _memory_fact_entry(
+            {**state, "public": public, "bundles": bundles},
+            source="anyplace_result_materialization",
+        )
+        self.record(
+            "anyplace_input_bundle_materialized",
+            {
+                "bundle_id": bundle_id,
+                "materialized_result_id": materialized_result_id,
+                "object_scene_epoch": current_epoch,
+            },
+        )
+        return True
+
+    def _capture_placement_world_reference(self, action: EnvAction) -> bool:
+        """Retain the latest transformed placement pose as compact tool evidence."""
+
+        call = _successful_tool_call(action, "camera_pose_to_world")
+        if call is None:
+            return False
+        outputs = _tool_call_outputs(call)
+        placement = outputs.get("placement_reference")
+        world_pose = outputs.get("world_pose")
+        if (
+            not isinstance(placement, dict)
+            or placement.get("schema_version")
+            != "openeta.placement_world_reference.v1"
+            or not isinstance(world_pose, dict)
+            or not _finite_xyz(world_pose.get("translation_xyz"))
+        ):
+            return False
+        value = {
+            "schema_version": "openeta.placement_world_reference.v1",
+            "semantic_role": placement.get("semantic_role"),
+            "execution_authorized": False,
+            "placement_result_id": outputs.get("placement_result_id"),
+            "candidate_id": outputs.get("candidate_id"),
+            "world_pose": {
+                "frame": "world",
+                "translation_xyz": [
+                    float(component)
+                    for component in world_pose["translation_xyz"][:3]
+                ],
+                **(
+                    {"rotation_matrix": world_pose.get("rotation_matrix")}
+                    if isinstance(world_pose.get("rotation_matrix"), list)
+                    else {}
+                ),
+            },
+            "required_before_motion": placement.get("required_before_motion"),
+            "agent_release_options": placement.get("agent_release_options"),
+            "object_scene_epoch": self.object_scene_epoch(),
+            "updated_at_s": time.time(),
+        }
+        previous = self.placement_world_reference()
+        if isinstance(previous, dict):
+            comparable_previous = dict(previous)
+            comparable_previous.pop("updated_at_s", None)
+            comparable_value = dict(value)
+            comparable_value.pop("updated_at_s", None)
+            if comparable_previous == comparable_value:
+                return False
+        self.facts[PLACEMENT_WORLD_REFERENCE_KEY] = _memory_fact_entry(
+            value,
+            source="camera_pose_to_world",
+        )
+        self.record("placement_world_reference_updated", dict(value))
+        return True
+
+    def _capture_ik_preview_receipt(self, action: EnvAction) -> bool:
+        call = _pipeline_call(action, "ik_preview_check")
+        if not isinstance(call, dict):
+            return False
+        result = call.get("result")
+        details = result.get("details") if isinstance(result, dict) else None
+        if not isinstance(details, dict):
+            return False
+        outputs = details.get("outputs")
+        outputs = outputs if isinstance(outputs, dict) else {}
+        parameters = call.get("parameters")
+        parameters = parameters if isinstance(parameters, dict) else {}
+        receipt = outputs.get("ik_preview_receipt")
+        if not isinstance(receipt, dict):
+            reachability = outputs.get("reachability")
+            if not isinstance(reachability, dict):
+                return False
+            receipt = {
+                "schema_version": "openeta.ik_preview_receipt.v1",
+                "receipt_id": hashlib.sha256(
+                    json.dumps(
+                        {"parameters": parameters, "reachability": reachability},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()[:20],
+                "target_signature": _ik_target_signature(parameters),
+                "classification": _ik_reachability_classification(reachability),
+                "reason_code": reachability.get("reason_code"),
+                "reachability": dict(reachability),
+            }
+        receipt = {
+            **receipt,
+            "object_scene_epoch": self.object_scene_epoch(),
+            "robot_motion_epoch": self.robot_motion_epoch(),
+            "recorded_at_s": time.time(),
+        }
+        target_pose = parameters.get("target_pose")
+        if not isinstance(receipt.get("target_pose"), dict) and isinstance(
+            target_pose, dict
+        ):
+            receipt["target_pose"] = dict(target_pose)
+        if not receipt.get("orientation_policy"):
+            receipt["orientation_policy"] = _ik_orientation_policy(parameters)
+        if not receipt.get("target_signature"):
+            receipt["target_signature"] = _ik_target_signature(
+                parameters
+            )
+        if not receipt.get("pose_policy_signature"):
+            receipt["pose_policy_signature"] = _ik_pose_policy_signature(
+                parameters
+            )
+        request_reference: JsonDict = {}
+        target_reference = target_pose if isinstance(target_pose, dict) else {}
+        for field_name in (
+            "compiled_grasp_id",
+            "waypoint_role",
+            "path_fraction",
+            "probe_id",
+            "waypoint_index",
+            "viewpoint_proposal_id",
+            "viewpoint_id",
+            "candidate_id",
+        ):
+            value = parameters.get(field_name, target_reference.get(field_name))
+            if value is not None:
+                request_reference[field_name] = value
+        if request_reference:
+            receipt["request_reference"] = request_reference
+        state = self.ik_preview_receipts() or {
+            "schema_version": "openeta.ik_preview_receipt_index.v1",
+            "receipts": [],
+        }
+        receipts = [
+            dict(item)
+            for item in state.get("receipts", [])
+            if isinstance(item, dict)
+        ]
+        receipts.append(receipt)
+        state.update({"receipts": receipts[-16:], "latest": receipt})
+        self.facts[IK_PREVIEW_RECEIPTS_KEY] = _memory_fact_entry(
+            state, source="ik_preview_check"
+        )
+        self.record("ik_preview_receipt", dict(receipt))
+        return True
+
+    def _record_world_mutation(self, action: EnvAction) -> bool:
         command = action.command if isinstance(action.command, dict) else {}
         request = command.get("request")
         name = str(request.get("name") or "") if isinstance(request, dict) else ""
@@ -3256,23 +6483,419 @@ class AgentMemory:
             "lower_body_control_policy",
         }:
             return False
-        if _successful_tool_call(action, name) is None:
+        call = _tool_call(action, name)
+        if call is None:
             return False
-        epoch = self.scene_epoch() + 1
-        self.facts[SCENE_EPOCH_KEY] = _memory_fact_entry(
-            {"epoch": epoch},
-            source="successful_world_mutation",
+        call_succeeded = _call_result_success(call)
+        if name in {"move_to", "follow_eef_trajectory"}:
+            # A failed goal is not necessarily a no-op. Controllers commonly move
+            # for several iterations before reporting iteration_limit, collision,
+            # or another terminal failure. Any trustworthy receipt proving that
+            # motion occurred must invalidate robot-state-bound IK/view evidence.
+            # Conversely, a blocked/skipped call with no execution receipt must not
+            # advance the epoch merely because legacy successful calls default to
+            # conservative mutation semantics.
+            pose_changed = _motion_call_changed_pose(call)
+            if not call_succeeded and not _motion_call_receipt_proves_pose_change(call):
+                return False
+            if not pose_changed:
+                self.record(
+                    "world_mutation_noop",
+                    {
+                        "tool": name,
+                        "robot_motion_epoch": self.robot_motion_epoch(),
+                        "reason": "motion receipt reports zero executed steps and no pose change",
+                    },
+                )
+                return False
+        elif not call_succeeded:
+            return False
+        self._advance_runtime_epochs(
+            tool=name,
+            # A command acknowledgement is not visual evidence that an object
+            # moved, attached, or was released.  Object freshness advances only
+            # when a later observation carries host-owned change evidence.
+            object_scene_changed=False,
+            source=(
+                "successful_world_mutation"
+                if call_succeeded
+                else "failed_motion_partial_execution"
+            ),
         )
-        self.record("scene_epoch_advanced", {"scene_epoch": epoch, "tool": name})
         return True
+
+    def _capture_compiled_clearance_execution(self, action: EnvAction) -> bool:
+        call = _tool_call(action, "move_to")
+        if not isinstance(call, dict):
+            return False
+        parameters = _executed_tool_parameters(action, "move_to")
+        target_pose = parameters.get("target_pose")
+        if (
+            not isinstance(target_pose, dict)
+            or _compiled_grasp_pose_role(target_pose) != "clearance"
+        ):
+            return False
+        compiled_id = str(target_pose.get("compiled_grasp_id") or "")
+        if not compiled_id:
+            return False
+        result = call.get("result")
+        details = result.get("details") if isinstance(result, dict) else None
+        details = details if isinstance(details, dict) else {}
+        motion = _structured_motion_summary(details)
+        end = motion.get("end")
+        end = end if isinstance(end, dict) else {}
+        receipt = {
+            "schema_version": "openeta.compiled_clearance_execution.v1",
+            "compiled_grasp_id": compiled_id,
+            "source_grasp_id": target_pose.get("source_grasp_id"),
+            "reached_target": motion.get("reached_target") is True
+            and details.get("operational_success") is not False,
+            "steps_executed": motion.get("steps_executed"),
+            "stop_reason": motion.get("stop_reason"),
+            "requested_xyz": _rounded_xyz(target_pose.get("xyz")),
+            "actual_xyz": (
+                _rounded_xyz(end.get("xyz")) if _finite_xyz(end.get("xyz")) else None
+            ),
+            "position_error_m": motion.get("position_error_m"),
+            "orientation_error_rad": motion.get("orientation_error_rad"),
+            "diagnostics": [
+                dict(item)
+                for item in details.get("diagnostics", [])
+                if isinstance(item, dict)
+            ],
+            "object_scene_epoch": self.object_scene_epoch(),
+            "robot_motion_epoch": self.robot_motion_epoch(),
+            "recorded_at_s": time.time(),
+        }
+        self.facts[LATEST_COMPILED_CLEARANCE_EXECUTION_KEY] = _memory_fact_entry(
+            receipt,
+            source="compiled_clearance_execution_receipt",
+        )
+        self.record("compiled_clearance_execution", dict(receipt))
+        return True
+
+    def _capture_compiled_contact_execution(self, action: EnvAction) -> bool:
+        call = _tool_call(action, "move_to")
+        if not isinstance(call, dict):
+            return False
+        parameters = _executed_tool_parameters(action, "move_to")
+        target_pose = parameters.get("target_pose")
+        if not isinstance(target_pose, dict) or _compiled_grasp_pose_role(target_pose) != "contact":
+            return False
+        compiled_id = str(target_pose.get("compiled_grasp_id") or "")
+        if not compiled_id:
+            return False
+        result = call.get("result")
+        details = result.get("details") if isinstance(result, dict) else None
+        details = details if isinstance(details, dict) else {}
+        motion = _structured_motion_summary(details)
+        collision = motion.get("collision")
+        collision = dict(collision) if isinstance(collision, dict) else {}
+        end = motion.get("end")
+        end = end if isinstance(end, dict) else {}
+        provenance = _memory_fact_value(self.facts.get(GRASP_PROVENANCE_KEY)) or {}
+        receipt = {
+            "schema_version": "openeta.compiled_contact_execution.v1",
+            "compiled_grasp_id": compiled_id,
+            "source_grasp_id": target_pose.get("source_grasp_id"),
+            "target_evidence_id": provenance.get("target_evidence_id"),
+            "target_identity_anchor_id": provenance.get("target_identity_anchor_id"),
+            "reached_target": motion.get("reached_target") is True
+            and details.get("operational_success") is not False,
+            "steps_executed": motion.get("steps_executed"),
+            "stop_reason": motion.get("stop_reason"),
+            "requested_xyz": _rounded_xyz(target_pose.get("xyz")),
+            "actual_xyz": (
+                _rounded_xyz(end.get("xyz")) if _finite_xyz(end.get("xyz")) else None
+            ),
+            "position_error_m": motion.get("position_error_m"),
+            "max_axis_position_error_m": motion.get("max_axis_position_error_m"),
+            "orientation_error_rad": motion.get("orientation_error_rad"),
+            "collision": collision,
+            "diagnostics": [
+                dict(item)
+                for item in details.get("diagnostics", [])
+                if isinstance(item, dict)
+            ],
+            "object_scene_epoch": self.object_scene_epoch(),
+            "robot_motion_epoch": self.robot_motion_epoch(),
+            "recorded_at_s": time.time(),
+        }
+        self.facts[LATEST_COMPILED_CONTACT_EXECUTION_KEY] = _memory_fact_entry(
+            receipt,
+            source="compiled_contact_execution_receipt",
+        )
+        self.record("compiled_contact_execution", dict(receipt))
+        return True
+
+    def _capture_grasp_adjustment_budget(self, action: EnvAction) -> bool:
+        """Persist host-derived residual travel for compiled-grasp move_to calls."""
+
+        compile_call = _successful_tool_call(action, "compile_grasp_seed")
+        if compile_call is not None:
+            outputs = _tool_call_outputs(compile_call)
+            compiled_id = str(outputs.get("compiled_grasp_id") or "")
+            if outputs.get("schema_version") == "openeta.compiled_grasp_seed.v1" and compiled_id:
+                self.facts[GRASP_ADJUSTMENT_BUDGET_KEY] = _memory_fact_entry(
+                    {
+                        "schema_version": "openeta.compiled_grasp_adjustment.v1",
+                        "compiled_grasp_id": compiled_id,
+                        "last_waypoint_role": None,
+                        "last_residual_xyz_m": [0.0, 0.0, 0.0],
+                        "last_target_xyz": None,
+                        "cumulative_translation_m": 0.0,
+                        "remaining_translation_m": GRASP_ADJUSTMENT_CUMULATIVE_LIMIT_M,
+                        "per_call_limit_m": GRASP_ADJUSTMENT_STEP_LIMIT_M,
+                        "cumulative_limit_m": GRASP_ADJUSTMENT_CUMULATIVE_LIMIT_M,
+                        "object_scene_epoch": self.object_scene_epoch(),
+                    },
+                    source="compile_grasp_seed",
+                )
+                self.record(
+                    "compiled_grasp_adjustment_budget_reset",
+                    {
+                        "compiled_grasp_id": compiled_id,
+                        "per_call_limit_m": GRASP_ADJUSTMENT_STEP_LIMIT_M,
+                        "cumulative_limit_m": GRASP_ADJUSTMENT_CUMULATIVE_LIMIT_M,
+                    },
+                )
+                return True
+
+        call = _successful_tool_call(action, "move_to")
+        if call is None:
+            return False
+        parameters = _executed_tool_parameters(action, "move_to")
+        target_pose = parameters.get("target_pose")
+        if not isinstance(target_pose, dict):
+            return False
+        compiled_id = str(target_pose.get("compiled_grasp_id") or "")
+        role = _compiled_grasp_pose_role(target_pose)
+        target_xyz = target_pose.get("xyz")
+        if not compiled_id or not role or not _finite_xyz(target_xyz):
+            return False
+        compiled = self._compiled_grasp_artifact(compiled_id)
+        reference = (
+            _compiled_grasp_reference_pose(compiled, role=role)
+            if isinstance(compiled, dict)
+            else None
+        )
+        reference_xyz = reference.get("xyz") if isinstance(reference, dict) else None
+        if not _finite_xyz(reference_xyz):
+            return False
+        residual = [
+            float(target_xyz[index]) - float(reference_xyz[index]) for index in range(3)
+        ]
+        prior = self.grasp_adjustment_budget() or {}
+        if str(prior.get("compiled_grasp_id") or "") == compiled_id:
+            prior_residual_raw = prior.get("last_residual_xyz_m")
+            prior_residual = (
+                [float(value) for value in prior_residual_raw]
+                if _finite_xyz(prior_residual_raw)
+                else [0.0, 0.0, 0.0]
+            )
+            cumulative = _finite_nonnegative_float(
+                prior.get("cumulative_translation_m"),
+                default=0.0,
+            )
+        else:
+            prior_residual = [0.0, 0.0, 0.0]
+            cumulative = 0.0
+        step = math.sqrt(
+            sum((residual[index] - prior_residual[index]) ** 2 for index in range(3))
+        )
+        cumulative = min(GRASP_ADJUSTMENT_CUMULATIVE_LIMIT_M, cumulative + step)
+        budget = {
+            "schema_version": "openeta.compiled_grasp_adjustment.v1",
+            "compiled_grasp_id": compiled_id,
+            "last_waypoint_role": role,
+            "last_residual_xyz_m": _rounded_xyz(residual),
+            "last_target_xyz": _rounded_xyz([float(value) for value in target_xyz]),
+            "last_increment_m": round(step, 6),
+            "cumulative_translation_m": round(cumulative, 6),
+            "remaining_translation_m": round(
+                max(0.0, GRASP_ADJUSTMENT_CUMULATIVE_LIMIT_M - cumulative),
+                6,
+            ),
+            "per_call_limit_m": GRASP_ADJUSTMENT_STEP_LIMIT_M,
+            "cumulative_limit_m": GRASP_ADJUSTMENT_CUMULATIVE_LIMIT_M,
+            "object_scene_epoch": self.object_scene_epoch(),
+        }
+        self.facts[GRASP_ADJUSTMENT_BUDGET_KEY] = _memory_fact_entry(
+            budget,
+            source="move_to_compiled_grasp_residual",
+        )
+        self.record("compiled_grasp_adjustment_consumed", dict(budget))
+        return True
+
+    def _advance_runtime_epochs(
+        self,
+        *,
+        tool: str,
+        object_scene_changed: bool,
+        source: str,
+        preserve_materialized_anyplace: bool = False,
+    ) -> None:
+        robot_epoch = self.robot_motion_epoch() + 1
+        self.facts[ROBOT_MOTION_EPOCH_KEY] = _memory_fact_entry(
+            {"epoch": robot_epoch},
+            source=source,
+        )
+        object_epoch = self.object_scene_epoch()
+        if object_scene_changed:
+            object_epoch += 1
+            entry = _memory_fact_entry({"epoch": object_epoch}, source=source)
+            self.facts[OBJECT_SCENE_EPOCH_KEY] = entry
+            self.facts[SCENE_EPOCH_KEY] = _memory_fact_entry(
+                {"epoch": object_epoch},
+                source=f"{source}_legacy_alias",
+            )
+            self._invalidate_anyplace_bundle_for_object_scene_change(
+                tool=tool,
+                object_scene_epoch=object_epoch,
+                source=source,
+                preserve_materialized=preserve_materialized_anyplace,
+            )
+        self.record(
+            "world_epochs_advanced",
+            {
+                "tool": tool,
+                "robot_motion_epoch": robot_epoch,
+                "object_scene_epoch": object_epoch,
+                "object_scene_changed": object_scene_changed,
+            },
+        )
+
+    def _capture_observed_object_scene_change(
+        self, observation: EnvObservation
+    ) -> bool:
+        """Advance object freshness only from explicit observation evidence.
+
+        The simulator or real-robot observation adapter may publish either the
+        compact boolean ``object_scene_changed`` or a structured
+        ``object_scene_change`` record.  Repeated change ids are idempotent.
+        Robot/gripper commands never synthesize this evidence.
+        """
+
+        metadata = observation.metadata if isinstance(observation.metadata, dict) else {}
+        raw = metadata.get("object_scene_change")
+        if isinstance(raw, dict):
+            changed = raw.get("changed") is True
+            evidence = dict(raw)
+        else:
+            changed = metadata.get("object_scene_changed") is True
+            evidence = {
+                "changed": changed,
+                "reason": metadata.get("object_scene_change_reason"),
+                "change_id": metadata.get("object_scene_change_id"),
+            }
+        if not changed:
+            return False
+        change_id = str(evidence.get("change_id") or "").strip()
+        previous = _memory_fact_value(self.facts.get(OBSERVED_OBJECT_SCENE_CHANGE_KEY)) or {}
+        if change_id and change_id == str(previous.get("change_id") or ""):
+            return False
+        object_epoch = self.object_scene_epoch() + 1
+        self.facts[OBJECT_SCENE_EPOCH_KEY] = _memory_fact_entry(
+            {"epoch": object_epoch}, source="observed_object_scene_change"
+        )
+        self.facts[SCENE_EPOCH_KEY] = _memory_fact_entry(
+            {"epoch": object_epoch}, source="observed_object_scene_change_legacy_alias"
+        )
+        evidence.update(
+            {
+                "schema_version": "openeta.observed_object_scene_change.v1",
+                "object_scene_epoch": object_epoch,
+                "observed_at_s": time.time(),
+            }
+        )
+        self.facts[OBSERVED_OBJECT_SCENE_CHANGE_KEY] = _memory_fact_entry(
+            evidence, source="observation_adapter"
+        )
+        self._invalidate_anyplace_bundle_for_object_scene_change(
+            tool="observe",
+            object_scene_epoch=object_epoch,
+            source="observed_object_scene_change",
+        )
+        self.record("observed_object_scene_change", evidence)
+        return True
+
+    def _invalidate_anyplace_bundle_for_object_scene_change(
+        self,
+        *,
+        tool: str,
+        object_scene_epoch: int,
+        source: str,
+        preserve_materialized: bool = False,
+    ) -> None:
+        state = _memory_fact_value(self.facts.get(ANYPLACE_INPUT_BUNDLES_KEY))
+        if not isinstance(state, dict) or not state.get("active_bundle_id"):
+            return
+        previous_bundle_id = str(state.get("active_bundle_id") or "")
+        bundles = dict(state.get("bundles") or {})
+        active_bundle = bundles.get(previous_bundle_id)
+        if preserve_materialized and isinstance(active_bundle, dict) and active_bundle.get(
+            "materialized"
+        ) is True:
+            active_bundle = {
+                **active_bundle,
+                "valid_through_object_scene_epoch": object_scene_epoch,
+            }
+            bundles[previous_bundle_id] = active_bundle
+            public_value = state.get("public")
+            public = dict(public_value) if isinstance(public_value, dict) else {}
+            public.update(
+                {
+                    "status": "ready",
+                    "bundle_id": previous_bundle_id,
+                    "call_parameters": {"bundle_id": previous_bundle_id},
+                    "materialized": True,
+                    "freshness_scope": "attachment_bound_plan",
+                    "valid_through_object_scene_epoch": object_scene_epoch,
+                }
+            )
+            self.facts[ANYPLACE_INPUT_BUNDLES_KEY] = _memory_fact_entry(
+                {**state, "public": public, "bundles": bundles},
+                source=f"{source}_attachment_bound_plan_carry",
+            )
+            self.record(
+                "anyplace_input_bundle_carried",
+                {
+                    "bundle_id": previous_bundle_id,
+                    "tool": tool,
+                    "object_scene_epoch": object_scene_epoch,
+                },
+            )
+            return
+        public = {
+            "schema_version": "openeta.anyplace_input_bundle.v1",
+            "status": "stale_object_scene",
+            "tool": "anyplace",
+            "previous_bundle_id": previous_bundle_id,
+            "object_scene_epoch": object_scene_epoch,
+            "recovery": "regenerate targeted grasp and placement evidence",
+        }
+        self.facts[ANYPLACE_INPUT_BUNDLES_KEY] = _memory_fact_entry(
+            {
+                **state,
+                "active_bundle_id": "",
+                "public": public,
+            },
+            source=f"{source}_object_scene_invalidation",
+        )
+        self.record(
+            "anyplace_input_bundle_invalidated",
+            {
+                "bundle_id": previous_bundle_id,
+                "tool": tool,
+                "object_scene_epoch": object_scene_epoch,
+            },
+        )
 
     def _capture_gripper_command_state(self, action: EnvAction) -> bool:
         call = _successful_tool_call(action, "gripper_control")
         if call is None:
             return False
-        command = action.command if isinstance(action.command, dict) else {}
-        request = command.get("request")
-        parameters = request.get("parameters") if isinstance(request, dict) else None
+        parameters = _executed_tool_parameters(action, "gripper_control")
         requested_position = (
             parameters.get("position", parameters.get("open"))
             if isinstance(parameters, dict)
@@ -3283,10 +6906,29 @@ class AgentMemory:
         )
         if position is None:
             return False
-        self._set_gripper_command_state(position, source="acknowledged_gripper_command")
+        outputs = _tool_call_outputs(call)
+        proxy_value = outputs.get("attachment_proxy_receipt")
+        proxy = dict(proxy_value) if isinstance(proxy_value, dict) else None
+        previous = self.gripper_command_state() or {}
+        if position == 1 and previous.get("position") == 0:
+            self._invalidate_active_contact_geometry(
+                reason="gripper_reopened_after_close",
+            )
+            self.facts.pop(ATTACHMENT_EVIDENCE_KEY, None)
+        self._set_gripper_command_state(
+            position,
+            source="acknowledged_gripper_command",
+            attachment_proxy_receipt=proxy,
+        )
         return True
 
-    def _set_gripper_command_state(self, position: int, *, source: str) -> None:
+    def _set_gripper_command_state(
+        self,
+        position: int,
+        *,
+        source: str,
+        attachment_proxy_receipt: JsonDict | None = None,
+    ) -> None:
         state = {
             "schema_version": "openeta.gripper_command_state.v1",
             "position": position,
@@ -3295,667 +6937,36 @@ class AgentMemory:
             "scene_epoch": self.scene_epoch(),
             "updated_at_s": time.time(),
         }
+        if position == 0 and isinstance(attachment_proxy_receipt, dict):
+            state["attachment_proxy_receipt"] = dict(attachment_proxy_receipt)
         self.facts[GRIPPER_COMMAND_STATE_KEY] = _memory_fact_entry(state, source=source)
         self.record("gripper_command_state_changed", dict(state))
 
-    def _capture_placement_release(self, action: EnvAction) -> bool:
-        command = action.command if isinstance(action.command, dict) else {}
-        request = command.get("request")
-        if not isinstance(request, dict):
+    def _invalidate_active_contact_geometry(self, *, reason: str) -> bool:
+        provenance = _memory_fact_value(self.facts.get(GRASP_PROVENANCE_KEY))
+        if not isinstance(provenance, dict):
             return False
-        name = str(request.get("name") or "")
-        parameters = request.get("parameters")
-        parameters = parameters if isinstance(parameters, dict) else {}
-        if name == "move_to":
-            target_pose = parameters.get("target_pose")
-            if not isinstance(target_pose, dict):
-                return False
-            placement_stage = str(target_pose.get("placement_stage") or "")
-            call = _successful_tool_call(action, "move_to")
-            if call is None:
-                return False
-            adaptive_release_pose = (
-                _near_receptacle_release_pose(call, target_pose=target_pose)
-                if placement_stage == "descend"
-                else None
-            )
-            if _motion_call_rejects_candidate(call) and adaptive_release_pose is None:
-                return False
-            if placement_stage == "retreat":
-                release = self.placement_release()
-                if (
-                    not isinstance(release, dict)
-                    or release.get("status") != "released"
-                    or str(target_pose.get("source_grasp_id") or "")
-                    != str(release.get("candidate_id") or "")
-                ):
-                    return False
-                release.update(
-                    {
-                        "status": "retreated",
-                        "scene_epoch": self.scene_epoch(),
-                        "retreat_pose": dict(target_pose),
-                        "retreated_at_s": time.time(),
-                    }
-                )
-                self.facts[PLACEMENT_RELEASE_KEY] = _memory_fact_entry(
-                    release,
-                    source="placement_retreat_completed",
-                )
-                self.record("placement_retreated", dict(release))
-                return True
-            if placement_stage not in {"descend", "release"}:
-                return False
-            release_pose = dict(adaptive_release_pose or target_pose)
-            release_pose["placement_stage"] = "release"
-            release = {
-                "schema_version": "openeta.placement_release.v1",
-                "status": "ready",
-                "candidate_id": target_pose.get("source_grasp_id"),
-                "placement_pose_id": target_pose.get("placement_pose_id"),
-                "release_pose": release_pose,
-                "scene_epoch": self.scene_epoch(),
-                "ready_at_s": time.time(),
-                "arrival_stage": (
-                    "descend_near_receptacle"
-                    if adaptive_release_pose is not None
-                    else placement_stage
-                ),
-            }
-            self.facts[PLACEMENT_RELEASE_KEY] = _memory_fact_entry(
-                release,
-                source="placement_release_pose_reached",
-            )
-            self.record("placement_release_ready", dict(release))
-            return True
-        if name != "gripper_control" or _successful_tool_call(action, name) is None:
+        if provenance.get("contact_geometry_invalidated_at_s"):
             return False
-        if _binary_gripper_position(parameters.get("position")) != 1:
-            return False
-        release = self.placement_release()
-        host_obligation = _action_host_obligation(action)
-        if (
-            not isinstance(release, dict)
-            and host_obligation.get("stage") == "placement_drop_detected"
-        ):
-            release = {
-                "schema_version": "openeta.placement_release.v1",
-                "status": "retreated",
-                "candidate_id": host_obligation.get("candidate_id"),
-                "placement_pose_id": host_obligation.get("placement_pose_id"),
-                "scene_epoch": self.scene_epoch(),
-                "release_mode": "detached_over_receptacle",
-                "released_at_s": time.time(),
-                "retreated_at_s": time.time(),
-            }
-            self.facts[PLACEMENT_RELEASE_KEY] = _memory_fact_entry(
-                release,
-                source="placement_drop_detected",
-            )
-            self._finalize_placement_subgoal(release)
-            self.record("placement_drop_completed", dict(release))
-            return True
-        if not isinstance(release, dict) or release.get("status") != "ready":
-            return False
-        release.update(
+        invalidated = dict(provenance)
+        invalidated.update(
             {
-                "status": "released",
-                "scene_epoch": self.scene_epoch(),
-                "released_at_s": time.time(),
+                "contact_geometry_invalidated_at_s": time.time(),
+                "contact_geometry_invalidated_by": reason,
             }
         )
-        self.facts[PLACEMENT_RELEASE_KEY] = _memory_fact_entry(
-            release,
-            source="placement_release_completed",
+        self.facts[GRASP_PROVENANCE_KEY] = _memory_fact_entry(
+            invalidated,
+            source="contact_geometry_evidence_invalidation",
         )
-        self._finalize_placement_subgoal(release)
-        self.record("placement_released", dict(release))
-        return True
-
-    def _capture_placement_release_denial(self, action: EnvAction) -> bool:
-        obligation = _action_host_obligation(action)
-        if obligation.get("stage") not in {"release", "placement_drop_detected"}:
-            return False
-        call = _tool_call(action, "gripper_control")
-        if not isinstance(call, dict) or not _call_has_diagnostic(
-            call,
-            "supervision_denied",
-        ):
-            return False
-        release = self.placement_release()
-        if not isinstance(release, dict) or release.get("status") != "ready":
-            return False
-        result = call.get("result")
-        reason = (
-            str(result.get("content") or "Independent reviewer denied placement release.")
-            if isinstance(result, dict)
-            else "Independent reviewer denied placement release."
-        )
-        release.update(
-            {
-                "status": "failed",
-                "failure_reason": reason,
-                "failed_at_s": time.time(),
-            }
-        )
-        self.facts[PLACEMENT_RELEASE_KEY] = _memory_fact_entry(
-            release,
-            source="placement_release_supervision_denied",
-        )
-        for key in (
-            PENDING_SAM3_SELECTION_KEY,
-            SELECTED_SAM3_DETECTION_KEY,
-            PENDING_REFERENCE_LOCALIZATION_KEY,
-            TARGET_ASSET_REFERENCE_KEY,
-            SAM3_NO_DETECTION_KEY,
-            GRASP_CANDIDATE_POLICY_KEY,
-            LEGACY_ANYGRASP_CANDIDATE_POLICY_KEY,
-            GRASP_LIFT_PROBE_KEY,
-            ARTICULATED_ATTACHMENT_PROBE_KEY,
-            GRASP_EXECUTION_KEY,
-            GRASP_ESTIMATION_RECOVERY_KEY,
-            ATTACHMENT_GATE_KEY,
-        ):
-            self.facts.pop(key, None)
-        for key in (
-            "anyplace_placement_candidates_latest",
-            "camera_pose_to_world_world_pose_latest",
-        ):
-            self.artifacts.pop(key, None)
         self.record(
-            "placement_release_failed",
+            "compiled_grasp_contact_geometry_invalidated",
             {
-                "candidate_id": release.get("candidate_id"),
-                "placement_pose_id": release.get("placement_pose_id"),
+                "compiled_grasp_id": invalidated.get("compiled_grasp_id"),
+                "evidence_id": invalidated.get("evidence_id"),
                 "reason": reason,
             },
         )
-        return True
-
-    def _finalize_placement_subgoal(self, release: JsonDict) -> None:
-        policy = self.grasp_candidate_policy() or {}
-        target = policy.get("target_detection")
-        target = target if isinstance(target, dict) else {}
-        completed = _memory_fact_value(self.facts.get(COMPLETED_PLACEMENT_SUBGOALS_KEY))
-        items = list(completed.get("items") or []) if isinstance(completed, dict) else []
-        items.append(
-            {
-                "candidate_id": release.get("candidate_id"),
-                "placement_pose_id": release.get("placement_pose_id"),
-                "target_object": target.get("target_prompt") or target.get("label"),
-                "release_mode": release.get("release_mode", "explicit_gripper_open"),
-                "completed_at_s": time.time(),
-            }
-        )
-        self.facts[COMPLETED_PLACEMENT_SUBGOALS_KEY] = _memory_fact_entry(
-            {"items": items[-16:]},
-            source="placement_subgoal_completed",
-        )
-        for key in (
-            PENDING_SAM3_SELECTION_KEY,
-            SELECTED_SAM3_DETECTION_KEY,
-            PENDING_REFERENCE_LOCALIZATION_KEY,
-            TARGET_ASSET_REFERENCE_KEY,
-            SAM3_NO_DETECTION_KEY,
-            GRASP_CANDIDATE_POLICY_KEY,
-            LEGACY_ANYGRASP_CANDIDATE_POLICY_KEY,
-            GRASP_LIFT_PROBE_KEY,
-            ARTICULATED_ATTACHMENT_PROBE_KEY,
-            GRASP_EXECUTION_KEY,
-            GRASP_ESTIMATION_RECOVERY_KEY,
-            ATTACHMENT_GATE_KEY,
-        ):
-            self.facts.pop(key, None)
-        for key in (
-            "anyplace_placement_candidates_latest",
-            "camera_pose_to_world_world_pose_latest",
-        ):
-            self.artifacts.pop(key, None)
-
-    def _advance_grasp_execution(self, action: EnvAction) -> bool:
-        execution = self.grasp_execution()
-        if not isinstance(execution, dict) or execution.get("status") != "required":
-            return False
-        stage = str(execution.get("stage") or "")
-        required = execution.get("required_action")
-        if stage == "align":
-            return False
-        if stage == "probe":
-            articulated_probe = self.articulated_attachment_probe()
-            if isinstance(articulated_probe, dict):
-                if articulated_probe.get("status") == "completed":
-                    return self._advance_articulated_probe_to_attachment(execution)
-                return False
-            return self._advance_probe_to_attachment(execution)
-        if stage == "attachment":
-            gate = self.attachment_gate() or {}
-            verdict = str(gate.get("verdict") or "UNKNOWN").upper()
-            if execution.get("attachment_mode") == "articulated_handle":
-                actions = execution.get("attachment_actions")
-                fail_action = actions.get("fail") if isinstance(actions, dict) else None
-                if verdict == "PASS":
-                    self._complete_attachment_execution(
-                        execution,
-                        source="runtime_articulated_attachment_pass",
-                    )
-                    self.record(
-                        "articulated_attachment_confirmed",
-                        {
-                            "candidate_id": execution.get("candidate_id"),
-                            "scene_epoch": self.scene_epoch(),
-                        },
-                    )
-                    return True
-                if (
-                    verdict == "FAIL"
-                    and isinstance(fail_action, dict)
-                    and _action_matches(action, fail_action)
-                    and _successful_tool_call(action, str(fail_action.get("name") or ""))
-                    is not None
-                ):
-                    return False
-                return False
-            actions = execution.get("attachment_actions")
-            pass_action = actions.get("pass") if isinstance(actions, dict) else None
-            successful_pass_call = (
-                _successful_tool_call(action, str(pass_action.get("name") or ""))
-                if isinstance(pass_action, dict)
-                else None
-            )
-            if (
-                isinstance(pass_action, dict)
-                and _action_matches(action, pass_action)
-                and successful_pass_call is not None
-                and not _motion_call_rejects_candidate(successful_pass_call)
-            ):
-                gate.update(
-                    {
-                        "pass_action_attempt_count": int(
-                            gate.get("pass_action_attempt_count") or 0
-                        )
-                        + 1,
-                        "pass_action_completed": True,
-                        "pass_action_completed_at_s": time.time(),
-                    }
-                )
-                self.facts[ATTACHMENT_GATE_KEY] = _memory_fact_entry(
-                    gate,
-                    source="runtime_attachment_full_lift",
-                )
-                self.record(
-                    "attachment_full_lift_completed",
-                    {
-                        "candidate_id": execution.get("candidate_id"),
-                        "verdict": verdict,
-                        "attempt_count": gate["pass_action_attempt_count"],
-                    },
-                )
-            selected = actions.get(verdict.lower()) if isinstance(actions, dict) else None
-            if not isinstance(selected, dict) or not _action_matches(action, selected):
-                return bool(gate.get("pass_action_completed"))
-            if _successful_tool_call(action, str(selected.get("name") or "")) is None:
-                return False
-            if verdict == "PASS":
-                self._complete_attachment_execution(
-                    execution,
-                    source="runtime_attachment_pass",
-                )
-                return True
-            return False
-        if not isinstance(required, dict) or not _grasp_stage_action_matches(
-            action,
-            required,
-            stage=stage,
-        ):
-            return False
-        name = str(required.get("name") or "")
-        successful_call = _successful_tool_call(action, name)
-        if successful_call is None:
-            return False
-        if name in {"move_to", "follow_eef_trajectory"} and _motion_call_rejects_candidate(
-            successful_call
-        ):
-            return False
-
-        compiled = execution.get("compiled_grasp")
-        compiled = compiled if isinstance(compiled, dict) else {}
-        if stage == "open":
-            hover = compiled.get("hover_pose")
-            if not isinstance(hover, dict):
-                return False
-            execution.update(
-                {
-                    "stage": "hover",
-                    "scene_epoch": self.scene_epoch(),
-                    "required_action": {
-                        "name": "move_to",
-                        "parameters": {"target_pose": _pose_for_epoch(hover, self.scene_epoch())},
-                    },
-                }
-            )
-        elif stage == "hover":
-            execution.update(
-                {
-                    "stage": "align",
-                    "scene_epoch": self.scene_epoch(),
-                    "required_action": None,
-                    "required_tool": "compute_wrist_alignment",
-                }
-            )
-        elif stage == "align_move":
-            contact = execution.get("adjusted_contact_pose")
-            if not isinstance(contact, dict):
-                return False
-            precontact = execution.get("adjusted_precontact_pose")
-            if isinstance(precontact, dict):
-                next_stage = "precontact"
-                next_pose = precontact
-            else:
-                next_stage = "descend"
-                next_pose = contact
-            execution.update(
-                {
-                    "stage": next_stage,
-                    "scene_epoch": self.scene_epoch(),
-                    "required_action": {
-                        "name": "move_to",
-                        "parameters": {
-                            "target_pose": _pose_for_epoch(next_pose, self.scene_epoch())
-                        },
-                    },
-                }
-            )
-        elif stage == "precontact":
-            contact = execution.get("adjusted_contact_pose")
-            if not isinstance(contact, dict):
-                return False
-            execution.update(
-                {
-                    "stage": "descend",
-                    "scene_epoch": self.scene_epoch(),
-                    "required_action": {
-                        "name": "move_to",
-                        "parameters": {
-                            "target_pose": _pose_for_epoch(contact, self.scene_epoch())
-                        },
-                    },
-                }
-            )
-        elif stage == "descend":
-            self._mark_active_candidate_accepted(source="compiled_contact_reached")
-            execution.update(
-                {
-                    "stage": "close",
-                    "scene_epoch": self.scene_epoch(),
-                    "required_action": {
-                        "name": "gripper_control",
-                        "parameters": {"position": 0},
-                    },
-                }
-            )
-        elif stage == "close":
-            policy = self.grasp_candidate_policy() or {}
-            articulated = policy.get("interaction_family") == "articulated_handle"
-            execution.update(
-                {
-                    "stage": "prepare_probe" if articulated else "probe",
-                    "scene_epoch": self.scene_epoch(),
-                    "required_action": None,
-                    "probe_kind": (
-                        "articulated_attachment" if articulated else "grasp_lift"
-                    ),
-                }
-            )
-        else:
-            return False
-        execution.pop("required_tool", None)
-        if execution.get("stage") == "align":
-            execution["required_tool"] = "compute_wrist_alignment"
-        self.facts[GRASP_EXECUTION_KEY] = _memory_fact_entry(
-            execution,
-            source="runtime_grasp_transition",
-        )
-        self.record(
-            "grasp_execution_transition",
-            {
-                "candidate_id": execution.get("candidate_id"),
-                "completed_stage": stage,
-                "next_stage": execution.get("stage"),
-                "scene_epoch": self.scene_epoch(),
-            },
-        )
-        return True
-
-    def _advance_probe_to_attachment(self, execution: JsonDict) -> bool:
-        probe = self.grasp_lift_probe()
-        if not isinstance(probe, dict) or probe.get("status") != "completed":
-            return False
-        target = ((probe.get("required_parameters") or {}).get("target_pose") or {}).get("xyz")
-        if not _finite_xyz(target):
-            return False
-        full_lift_pose = {
-            "frame": "world",
-            "xyz": [
-                float(target[0]),
-                float(target[1]),
-                float(target[2]) + GRASP_FULL_LIFT_DISTANCE_M,
-            ],
-            "source_grasp_id": execution.get("candidate_id"),
-            "compiled_grasp_id": execution.get("compiled_grasp_id"),
-            "grasp_stage": "full_lift",
-            "scene_epoch": self.scene_epoch(),
-        }
-        execution.update(
-            {
-                "stage": "attachment",
-                "scene_epoch": self.scene_epoch(),
-                "required_action": None,
-                "attachment_actions": {
-                    "pass": {"name": "move_to", "parameters": {"target_pose": full_lift_pose}},
-                    "fail": {"name": "gripper_control", "parameters": {"position": 1}},
-                },
-            }
-        )
-        self.facts[GRASP_EXECUTION_KEY] = _memory_fact_entry(
-            execution,
-            source="runtime_attachment_gate",
-        )
-        self.facts[ATTACHMENT_GATE_KEY] = _memory_fact_entry(
-            {
-                "status": "pending",
-                "verdict": "UNKNOWN",
-                "candidate_id": execution.get("candidate_id"),
-                "scene_epoch": self.scene_epoch(),
-            },
-            source="runtime_attachment_gate",
-        )
-        self.record(
-            "attachment_gate_required",
-            {
-                "candidate_id": execution.get("candidate_id"),
-                "scene_epoch": self.scene_epoch(),
-            },
-        )
-        return True
-
-    def _advance_articulated_probe_to_attachment(self, execution: JsonDict) -> bool:
-        probe = self.articulated_attachment_probe()
-        if (
-            not isinstance(probe, dict)
-            or probe.get("status") != "completed"
-            or str(probe.get("candidate_id") or "")
-            != str(execution.get("candidate_id") or "")
-        ):
-            return False
-        recovery_open = {"name": "gripper_control", "parameters": {"position": 1}}
-        execution.update(
-            {
-                "stage": "attachment",
-                "scene_epoch": self.scene_epoch(),
-                "required_action": None,
-                "attachment_mode": "articulated_handle",
-                "attachment_actions": {"fail": recovery_open},
-            }
-        )
-        self.facts[GRASP_EXECUTION_KEY] = _memory_fact_entry(
-            execution,
-            source="runtime_articulated_attachment_gate",
-        )
-        self.facts[ATTACHMENT_GATE_KEY] = _memory_fact_entry(
-            {
-                "status": "pending",
-                "verdict": "UNKNOWN",
-                "candidate_id": execution.get("candidate_id"),
-                "scene_epoch": self.scene_epoch(),
-                "attachment_mode": "articulated_handle",
-                "unknown_observation_count": 0,
-            },
-            source="runtime_articulated_attachment_gate",
-        )
-        self.record(
-            "attachment_gate_required",
-            {
-                "candidate_id": execution.get("candidate_id"),
-                "scene_epoch": self.scene_epoch(),
-                "attachment_mode": "articulated_handle",
-            },
-        )
-        return True
-
-    def _mark_active_candidate_accepted(self, *, source: str) -> bool:
-        policy = self.anygrasp_candidate_policy()
-        if not isinstance(policy, dict) or policy.get("status") != "active":
-            return False
-        active = policy.get("active_candidate")
-        if not isinstance(active, dict):
-            return False
-        policy.update(
-            {
-                "status": "accepted",
-                "accepted_candidate": dict(active),
-                "accepted_at_s": time.time(),
-            }
-        )
-        self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(policy, source=source)
-        self.record(
-            "anygrasp_candidate_accepted",
-            {
-                "result_id": policy.get("result_id"),
-                "candidate_id": active.get("id"),
-                "rank": policy.get("active_rank"),
-                "score": active.get("score"),
-                "source": source,
-            },
-        )
-        return True
-
-    def _capture_attachment_verdict(self, action: EnvAction) -> bool:
-        execution = self.grasp_execution()
-        if not isinstance(execution, dict) or execution.get("stage") != "attachment":
-            return False
-        if execution.get("attachment_mode") == "articulated_handle":
-            return False
-        outcome = _action_grasp_outcome(action)
-        if outcome not in {"pass", "fail", "unknown"}:
-            return False
-        candidate_id = str(execution.get("candidate_id") or "")
-        existing = self.attachment_gate() or {}
-        existing_verdict = str(existing.get("verdict") or "UNKNOWN").upper()
-        if (
-            outcome == "unknown"
-            and existing.get("status") == "resolved"
-            and existing_verdict in {"PASS", "FAIL"}
-        ):
-            return False
-        gate = {
-            **existing,
-            "status": "resolved" if outcome in {"pass", "fail"} else "pending",
-            "verdict": outcome.upper(),
-            "candidate_id": candidate_id,
-            "scene_epoch": self.scene_epoch(),
-            "evidence_source": "independent_action_reviewer",
-            "updated_at_s": time.time(),
-        }
-        self.facts[ATTACHMENT_GATE_KEY] = _memory_fact_entry(
-            gate,
-            source="independent_action_reviewer",
-        )
-        self.record("attachment_gate_verdict", dict(gate))
-        return True
-
-    def _capture_attachment_observation_verdict(
-        self,
-        observation: EnvObservation,
-    ) -> bool:
-        execution = self.grasp_execution()
-        if (
-            not isinstance(execution, dict)
-            or execution.get("status") != "required"
-            or execution.get("stage") != "attachment"
-        ):
-            return False
-        gate = self.attachment_gate()
-        if not isinstance(gate, dict):
-            return False
-        if execution.get("attachment_mode") == "articulated_handle":
-            command = self._latest_action_command()
-            request = command.get("request") if isinstance(command, dict) else None
-            if (
-                str(gate.get("verdict") or "UNKNOWN").upper() != "UNKNOWN"
-                or not isinstance(request, dict)
-                or request.get("name") != "observe"
-                or gate.get("refresh_required") is not True
-                or gate.get("unknown_refresh_completed") is True
-            ):
-                return False
-            gate.update(
-                {
-                    "unknown_refresh_completed": True,
-                    "refresh_required": False,
-                    "last_observed_scene_epoch": self.scene_epoch(),
-                    "last_observed_at_s": time.time(),
-                }
-            )
-            self.facts[ATTACHMENT_GATE_KEY] = _memory_fact_entry(
-                gate,
-                source="articulated_attachment_observation",
-            )
-            self.record(
-                "articulated_attachment_probe_verdict",
-                {
-                    "candidate_id": execution.get("candidate_id"),
-                    "verdict": "UNKNOWN",
-                    "refresh_completed": True,
-                    "scene_epoch": self.scene_epoch(),
-                },
-            )
-            return True
-        verdict, evidence = _gripper_attachment_evidence(
-            observation.robot.gripper_state,
-            command_state=self.gripper_command_state(),
-        )
-        if verdict not in {"PASS", "FAIL"}:
-            return False
-        gate.update(
-            {
-                "status": "resolved",
-                "verdict": verdict,
-                "scene_epoch": self.scene_epoch(),
-                "evidence_source": "gripper_observation",
-                "evidence": evidence,
-                "updated_at_s": time.time(),
-            }
-        )
-        self.facts[ATTACHMENT_GATE_KEY] = _memory_fact_entry(
-            gate,
-            source="gripper_observation",
-        )
-        self.record("attachment_gate_verdict", dict(gate))
-        if verdict == "PASS" and gate.get("pass_action_completed") is True:
-            self._complete_attachment_execution(
-                execution,
-                source="runtime_attachment_observation",
-            )
         return True
 
     def _capture_articulated_attachment_assessment(self, action: EnvAction) -> bool:
@@ -3967,59 +6978,33 @@ class AgentMemory:
             "openeta.articulated_attachment_assessment.v1"
         ):
             return False
-        execution = self.grasp_execution()
-        gate = self.attachment_gate()
-        if (
-            not isinstance(execution, dict)
-            or execution.get("stage") != "attachment"
-            or execution.get("attachment_mode") != "articulated_handle"
-            or not isinstance(gate, dict)
-        ):
+        probe = self.articulated_attachment_probe()
+        if not isinstance(probe, dict) or probe.get("status") != "completed":
             return False
-        if str(outputs.get("candidate_id") or "") != str(execution.get("candidate_id") or ""):
+        if str(outputs.get("probe_id") or "") != str(probe.get("probe_id") or ""):
+            return False
+        if str(outputs.get("candidate_id") or "") != str(probe.get("candidate_id") or ""):
             return False
         verdict = str(outputs.get("verdict") or "").upper()
         if verdict not in {"PASS", "FAIL", "UNKNOWN"}:
             return False
-        assessment_count = int(gate.get("assessment_count") or 0) + 1
-        gate.update(
-            {
-                "status": "resolved" if verdict in {"PASS", "FAIL"} else "pending",
-                "verdict": verdict,
-                "assessment_count": assessment_count,
-                "evidence_source": "independent_attachment_reviewer",
-                "assessment_reason": outputs.get("reason"),
-                "updated_at_s": time.time(),
-                "refresh_required": verdict == "UNKNOWN" and assessment_count == 1,
-            }
-        )
-        self.facts[ATTACHMENT_GATE_KEY] = _memory_fact_entry(
+        gate = {
+            "schema_version": "openeta.attachment_evidence.v1",
+            "probe_id": probe.get("probe_id"),
+            "compiled_grasp_id": probe.get("compiled_grasp_id"),
+            "candidate_id": probe.get("candidate_id"),
+            "object_scene_epoch": self.object_scene_epoch(),
+            "verdict": verdict,
+            "evidence_source": "independent_attachment_reviewer",
+            "assessment_reason": outputs.get("reason"),
+            "updated_at_s": time.time(),
+        }
+        self.facts[ATTACHMENT_EVIDENCE_KEY] = _memory_fact_entry(
             gate,
             source="independent_attachment_reviewer",
         )
         self.record("articulated_attachment_probe_verdict", dict(gate))
         return True
-
-    def _complete_attachment_execution(
-        self,
-        execution: JsonDict,
-        *,
-        source: str,
-    ) -> None:
-        execution.update(
-            {
-                "status": "completed",
-                "stage": "attached",
-                "scene_epoch": self.scene_epoch(),
-                "required_action": None,
-                "completed_at_s": time.time(),
-            }
-        )
-        self.facts[GRASP_EXECUTION_KEY] = _memory_fact_entry(execution, source=source)
-        self.record(
-            "grasp_attachment_confirmed",
-            {"candidate_id": execution.get("candidate_id"), "source": source},
-        )
 
     def _capture_motion_reconciliation(self, action: EnvAction) -> bool:
         command = action.command if isinstance(action.command, dict) else {}
@@ -4033,12 +7018,12 @@ class AgentMemory:
         outputs = _tool_call_outputs(call) if isinstance(call, dict) else {}
         if outputs.get("motion_outcome") != "unknown":
             return False
+        executed_parameters = _executed_tool_parameters(action, name)
         reconciliation = {
             "status": "required",
             "tool": name,
-            "intended_parameters": dict(request.get("parameters") or {}),
-            "candidate_id": _parameters_grasp_candidate_id(request.get("parameters") or {}),
-            "grasp_stage": (self.grasp_execution() or {}).get("stage"),
+            "intended_parameters": dict(executed_parameters),
+            "candidate_id": _parameters_grasp_candidate_id(executed_parameters),
             "scene_epoch": self.scene_epoch(),
             "created_at_s": time.time(),
         }
@@ -4068,8 +7053,9 @@ class AgentMemory:
                 requested_position, observation.robot.gripper_state
             )
             if verdict == "completed":
-                self.facts[SCENE_EPOCH_KEY] = _memory_fact_entry(
-                    {"epoch": self.scene_epoch() + 1},
+                self._advance_runtime_epochs(
+                    tool="gripper_control",
+                    object_scene_changed=False,
                     source="reconciled_world_mutation",
                 )
                 position = _binary_gripper_position(requested_position)
@@ -4078,7 +7064,6 @@ class AgentMemory:
                         position,
                         source="reconciled_gripper_command",
                     )
-                self._advance_reconciled_grasp_stage(str(reconciliation.get("grasp_stage") or ""))
             reconciliation.update(
                 {
                     "status": verdict,
@@ -4098,11 +7083,11 @@ class AgentMemory:
             observation_count = int(reconciliation.get("observation_count") or 0) + 1
             if distance <= max(0.005, tolerance):
                 verdict = "completed"
-                self.facts[SCENE_EPOCH_KEY] = _memory_fact_entry(
-                    {"epoch": self.scene_epoch() + 1},
+                self._advance_runtime_epochs(
+                    tool=tool_name or "move_to",
+                    object_scene_changed=False,
                     source="reconciled_world_mutation",
                 )
-                self._advance_reconciled_grasp_stage(str(reconciliation.get("grasp_stage") or ""))
             elif (
                 observation_count >= 3
                 and _finite_xyz(previous_measured_xyz)
@@ -4135,167 +7120,7 @@ class AgentMemory:
             source="same_handle_observation",
         )
         self.record("motion_reconciliation_result", dict(reconciliation))
-        if reconciliation.get("status") == "failed":
-            self._reject_candidate_after_failed_motion_reconciliation(reconciliation)
         return True
-
-    def _reject_candidate_after_failed_motion_reconciliation(
-        self,
-        reconciliation: JsonDict,
-    ) -> None:
-        policy = self.grasp_candidate_policy()
-        if not isinstance(policy, dict) or policy.get("status") != "active":
-            return
-        active = policy.get("active_candidate")
-        if not isinstance(active, dict):
-            return
-        candidate_id = str(reconciliation.get("candidate_id") or "")
-        if not candidate_id or candidate_id != str(active.get("id") or ""):
-            return
-        advanced = self._apply_anygrasp_candidate_rejection(
-            policy=policy,
-            active=active,
-            rejection={
-                "source": "reconciled_candidate_motion_rejected",
-                "target_tool": reconciliation.get("tool"),
-                "reason": "reconciled_target_not_reached",
-            },
-        )
-        if advanced:
-            self._schedule_grasp_recovery(
-                xyz=reconciliation.get("measured_eef_xyz"),
-                rejection={
-                    "source": "reconciled_candidate_motion_rejected",
-                    "target_tool": reconciliation.get("tool"),
-                    "reason": "reconciled_target_not_reached",
-                },
-                candidate_id=candidate_id,
-            )
-            self.facts.pop(GRASP_LIFT_PROBE_KEY, None)
-            self.facts.pop(ARTICULATED_ATTACHMENT_PROBE_KEY, None)
-            self.facts.pop(GRASP_EXECUTION_KEY, None)
-            self.facts.pop(ATTACHMENT_GATE_KEY, None)
-
-    def _advance_reconciled_grasp_stage(self, stage: str) -> None:
-        execution = self.grasp_execution()
-        if not isinstance(execution, dict) or execution.get("stage") != stage:
-            return
-        # Reconciliation commits only the already-generated deterministic edge.
-        if stage == "hover":
-            execution.update(
-                {
-                    "stage": "align",
-                    "required_action": None,
-                    "required_tool": "compute_wrist_alignment",
-                }
-            )
-        elif stage == "align_move":
-            contact = execution.get("adjusted_contact_pose")
-            if isinstance(contact, dict):
-                precontact = execution.get("adjusted_precontact_pose")
-                next_stage = "precontact" if isinstance(precontact, dict) else "descend"
-                next_pose = precontact if isinstance(precontact, dict) else contact
-                execution.update(
-                    {
-                        "stage": next_stage,
-                        "required_action": {
-                            "name": "move_to",
-                            "parameters": {
-                                "target_pose": _pose_for_epoch(next_pose, self.scene_epoch())
-                            },
-                        },
-                    }
-                )
-        elif stage == "precontact":
-            contact = execution.get("adjusted_contact_pose")
-            if isinstance(contact, dict):
-                execution.update(
-                    {
-                        "stage": "descend",
-                        "required_action": {
-                            "name": "move_to",
-                            "parameters": {
-                                "target_pose": _pose_for_epoch(contact, self.scene_epoch())
-                            },
-                        },
-                    }
-                )
-        elif stage == "descend":
-            self._mark_active_candidate_accepted(source="reconciled_contact_reached")
-            execution.update(
-                {
-                    "stage": "close",
-                    "required_action": {"name": "gripper_control", "parameters": {"position": 0}},
-                }
-            )
-        elif stage == "open":
-            compiled = execution.get("compiled_grasp")
-            hover = compiled.get("hover_pose") if isinstance(compiled, dict) else None
-            if isinstance(hover, dict):
-                execution.update(
-                    {
-                        "stage": "hover",
-                        "required_action": {
-                            "name": "move_to",
-                            "parameters": {
-                                "target_pose": _pose_for_epoch(hover, self.scene_epoch())
-                            },
-                        },
-                    }
-                )
-        elif stage == "close":
-            policy = self.grasp_candidate_policy() or {}
-            articulated = policy.get("interaction_family") == "articulated_handle"
-            execution.update(
-                {
-                    "stage": "prepare_probe" if articulated else "probe",
-                    "required_action": None,
-                    "probe_kind": (
-                        "articulated_attachment" if articulated else "grasp_lift"
-                    ),
-                }
-            )
-        elif stage == "probe":
-            articulated_probe = self.articulated_attachment_probe()
-            if isinstance(articulated_probe, dict):
-                articulated_probe.update(
-                    {
-                        "status": "completed",
-                        "completed_at_s": time.time(),
-                        "last_attempt_status": "reconciled",
-                    }
-                )
-                self.facts[ARTICULATED_ATTACHMENT_PROBE_KEY] = _memory_fact_entry(
-                    articulated_probe,
-                    source="motion_reconciliation",
-                )
-                self.record(
-                    "articulated_attachment_probe_completed",
-                    dict(articulated_probe),
-                )
-                self._advance_articulated_probe_to_attachment(execution)
-                return
-            probe = self.grasp_lift_probe()
-            if isinstance(probe, dict):
-                probe.update(
-                    {
-                        "status": "completed",
-                        "completed_at_s": time.time(),
-                        "last_attempt_status": "reconciled",
-                    }
-                )
-                self.facts[GRASP_LIFT_PROBE_KEY] = _memory_fact_entry(
-                    probe,
-                    source="motion_reconciliation",
-                )
-                self.record("grasp_lift_probe_reconciled", dict(probe))
-                self._advance_probe_to_attachment(execution)
-                return
-        execution["scene_epoch"] = self.scene_epoch()
-        self.facts[GRASP_EXECUTION_KEY] = _memory_fact_entry(
-            execution,
-            source="motion_reconciliation",
-        )
 
     def _append_transition_ledger(self, action: EnvAction) -> None:
         command = action.command if isinstance(action.command, dict) else {}
@@ -4303,6 +7128,7 @@ class AgentMemory:
         request = request if isinstance(request, dict) else {}
         name = str(request.get("name") or "")
         call = _tool_call(action, name)
+        executed_parameters = _executed_tool_parameters(action, name)
         row = {
             "index": len(self.transition_ledger()),
             "timestamp_s": time.time(),
@@ -4311,11 +7137,10 @@ class AgentMemory:
             "effect": "world_mutating"
             if name in {"move_to", "gripper_control", "follow_eef_trajectory"}
             else "other",
-            "grasp_stage": (self.grasp_execution() or {}).get("stage"),
-            "candidate_id": _parameters_grasp_candidate_id(request.get("parameters") or {}),
+            "candidate_id": _parameters_grasp_candidate_id(executed_parameters),
             "verdict": _transition_call_verdict(call),
         }
-        rows = [*self.transition_ledger(), row][-TRANSITION_LEDGER_LIMIT:]
+        rows = [*self.transition_ledger(), row]
         self.facts[TRANSITION_LEDGER_KEY] = _memory_fact_entry(
             {"rows": rows},
             source="runtime_transition_ledger",
@@ -4360,165 +7185,16 @@ class AgentMemory:
             }
         )
         self.facts[TRANSITION_LEDGER_KEY] = _memory_fact_entry(
-            {"rows": rows[-TRANSITION_LEDGER_LIMIT:]},
+            {"rows": rows},
             source="runtime_transition_ledger",
         )
         self._save_working_memory()
-
-    def _capture_grasp_lift_probe_obligation(
-        self,
-        observation: EnvObservation,
-    ) -> bool:
-        policy = self.anygrasp_candidate_policy()
-        if not isinstance(policy, dict) or str(policy.get("status") or "") != "accepted":
-            return False
-        if policy.get("interaction_family") == "articulated_handle":
-            return False
-        active = policy.get("active_candidate")
-        if not isinstance(active, dict):
-            return False
-        candidate_id = str(active.get("id") or "")
-        if not candidate_id:
-            return False
-        existing = self.grasp_lift_probe()
-        if isinstance(existing, dict) and str(existing.get("candidate_id") or "") == candidate_id:
-            return False
-        command = self._latest_action_command()
-        if not _successful_gripper_close_command(command):
-            return False
-        pose = observation.robot.end_effector_pose
-        xyz = pose.get("xyz") if isinstance(pose, dict) else None
-        if not _finite_xyz(xyz):
-            return False
-        start_xyz = [float(value) for value in xyz[:3]]
-        target_xyz = [start_xyz[0], start_xyz[1], start_xyz[2] + GRASP_LIFT_PROBE_DISTANCE_M]
-        probe = {
-            "status": "required",
-            "candidate_id": candidate_id,
-            "distance_m": GRASP_LIFT_PROBE_DISTANCE_M,
-            "start_eef_xyz": start_xyz,
-            "required_parameters": {
-                "target_pose": {
-                    "frame": "world",
-                    "xyz": target_xyz,
-                    "probe_type": "grasp_lift",
-                    "source_grasp_id": candidate_id,
-                }
-            },
-            "created_at_s": time.time(),
-        }
-        self.facts[GRASP_LIFT_PROBE_KEY] = _memory_fact_entry(
-            probe,
-            source="runtime_grasp_lift_probe",
-        )
-        self.record("grasp_lift_probe_required", dict(probe))
-        return True
-
-    def _capture_grasp_lift_probe_result(self, action: EnvAction) -> bool:
-        probe = self.grasp_lift_probe()
-        if not isinstance(probe, dict) or str(probe.get("status") or "") != "required":
-            return False
-        command = action.command if isinstance(action.command, dict) else {}
-        request = command.get("request")
-        if not isinstance(request, dict) or str(request.get("name") or "") != "move_to":
-            return False
-        parameters = request.get("parameters")
-        required = probe.get("required_parameters")
-        if not isinstance(parameters, dict) or parameters != required:
-            return False
-        move_call = next(
-            (
-                call
-                for call in command.get("tool_calls", []) or []
-                if isinstance(call, dict) and str(call.get("name") or "") == "move_to"
-            ),
-            None,
-        )
-        probe["attempt_count"] = int(probe.get("attempt_count") or 0) + 1
-        if (
-            not isinstance(move_call, dict)
-            or not _call_result_success(move_call)
-            or _motion_call_rejects_candidate(move_call)
-        ):
-            probe["last_attempt_status"] = "failed"
-            self.facts[GRASP_LIFT_PROBE_KEY] = _memory_fact_entry(
-                probe,
-                source="runtime_grasp_lift_probe",
-            )
-            self.record(
-                "grasp_lift_probe_failed",
-                {
-                    "candidate_id": probe.get("candidate_id"),
-                    "attempt_count": probe["attempt_count"],
-                },
-            )
-            return True
-        probe.update(
-            {
-                "status": "completed",
-                "completed_at_s": time.time(),
-                "last_attempt_status": "executed",
-            }
-        )
-        self.facts[GRASP_LIFT_PROBE_KEY] = _memory_fact_entry(
-            probe,
-            source="runtime_grasp_lift_probe",
-        )
-        self.record("grasp_lift_probe_completed", dict(probe))
-        return True
-
-    def _latest_action_command(self) -> JsonDict:
-        for event in reversed(self.events[:-1]):
-            if event.event_type == "action":
-                command = event.payload.get("command")
-                return dict(command) if isinstance(command, dict) else {}
-            if event.event_type in {"observation", "episode_start"}:
-                break
-        return {}
-
-    def _accept_anygrasp_candidate_after_motion(self, action: EnvAction) -> bool:
-        execution = self.grasp_execution()
-        if isinstance(execution, dict) and execution.get("status") == "required":
-            return False
-        policy = self.anygrasp_candidate_policy()
-        if policy is None or str(policy.get("status") or "") != "active":
-            return False
-        active = policy.get("active_candidate")
-        if not isinstance(active, dict):
-            return False
-        if not _candidate_linked_motion_succeeded(
-            action,
-            active_candidate_id=str(active.get("id") or ""),
-            artifacts=self.artifacts,
-        ):
-            return False
-        policy.update(
-            {
-                "status": "accepted",
-                "accepted_candidate": dict(active),
-                "accepted_at_s": time.time(),
-            }
-        )
-        source_tool = str(policy.get("source_tool") or "anygrasp")
-        self.facts[GRASP_CANDIDATE_POLICY_KEY] = _memory_fact_entry(
-            policy,
-            source=f"{source_tool}_motion_accepted",
-        )
-        self.record(
-            f"{source_tool}_candidate_accepted",
-            {
-                "result_id": policy.get("result_id"),
-                "candidate_id": active.get("id"),
-                "rank": policy.get("active_rank"),
-                "score": active.get("score"),
-            },
-        )
-        return True
 
     def delete_memory(self, key: str, *, namespace: str = "all") -> JsonDict:
         deleted: JsonDict = {}
         if namespace in {"all", "facts"}:
             deleted["facts"] = self.facts.pop(key, None) is not None
+            self.agent_working_state.pop(key, None)
         if namespace in {"all", "artifacts"}:
             deleted["artifacts"] = self.artifacts.pop(key, None) is not None
         if namespace in {"all", "skill_notes"}:
@@ -4531,6 +7207,7 @@ class AgentMemory:
         """Clear persisted working memory without deleting session trace files."""
 
         self.facts.clear()
+        self.agent_working_state.clear()
         self.artifacts.clear()
         self.skill_notes.clear()
         self.compact_summary = ""
@@ -4545,6 +7222,7 @@ class AgentMemory:
             f"task={self.task}",
             f"current_user_request={self.current_user_request}",
             f"facts={list(self.facts)}",
+            f"agent_working_state={list(self.agent_working_state)}",
             f"artifacts={list(self.artifacts)}",
             f"skill_notes={list(self.skill_notes)}",
             "recent_events=" + ",".join(event.event_type for event in recent),
@@ -4557,7 +7235,9 @@ class AgentMemory:
         self._save_working_memory()
         return self.compact_summary
 
-    def recent_events(self, limit: int = 8) -> list[MemoryEvent]:
+    def recent_events(self, limit: int | None = 8) -> list[MemoryEvent]:
+        if limit is None:
+            return list(self.events)
         if limit <= 0:
             return []
         return self.events[-limit:]
@@ -4605,7 +7285,7 @@ class AgentMemory:
             return interaction
         return None
 
-    def planning_context(self, *, max_events: int = 8) -> JsonDict:
+    def planning_context(self, *, max_events: int | None = 8) -> JsonDict:
         """Return compact context suitable for a planner prompt or policy."""
 
         return {
@@ -4616,28 +7296,44 @@ class AgentMemory:
             "active_environment_task": self.active_environment_task(),
             "conversation": self.conversation.planning_context(max_items=0),
             "metadata": self.metadata,
-            "selection_obligation": self.pending_sam3_selection(),
+            "pending_target_selection": self.pending_sam3_selection(),
             "selected_sam3_detection": self.selected_sam3_detection(),
-            "reference_localization_obligation": self.pending_reference_localization(),
+            "selected_sam3_detections": self.selected_sam3_detections(),
+            "pending_reference_localization": self.pending_reference_localization(),
             "target_asset_reference": self.target_asset_reference(),
+            "target_identity_anchor": self.target_identity_anchor(),
             "reference_localization_failure": self.reference_localization_failure(),
+            "tool_health": self.tool_health(),
             "sam3_no_detection": self.sam3_no_detection(),
-            "grasp_candidate_policy": self.anygrasp_candidate_policy(),
-            "retained_targeted_grasp": self.retained_targeted_grasp(),
-            "grasp_lift_probe": self.grasp_lift_probe(),
+            "sam3_no_detections": self.sam3_no_detections(),
+            "retained_targeted_grasp": (
+                self.retained_targeted_grasp()
+            ),
+            "provenance_evidence_graph": self.provenance_evidence_graph(),
+            "grasp_adjustment_budget": self.grasp_adjustment_budget(),
+            "grasp_input_bundle": self.grasp_input_bundle(),
+            "wrist_alignment_bundle": self.wrist_alignment_bundle(),
+            "anyplace_input_bundle": self.anyplace_input_bundle(),
             "articulated_attachment_probe": self.articulated_attachment_probe(),
-            "grasp_execution": self.grasp_execution(),
-            "grasp_recovery": self.grasp_recovery(),
-            "grasp_estimation_recovery": self.grasp_estimation_recovery(),
             "gripper_command_state": self.gripper_command_state(),
-            "attachment_gate": self.attachment_gate(),
-            "placement_release": self.placement_release(),
+            "attachment_evidence": self.attachment_evidence(),
+            "placement_world_reference": self.placement_world_reference(),
             "motion_reconciliation": self.motion_reconciliation(),
+            "ik_preview_receipts": self.ik_preview_receipts(),
+            "controller_capabilities": self.controller_capabilities(),
             "scene_epoch": self.scene_epoch(),
-            "transition_ledger": self.transition_ledger()[-12:],
+            "object_scene_epoch": self.object_scene_epoch(),
+            "robot_motion_epoch": self.robot_motion_epoch(),
+            "transition_ledger": self.transition_ledger(),
+            "latest_compiled_clearance_execution": (
+                self.latest_compiled_clearance_execution()
+            ),
+            "latest_compiled_contact_execution": self.latest_compiled_contact_execution(),
             "latest_environment_receipt": self.latest_environment_receipt(),
+            "world_evidence": self.world_evidence_context(),
             "latest_human_interaction": self.latest_human_interaction(),
             "latest_guidance_interaction": self.latest_guidance_interaction(),
+            "agent_working_state": dict(self.agent_working_state),
             "working_memory": {
                 "facts": {
                     key: value
@@ -4646,24 +7342,32 @@ class AgentMemory:
                     not in {
                         PENDING_SAM3_SELECTION_KEY,
                         SELECTED_SAM3_DETECTION_KEY,
+                        SELECTED_SAM3_DETECTIONS_KEY,
                         PENDING_REFERENCE_LOCALIZATION_KEY,
                         REFERENCE_LOCALIZATION_FAILURE_KEY,
+                        TOOL_HEALTH_KEY,
                         TARGET_ASSET_REFERENCE_KEY,
+                        TARGET_IDENTITY_ANCHOR_KEY,
                         SAM3_NO_DETECTION_KEY,
-                        GRASP_CANDIDATE_POLICY_KEY,
-                        LEGACY_ANYGRASP_CANDIDATE_POLICY_KEY,
-                        GRASP_LIFT_PROBE_KEY,
+                        SAM3_NO_DETECTIONS_KEY,
                         ARTICULATED_ATTACHMENT_PROBE_KEY,
-                        GRASP_EXECUTION_KEY,
-                        GRASP_RECOVERY_KEY,
-                        GRASP_ESTIMATION_RECOVERY_KEY,
                         GRIPPER_COMMAND_STATE_KEY,
-                        ATTACHMENT_GATE_KEY,
-                        PLACEMENT_RELEASE_KEY,
+                        ATTACHMENT_EVIDENCE_KEY,
+                        PLACEMENT_WORLD_REFERENCE_KEY,
                         MOTION_RECONCILIATION_KEY,
+                        IK_PREVIEW_RECEIPTS_KEY,
+                        OBSERVED_OBJECT_SCENE_CHANGE_KEY,
                         SCENE_EPOCH_KEY,
+                        OBJECT_SCENE_EPOCH_KEY,
+                        ROBOT_MOTION_EPOCH_KEY,
+                        GRASP_PROVENANCE_KEY,
+                        GRASP_INPUT_BUNDLES_KEY,
+                        WRIST_ALIGNMENT_BUNDLES_KEY,
+                        ANYPLACE_INPUT_BUNDLES_KEY,
                         TRANSITION_LEDGER_KEY,
                         ACTIVE_ENVIRONMENT_TASK_KEY,
+                        LATEST_COMPILED_CLEARANCE_EXECUTION_KEY,
+                        LATEST_COMPILED_CONTACT_EXECUTION_KEY,
                     }
                 },
                 "artifacts": {
@@ -4687,10 +7391,28 @@ class AgentMemory:
             return
         memory = self.store.load_working_memory()
         facts = memory.get("facts", {})
+        agent_working_state = memory.get("agent_working_state", {})
         artifacts = memory.get("artifacts", {})
         skill_notes = memory.get("skill_notes", {})
+        removed_task_policy_entries: list[str] = []
         if isinstance(facts, dict):
             self.facts = dict(facts)
+            removed_task_policy_entries.extend(purge_removed_task_policy_facts(self.facts))
+        if isinstance(agent_working_state, dict) and agent_working_state:
+            self.agent_working_state = dict(agent_working_state)
+            removed_task_policy_entries.extend(
+                purge_removed_task_policy_facts(self.agent_working_state)
+            )
+        else:
+            self.agent_working_state = {
+                str(key): {
+                    **dict(entry),
+                    "ownership": "agent",
+                    "freshness": "agent_managed",
+                }
+                for key, entry in self.facts.items()
+                if isinstance(entry, dict) and entry.get("source") == "save_memory"
+            }
         if isinstance(artifacts, dict):
             self.artifacts = dict(artifacts)
         if isinstance(skill_notes, dict):
@@ -4699,11 +7421,21 @@ class AgentMemory:
                 for skill, notes in skill_notes.items()
             }
         self.compact_summary = str(memory.get("compact_summary", ""))
+        if removed_task_policy_entries:
+            self._save_working_memory()
 
-    def model_conversation_messages(self) -> list[JsonDict]:
+    def model_conversation_messages(
+        self,
+        *,
+        max_message_chars: int | None = None,
+        max_action_groups: int | None = None,
+    ) -> list[JsonDict]:
         """Return canonical chat messages in provider-compatible form."""
 
-        return self.conversation.model_messages()
+        return self.conversation.model_messages(
+            max_message_chars=max_message_chars,
+            max_action_groups=max_action_groups,
+        )
 
     def conversation_checkpoint_summary(self) -> str:
         summary = self.conversation.checkpoint.get("summary")
@@ -4743,327 +7475,6 @@ class AgentMemory:
             self.store.save_working_memory(self)
 
 
-def _grasp_candidate_sort_key(candidate: JsonDict) -> tuple[float, int]:
-    try:
-        score = float(candidate.get("score"))
-    except (TypeError, ValueError):
-        score = float("-inf")
-    try:
-        rank = int(candidate.get("rank"))
-    except (TypeError, ValueError):
-        rank = 1_000_000
-    return (-score, rank)
-
-
-def _normalize_grasp_geometry_family(value: object) -> str:
-    family = str(value or "").strip().lower()
-    return "articulated_handle" if family == "drawer_handle" else family
-
-
-def _active_task_text(memory: AgentMemory) -> str:
-    active = memory.active_environment_task()
-    task = active.get("task") if isinstance(active, dict) else None
-    if isinstance(task, str) and task.strip():
-        return task.strip()
-    return str(memory.current_user_request or memory.task or "").strip()
-
-
-def _articulated_handle_candidate_policy(
-    *,
-    candidates: list[JsonDict],
-    selected_target: JsonDict,
-    task: str,
-    source_tool: str,
-    source_rgb: str,
-    source_mask: str,
-    camera_frame_id: str,
-    scene_epoch: int,
-    camera_extrinsics: JsonDict | None,
-) -> JsonDict | None:
-    """Build host-owned mode queues only for a current targeted handle grasp."""
-
-    if source_tool not in {"grasp_pose_estimate", "anygrasp"} or not candidates:
-        return None
-    if not camera_frame_id or not isinstance(camera_extrinsics, dict):
-        return None
-    try:
-        selected_epoch = int(selected_target.get("scene_epoch"))
-    except (TypeError, ValueError):
-        return None
-    if selected_epoch != scene_epoch:
-        return None
-    selected_image = str(selected_target.get("source_image") or "")
-    selected_mask = str(selected_target.get("mask_ref") or "")
-    if not selected_image or not source_rgb or not _same_local_file(selected_image, source_rgb):
-        return None
-    if not selected_mask or not source_mask or selected_mask != source_mask:
-        return None
-    geometry_family = _normalize_grasp_geometry_family(
-        selected_target.get("target_geometry_family")
-    )
-    target_is_handle = _selected_target_is_handle(selected_target)
-    if _selected_target_is_non_articulated_handle(selected_target):
-        return None
-    if geometry_family != "articulated_handle" and not (
-        _is_articulated_container_task(task) and target_is_handle
-    ):
-        return None
-    try:
-        from agent.tools.grasp_geometry import (
-            GraspGeometryError,
-            camera_optical_forward_world,
-            grasp_candidate_approach_world,
-        )
-
-        optical_forward = camera_optical_forward_world(camera_extrinsics)
-        grouped: dict[str, list[JsonDict]] = {
-            mode: [] for mode in ARTICULATED_HANDLE_APPROACH_MODES
-        }
-        for candidate in candidates:
-            approach_world = grasp_candidate_approach_world(candidate, camera_extrinsics)
-            mode = _classify_articulated_handle_approach(
-                approach_world,
-                optical_forward_world=optical_forward,
-            )
-            candidate["approach_mode"] = mode
-            candidate["native_approach_world_xyz"] = [
-                round(float(value), 6) for value in approach_world
-            ]
-            grouped[mode].append(candidate)
-    except (TypeError, ValueError, GraspGeometryError):
-        return None
-    ordered_modes = [mode for mode in ARTICULATED_HANDLE_APPROACH_MODES if grouped[mode]]
-    if not ordered_modes:
-        return None
-    active_mode = ordered_modes[0]
-    active_candidates = grouped[active_mode]
-    active = dict(active_candidates[0])
-    return {
-        "interaction_family": "articulated_handle",
-        "normalized_target_geometry_family": "articulated_handle",
-        "approach_mode_order": ordered_modes,
-        "approach_mode_queues": {
-            mode: [str(candidate.get("id")) for candidate in grouped[mode]]
-            for mode in ordered_modes
-        },
-        "active_approach_mode": active_mode,
-        "active_mode_rank": 0,
-        "active_rank": int(active.get("rank") or 0),
-        "active_candidate": active,
-        "remaining_candidate_ids": [
-            str(candidate.get("id")) for candidate in active_candidates[1:]
-        ],
-        "candidate_attempt_count": 0,
-        "mode_attempt_count": 0,
-        "mode_max_candidate_attempts": GRASP_CANDIDATE_MAX_ATTEMPTS,
-        "compile_hints": {
-            "target_geometry_family": "articulated_handle",
-            "approach_mode": active_mode,
-            "strategy_id": _articulated_handle_strategy_id(active_mode),
-        },
-        "approach_classification": {
-            "camera_frame_id": camera_frame_id,
-            "scene_epoch": scene_epoch,
-            "method": "world_approach_with_matching_camera_extrinsics",
-        },
-    }
-
-
-def _classify_articulated_handle_approach(
-    approach_world: list[float],
-    *,
-    optical_forward_world: list[float],
-) -> str:
-    downward_alignment = -float(approach_world[2])
-    front_alignment = abs(
-        sum(
-            float(approach_world[index]) * float(optical_forward_world[index])
-            for index in range(3)
-        )
-    )
-    if downward_alignment >= 0.5:
-        return "top_down"
-    if front_alignment >= 0.5:
-        return "front"
-    return "side"
-
-
-def _selected_target_is_handle(selected_target: JsonDict) -> bool:
-    values = [
-        selected_target.get("target_prompt"),
-        selected_target.get("label"),
-        selected_target.get("class_name"),
-        selected_target.get("name"),
-    ]
-    return any(
-        any(
-            token == "handle" or token.endswith("_handle")
-            for token in _grasp_word_tokens(str(value or ""))
-        )
-        for value in values
-    )
-
-
-def _selected_target_is_non_articulated_handle(selected_target: JsonDict) -> bool:
-    values = " ".join(
-        str(selected_target.get(field) or "")
-        for field in ("target_prompt", "label", "class_name", "name")
-    )
-    tokens = set(_grasp_word_tokens(values))
-    portable_handles = {
-        "mug",
-        "cup",
-        "basket",
-        "bucket",
-        "bag",
-        "suitcase",
-        "pan",
-        "pot",
-    }
-    non_handle_controls = {"button", "knob", "dial", "lever", "switch"}
-    return bool(tokens & portable_handles) or bool(tokens & non_handle_controls)
-
-
-def _is_articulated_container_task(task: str) -> bool:
-    tokens = set(_grasp_word_tokens(task))
-    containers = {
-        "drawer",
-        "drawers",
-        "microwave",
-        "cabinet",
-        "cupboard",
-        "fridge",
-        "refrigerator",
-        "door",
-    }
-    if not tokens & containers:
-        return False
-    explicit_interaction = bool(tokens & {"open", "pull"})
-    interior_access = bool(tokens & {"in", "inside", "into", "interior"})
-    return explicit_interaction or interior_access
-
-
-def _grasp_word_tokens(text: str) -> list[str]:
-    return re.findall(r"[a-zA-Z0-9_]+", text.lower())
-
-
-def _same_local_file(left: str, right: str) -> bool:
-    if left == right:
-        return True
-    try:
-        left_path = Path(left)
-        right_path = Path(right)
-        if not left_path.is_file() or not right_path.is_file():
-            return False
-        if left_path.stat().st_size != right_path.stat().st_size:
-            return False
-        return left_path.read_bytes() == right_path.read_bytes()
-    except OSError:
-        return False
-
-
-def _articulated_handle_strategy_id(approach_mode: str) -> str:
-    return {
-        "top_down": "top-down-drawer-handle-panda-p8",
-        "front": "native-front-articulated-handle-panda-p8",
-        "side": "native-side-articulated-handle-panda-p8",
-    }[approach_mode]
-
-
-def _highest_refinable_candidate(policy: JsonDict) -> JsonDict | None:
-    candidates = policy.get("candidates")
-    rejected = policy.get("rejected_candidates")
-    if not isinstance(candidates, list) or not isinstance(rejected, list):
-        return None
-    refinable_ids = {
-        str(item.get("candidate_id") or "")
-        for item in rejected
-        if isinstance(item, dict)
-        and str(item.get("recovery_class") or "")
-        in {"perception_refinable", "uncertain_review"}
-    }
-    eligible = [
-        dict(candidate)
-        for candidate in candidates
-        if isinstance(candidate, dict) and str(candidate.get("id") or "") in refinable_ids
-    ]
-    return min(eligible, key=_grasp_candidate_sort_key) if eligible else None
-
-
-def _policy_grasp_source(policy: JsonDict) -> JsonDict:
-    source = policy.get("grasp_source")
-    if isinstance(source, dict):
-        return dict(source)
-    return {
-        "mode": "targeted",
-        "rgb": policy.get("source_rgb"),
-        "depth": policy.get("source_depth"),
-        "camera_frame_id": policy.get("camera_frame_id"),
-    }
-
-
-def _append_refinable_fallback_candidate(
-    candidates: list[JsonDict],
-    entry: JsonDict,
-) -> None:
-    candidate = entry.get("candidate")
-    if not isinstance(candidate, dict):
-        return
-    identity = (
-        str(entry.get("source_result_id") or ""),
-        str(candidate.get("id") or ""),
-    )
-    for item in candidates:
-        stored = item.get("candidate")
-        stored_identity = (
-            str(item.get("source_result_id") or ""),
-            str(stored.get("id") or "") if isinstance(stored, dict) else "",
-        )
-        if stored_identity == identity:
-            return
-    candidates.append(dict(entry))
-
-
-def _candidate_fits_gripper(
-    candidate: JsonDict,
-    *,
-    max_gripper_width_m: float,
-) -> bool:
-    try:
-        width = float(candidate.get("width"))
-    except (TypeError, ValueError):
-        return False
-    return math.isfinite(width) and 0.0 < width <= max_gripper_width_m
-
-
-def _policy_max_gripper_width(policy: JsonDict, *, default: float) -> float:
-    try:
-        value = float(policy.get("physical_width_limit_m"))
-    except (TypeError, ValueError):
-        return default
-    return value if math.isfinite(value) and 0.0 < value <= 0.2 else default
-
-
-def _fallback_candidate_capabilities(
-    entry: JsonDict,
-    *,
-    default: JsonDict,
-) -> JsonDict:
-    capabilities = entry.get("grasp_calibration")
-    capabilities = dict(capabilities) if isinstance(capabilities, dict) else {}
-    max_width = _policy_max_gripper_width(
-        {"physical_width_limit_m": capabilities.get("max_gripper_width_m")},
-        default=float(default["max_gripper_width_m"]),
-    )
-    return {
-        "calibration_id": str(
-            capabilities.get("calibration_id") or default.get("calibration_id") or ""
-        ),
-        "profile_path": str(
-            capabilities.get("profile_path") or default.get("profile_path") or ""
-        ),
-        "max_gripper_width_m": max_width,
-    }
 
 
 def _parameters_grasp_candidate_id(parameters: JsonDict) -> str:
@@ -5093,323 +7504,46 @@ def _parameters_grasp_candidate_id(parameters: JsonDict) -> str:
     return ""
 
 
-def _candidate_linked_rejection(
-    action: EnvAction,
-    *,
-    active_candidate_id: str,
-    artifacts: dict[str, JsonDict],
-    final_refinable_fallback: bool = False,
-) -> JsonDict | None:
-    if not active_candidate_id:
-        return None
-    command = action.command if isinstance(action.command, dict) else {}
-    request = command.get("request")
-    if not isinstance(request, dict):
-        request = {}
-    request_name = str(request.get("name") or command.get("request_name") or "")
-    parameters = request.get("parameters")
-    if not isinstance(parameters, dict):
-        parameters = {}
-    candidate_id = _parameters_grasp_candidate_id(parameters)
-    if not candidate_id:
-        candidate_id = _matching_latest_world_pose_candidate(parameters, artifacts)
-    if candidate_id != active_candidate_id:
-        return None
+def _articulated_probe_path_sha256(tool_name: str, parameters: JsonDict) -> str:
+    poses: list[object]
+    if tool_name == "move_to":
+        poses = [parameters.get("target_pose")]
+    elif tool_name == "follow_eef_trajectory":
+        trajectory = parameters.get("trajectory")
+        poses = list(trajectory) if isinstance(trajectory, list) else []
+    else:
+        return ""
+    markers = {
+        str(pose.get("probe_path_sha256") or "")
+        for pose in poses
+        if isinstance(pose, dict) and pose.get("probe_path_sha256")
+    }
+    return next(iter(markers)) if len(markers) == 1 else ""
 
-    failed_safety = next(
-        (
-            call
-            for call in command.get("safety_checks", []) or []
-            if isinstance(call, dict) and _safety_call_rejects_candidate(call)
-        ),
-        None,
-    )
-    if isinstance(failed_safety, dict):
-        return {
-            "source": "safety_check_rejected",
-            "checker": failed_safety.get("name"),
-            "target_tool": request_name,
-            "reason": _call_failure_reason(failed_safety),
-        }
 
-    if request_name == "compile_grasp_seed":
-        failed_compile = next(
-            (
-                call
-                for call in command.get("tool_calls", []) or []
-                if isinstance(call, dict)
-                and str(call.get("name") or "") == request_name
-                and _grasp_seed_compile_rejects_candidate(call)
-            ),
-            None,
+def _articulated_probe_motion_equivalent(
+    frozen_parameters: object,
+    resolved_parameters: object,
+) -> bool:
+    """Compare frozen probe geometry while ignoring typed handoff bookkeeping."""
+
+    if not isinstance(frozen_parameters, dict) or not isinstance(
+        resolved_parameters, dict
+    ):
+        return False
+    if resolved_parameters.get("enable_collision_check") is not True:
+        return False
+    if "target_pose" in frozen_parameters:
+        return resolved_parameters.get("target_pose") == frozen_parameters.get(
+            "target_pose"
         )
-        if isinstance(failed_compile, dict):
-            recovery_metadata = _grasp_seed_compile_recovery_metadata(failed_compile)
-            return {
-                "source": "grasp_seed_geometry_rejected",
-                "target_tool": request_name,
-                "reason": _call_failure_reason(failed_compile),
-                **recovery_metadata,
-            }
-        if final_refinable_fallback:
-            terminal_compile = next(
-                (
-                    call
-                    for call in command.get("tool_calls", []) or []
-                    if isinstance(call, dict)
-                    and str(call.get("name") or "") == request_name
-                    and not _call_result_success(call)
-                ),
-                None,
-            )
-            if isinstance(terminal_compile, dict):
-                return {
-                    "source": "final_fallback_compile_failed",
-                    "target_tool": request_name,
-                    "reason": _call_failure_reason(terminal_compile),
-                }
-        return None
-
-    if request_name not in {"move_to", "follow_eef_trajectory"}:
-        return None
-    failed_review = next(
-        (
-            call
-            for call in command.get("tool_calls", []) or []
-            if isinstance(call, dict)
-            and str(call.get("name") or "") == request_name
-            and _independent_precontact_review_rejects_candidate(call)
-        ),
-        None,
-    )
-    if isinstance(failed_review, dict):
-        return {
-            "source": "independent_precontact_review_rejected",
-            "target_tool": request_name,
-            "reason": _call_failure_reason(failed_review),
-            **_independent_review_recovery_metadata(failed_review),
-        }
-    failed_tool = next(
-        (
-            call
-            for call in command.get("tool_calls", []) or []
-            if isinstance(call, dict)
-            and str(call.get("name") or "") == request_name
-            and _motion_call_rejects_candidate(call)
-        ),
-        None,
-    )
-    if not isinstance(failed_tool, dict):
-        return None
-    return {
-        "source": "candidate_motion_rejected",
-        "target_tool": request_name,
-        "reason": _call_failure_reason(failed_tool),
-    }
+    if "trajectory" in frozen_parameters:
+        return resolved_parameters.get("trajectory") == frozen_parameters.get(
+            "trajectory"
+        )
+    return False
 
 
-def _host_stage_precontact_review_rejection(
-    action: EnvAction,
-    *,
-    active_candidate_id: str,
-    execution: JsonDict | None,
-) -> JsonDict | None:
-    if (
-        not active_candidate_id
-        or not isinstance(execution, dict)
-        or str(execution.get("candidate_id") or "") != active_candidate_id
-        or str(execution.get("stage") or "")
-        not in {"open", "hover", "align_move", "precontact", "descend", "close"}
-    ):
-        return None
-    required = execution.get("required_action")
-    if not isinstance(required, dict):
-        return None
-    command = action.command if isinstance(action.command, dict) else {}
-    request = command.get("request")
-    if not isinstance(request, dict):
-        return None
-    request_name = str(request.get("name") or "")
-    parameters = request.get("parameters")
-    if (
-        request_name != str(required.get("name") or "")
-        or not isinstance(parameters, dict)
-        or parameters != required.get("parameters")
-    ):
-        return None
-    call = _tool_call(action, request_name)
-    if not isinstance(call, dict) or not _independent_precontact_review_rejects_candidate(call):
-        return None
-    return {
-        "source": "independent_host_stage_review_rejected",
-        "target_tool": request_name,
-        "grasp_stage": execution.get("stage"),
-        "reason": _call_failure_reason(call),
-        **_independent_review_recovery_metadata(call),
-    }
-
-
-def _wrist_reference_localization_rejection(
-    action: EnvAction,
-    *,
-    active_candidate_id: str,
-    execution: JsonDict | None,
-) -> JsonDict | None:
-    if (
-        not active_candidate_id
-        or not isinstance(execution, dict)
-        or str(execution.get("candidate_id") or "") != active_candidate_id
-        or str(execution.get("stage") or "") != "align"
-    ):
-        return None
-    command = action.command if isinstance(action.command, dict) else {}
-    request = command.get("request")
-    if (
-        not isinstance(request, dict)
-        or str(request.get("name") or "") != "retrieve_asset_reference"
-    ):
-        return None
-    call = _tool_call(action, "retrieve_asset_reference")
-    if not isinstance(call, dict) or _call_result_success(call):
-        return None
-    result = call.get("result")
-    details = result.get("details") if isinstance(result, dict) else None
-    outputs = details.get("outputs") if isinstance(details, dict) else None
-    diagnostics = details.get("diagnostics") if isinstance(details, dict) else None
-    reason = outputs.get("reason") if isinstance(outputs, dict) else None
-    diagnostic_codes = {
-        str(item.get("code") or "") for item in diagnostics or [] if isinstance(item, dict)
-    }
-    if (
-        str(reason or "") != "object_memory_localization_failed"
-        and "object_memory_localization_failed" not in diagnostic_codes
-    ):
-        return None
-    return {
-        "source": "wrist_reference_localization_rejected",
-        "target_tool": "retrieve_asset_reference",
-        "grasp_stage": "align",
-        "reason": (
-            "Target instance could not be localized in the current wrist view after "
-            "the reference localizer exhausted its provider retries."
-        ),
-    }
-
-
-def _candidate_linked_grasp_outcome_rejection(
-    action: EnvAction,
-    *,
-    active_candidate_id: str,
-    lift_probe: JsonDict | None,
-    articulated_probe: JsonDict | None = None,
-    attachment_gate: JsonDict | None = None,
-    execution: JsonDict | None = None,
-) -> JsonDict | None:
-    if not active_candidate_id:
-        return None
-    completed_probe = next(
-        (
-            probe
-            for probe in (lift_probe, articulated_probe)
-            if isinstance(probe, dict)
-            and str(probe.get("status") or "") == "completed"
-            and str(probe.get("candidate_id") or "") == active_candidate_id
-        ),
-        None,
-    )
-    if completed_probe is None:
-        return None
-    command = action.command if isinstance(action.command, dict) else {}
-    request = command.get("request")
-    if not isinstance(request, dict):
-        return None
-    request_name = str(request.get("name") or "")
-    if request_name not in {"gripper_control", "move_to", "follow_eef_trajectory"}:
-        return None
-    if (
-        completed_probe is articulated_probe
-        and isinstance(attachment_gate, dict)
-        and str(attachment_gate.get("verdict") or "").upper() == "FAIL"
-        and isinstance(execution, dict)
-        and execution.get("attachment_mode") == "articulated_handle"
-    ):
-        actions = execution.get("attachment_actions")
-        fail_action = actions.get("fail") if isinstance(actions, dict) else None
-        call = _tool_call(action, request_name)
-        if (
-            isinstance(fail_action, dict)
-            and _action_matches(action, fail_action)
-            and isinstance(call, dict)
-            and _call_result_success(call)
-        ):
-            return {
-                "source": "articulated_attachment_assessment_failed",
-                "target_tool": request_name,
-                "reason": str(
-                    attachment_gate.get("assessment_reason")
-                    or "Independent multi-view assessment found no attachment."
-                ),
-            }
-    for call in command.get("tool_calls", []) or []:
-        if not isinstance(call, dict) or str(call.get("name") or "") != request_name:
-            continue
-        supervision = _call_supervision(call)
-        review = supervision.get("details") if isinstance(supervision, dict) else None
-        if not isinstance(review, dict) or str(review.get("grasp_outcome") or "").lower() not in {
-            "fail",
-            "failed",
-        }:
-            continue
-        if str(review.get("candidate_id") or "") != active_candidate_id:
-            continue
-        if request_name == "gripper_control":
-            parameters = request.get("parameters")
-            if not isinstance(parameters, dict):
-                continue
-            if _binary_gripper_position(
-                parameters.get("position")
-            ) != 1 or not _call_result_success(call):
-                continue
-        elif _call_result_success(call) or supervision.get("allowed") is not False:
-            continue
-        return {
-            "source": "independent_grasp_outcome_rejected",
-            "target_tool": request_name,
-            "reason": str(supervision.get("reason") or "Visual grasp verification failed."),
-        }
-    return None
-
-
-def _call_supervision(call: JsonDict) -> JsonDict | None:
-    result = call.get("result")
-    details = result.get("details") if isinstance(result, dict) else None
-    if not isinstance(details, dict):
-        return None
-    supervision = details.get("supervision")
-    if isinstance(supervision, dict):
-        return supervision
-    outputs = details.get("outputs")
-    if not isinstance(outputs, dict):
-        return None
-    supervision = outputs.get("supervision")
-    return supervision if isinstance(supervision, dict) else None
-
-
-def _successful_gripper_close_command(command: JsonDict) -> bool:
-    request = command.get("request")
-    if not isinstance(request, dict) or str(request.get("name") or "") != "gripper_control":
-        return False
-    parameters = request.get("parameters")
-    if not isinstance(parameters, dict):
-        return False
-    if _binary_gripper_position(parameters.get("position")) != 0:
-        return False
-    return any(
-        isinstance(call, dict)
-        and str(call.get("name") or "") == "gripper_control"
-        and _call_result_success(call)
-        for call in command.get("tool_calls", []) or []
-    )
 
 
 def _finite_xyz(value: object) -> bool:
@@ -5423,6 +7557,67 @@ def _finite_xyz(value: object) -> bool:
     )
 
 
+def _is_wrist_camera(frame_id: str, role: str) -> bool:
+    marker = f"{frame_id} {role}".lower()
+    return any(name in marker for name in ("wrist", "hand", "gripper", "eye_in_hand"))
+
+
+def _rounded_xyz(value: list[float]) -> list[float]:
+    return [round(float(component), 6) for component in value[:3]]
+
+
+def _finite_nonnegative_float(value: object, *, default: float) -> float:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return default
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) and parsed >= 0.0 else default
+
+
+def _compiled_grasp_pose_role(pose: JsonDict) -> str:
+    waypoint = str(pose.get("waypoint_role") or "").strip().lower()
+    if waypoint == "grasp_contact":
+        return "contact"
+    if waypoint == "grasp_precontact":
+        return "precontact"
+    if waypoint in {"grasp_clearance", "grasp_alignment_reference"}:
+        return "clearance"
+    return ""
+
+
+def _compiled_grasp_reference_pose(
+    compiled: JsonDict,
+    *,
+    role: str,
+) -> JsonDict | None:
+    field = {
+        "clearance": "hover_pose",
+        "precontact": "precontact_pose",
+        "contact": "contact_pose",
+    }.get(role)
+    value = compiled.get(field) if field else None
+    return value if isinstance(value, dict) else None
+
+
+def _pose_near_xyz(
+    pose: object,
+    reference_xyz: object,
+    *,
+    tolerance_m: float,
+) -> bool:
+    if not isinstance(pose, dict):
+        return False
+    xyz = pose.get("xyz")
+    if not (_finite_xyz(xyz) and _finite_xyz(reference_xyz)):
+        return False
+    distance = math.sqrt(
+        sum(
+            (float(xyz[index]) - float(reference_xyz[index])) ** 2
+            for index in range(3)
+        )
+    )
+    return distance <= tolerance_m
+
+
 def _finite_number(value: object) -> bool:
     return (
         isinstance(value, int | float)
@@ -5431,49 +7626,9 @@ def _finite_number(value: object) -> bool:
     )
 
 
-def _candidate_linked_motion_succeeded(
-    action: EnvAction,
-    *,
-    active_candidate_id: str,
-    artifacts: dict[str, JsonDict],
-) -> bool:
-    if not active_candidate_id:
-        return False
-    command = action.command if isinstance(action.command, dict) else {}
-    request = command.get("request")
-    if not isinstance(request, dict) or str(request.get("name") or "") != "move_to":
-        return False
-    parameters = request.get("parameters")
-    if not isinstance(parameters, dict):
-        return False
-    candidate_id = _parameters_grasp_candidate_id(parameters)
-    if not candidate_id:
-        candidate_id = _matching_latest_world_pose_candidate(parameters, artifacts)
-    if candidate_id != active_candidate_id:
-        return False
-    return any(
-        isinstance(call, dict)
-        and str(call.get("name") or "") == "move_to"
-        and str(call.get("status") or "") == "executed"
-        and _call_result_success(call)
-        and not _motion_call_rejects_candidate(call)
-        for call in command.get("tool_calls", []) or []
-    )
-
-
 def _call_result_success(call: JsonDict) -> bool:
     result = call.get("result")
     return isinstance(result, dict) and bool(result.get("success"))
-
-
-def _call_has_diagnostic(call: JsonDict, code: str) -> bool:
-    result = call.get("result")
-    details = result.get("details") if isinstance(result, dict) else None
-    diagnostics = details.get("diagnostics") if isinstance(details, dict) else None
-    return isinstance(diagnostics, list) and any(
-        isinstance(diagnostic, dict) and diagnostic.get("code") == code
-        for diagnostic in diagnostics
-    )
 
 
 def _tool_call(action: EnvAction, name: str) -> JsonDict | None:
@@ -5486,6 +7641,378 @@ def _tool_call(action: EnvAction, name: str) -> JsonDict | None:
         ),
         None,
     )
+
+
+def _executed_tool_parameters(action: EnvAction, name: str) -> JsonDict:
+    """Return the host-resolved parameters actually dispatched to a tool.
+
+    Typed public requests intentionally contain compact ids rather than copied
+    geometry. Post-execution memory first consumes the environment-authority
+    execution receipt, then the older trusted pose-feedback representation, and
+    finally legacy/synthetic call or request parameters.
+    """
+
+    call = _tool_call(action, name)
+    result = call.get("result") if isinstance(call, dict) else None
+    details = result.get("details") if isinstance(result, dict) else None
+    details = details if isinstance(details, dict) else {}
+    provenance = details.get("host_provenance")
+    provenance = provenance if isinstance(provenance, dict) else {}
+    trusted_environment_result = (
+        provenance.get("schema_version") == "openeta.tool_result_provenance.v1"
+        and provenance.get("authority") == "environment"
+        and str(provenance.get("tool") or "") == name
+    )
+    if trusted_environment_result:
+        receipt = details.get("host_execution_receipt")
+        receipt = receipt if isinstance(receipt, dict) else {}
+        receipt_parameters = receipt.get("parameters")
+        if (
+            receipt.get("schema_version") == "openeta.resolved_tool_execution.v1"
+            and str(receipt.get("tool") or "") == name
+            and isinstance(receipt_parameters, dict)
+        ):
+            return dict(receipt_parameters)
+
+    call_parameters = call.get("parameters") if isinstance(call, dict) else None
+    resolved = dict(call_parameters) if isinstance(call_parameters, dict) else {}
+    if trusted_environment_result and name == "move_to":
+        outputs = details.get("outputs")
+        outputs = outputs if isinstance(outputs, dict) else {}
+        pose_feedback = outputs.get("pose_feedback")
+        pose_feedback = pose_feedback if isinstance(pose_feedback, dict) else {}
+        requested_pose = pose_feedback.get("requested_eef_pose")
+        if isinstance(requested_pose, dict) and requested_pose:
+            resolved["target_pose"] = dict(requested_pose)
+            return resolved
+    if isinstance(call_parameters, dict):
+        return resolved
+    command = action.command if isinstance(action.command, dict) else {}
+    request = command.get("request")
+    if (
+        isinstance(request, dict)
+        and str(request.get("name") or "") == name
+        and isinstance(request.get("parameters"), dict)
+    ):
+        return dict(request["parameters"])
+    return {}
+
+
+def _pipeline_call(action: EnvAction, name: str) -> JsonDict | None:
+    """Find a named call in either normal tools or inline safety checks."""
+
+    command = action.command if isinstance(action.command, dict) else {}
+    for field_name in ("tool_calls", "safety_checks"):
+        for call in command.get(field_name, []) or []:
+            if isinstance(call, dict) and str(call.get("name") or "") == name:
+                return call
+    return None
+
+
+IK_POSE_EQUIVALENCE_POSITION_ATOL_M = 1e-6
+IK_POSE_EQUIVALENCE_ORIENTATION_ATOL = 1e-6
+
+
+def _ik_orientation_fields(target_pose: JsonDict) -> JsonDict:
+    return {
+        key: target_pose.get(key)
+        for key in (
+            "rotation_matrix",
+            "quat_xyzw",
+            "quaternion",
+            "euler_xyz_deg",
+            "rotvec",
+            "roll",
+            "pitch",
+            "yaw",
+        )
+        if target_pose.get(key) is not None
+    }
+
+
+def _ik_orientation_policy(parameters: JsonDict) -> str:
+    target_pose = parameters.get("target_pose")
+    target_pose = target_pose if isinstance(target_pose, dict) else {}
+    orientation_fields = _ik_orientation_fields(target_pose)
+    preserve_current = parameters.get("preserve_current_orientation")
+    if preserve_current is None:
+        preserve_current = not orientation_fields
+    return "preserve_current" if preserve_current is True else "explicit_orientation"
+
+
+def ik_pose_policy_numerically_equivalent(
+    receipt: JsonDict,
+    parameters: JsonDict,
+) -> bool:
+    """Accept harmless JSON float round-trips without authorizing a new pose.
+
+    Signatures remain the fast exact index.  This fallback compares the stored
+    receipt target numerically at micron/component-level tolerances, far below
+    controller execution tolerances.  It therefore removes serialization
+    brittleness while still requiring a fresh preview for Agent-authored pose
+    adjustments.
+    """
+
+    requested = parameters.get("target_pose")
+    recorded = receipt.get("target_pose")
+    if not isinstance(requested, dict) or not isinstance(recorded, dict):
+        return False
+    requested_xyz = requested.get("xyz", requested.get("translation_xyz"))
+    recorded_xyz = recorded.get("xyz", recorded.get("translation_xyz"))
+    if not _finite_xyz(requested_xyz) or not _finite_xyz(recorded_xyz):
+        return False
+    if any(
+        abs(float(requested_xyz[index]) - float(recorded_xyz[index]))
+        > IK_POSE_EQUIVALENCE_POSITION_ATOL_M
+        for index in range(3)
+    ):
+        return False
+
+    requested_policy = _ik_orientation_policy(parameters)
+    recorded_policy = str(receipt.get("orientation_policy") or "")
+    if not recorded_policy:
+        recorded_policy = (
+            "explicit_orientation"
+            if _ik_orientation_fields(recorded)
+            else "preserve_current"
+        )
+    if requested_policy != recorded_policy:
+        return False
+    if requested_policy == "preserve_current":
+        return True
+
+    requested_rotation = _ik_orientation_rotation_matrix(requested)
+    recorded_rotation = _ik_orientation_rotation_matrix(recorded)
+    if requested_rotation is None or recorded_rotation is None:
+        return False
+    relative_trace = sum(
+        requested_rotation[row][column] * recorded_rotation[row][column]
+        for row in range(3)
+        for column in range(3)
+    )
+    angle_rad = math.acos(max(-1.0, min(1.0, (relative_trace - 1.0) / 2.0)))
+    return angle_rad <= IK_POSE_EQUIVALENCE_ORIENTATION_ATOL
+
+
+def _ik_orientation_rotation_matrix(target_pose: JsonDict) -> list[list[float]] | None:
+    """Canonicalize supported explicit orientations for semantic IK matching."""
+
+    direct_euler = [target_pose.get(axis) for axis in ("roll", "pitch", "yaw")]
+    if any(value is not None for value in direct_euler):
+        if not all(_finite_number(value) for value in direct_euler):
+            return None
+        return _xyz_euler_degrees_to_rotation_matrix(direct_euler)
+
+    euler = target_pose.get("euler_xyz_deg")
+    if _finite_numeric_vector(euler, length=3):
+        return _xyz_euler_degrees_to_rotation_matrix(euler)
+
+    quaternion = target_pose.get("quat_xyzw", target_pose.get("quaternion"))
+    if _finite_numeric_vector(quaternion, length=4):
+        qx, qy, qz, qw = [float(value) for value in quaternion]
+        norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        if norm <= 1e-12:
+            return None
+        qx, qy, qz, qw = [value / norm for value in (qx, qy, qz, qw)]
+        return [
+            [
+                1.0 - 2.0 * (qy * qy + qz * qz),
+                2.0 * (qx * qy - qz * qw),
+                2.0 * (qx * qz + qy * qw),
+            ],
+            [
+                2.0 * (qx * qy + qz * qw),
+                1.0 - 2.0 * (qx * qx + qz * qz),
+                2.0 * (qy * qz - qx * qw),
+            ],
+            [
+                2.0 * (qx * qz - qy * qw),
+                2.0 * (qy * qz + qx * qw),
+                1.0 - 2.0 * (qx * qx + qy * qy),
+            ],
+        ]
+
+    rotation = target_pose.get("rotation_matrix")
+    if (
+        isinstance(rotation, list | tuple)
+        and len(rotation) == 3
+        and all(_finite_numeric_vector(row, length=3) for row in rotation)
+    ):
+        matrix = [[float(value) for value in row] for row in rotation]
+        return matrix if _proper_rotation_matrix(matrix) else None
+
+    rotvec = target_pose.get("rotvec")
+    if _finite_numeric_vector(rotvec, length=3):
+        vector = [float(value) for value in rotvec]
+        angle = math.sqrt(sum(value * value for value in vector))
+        if angle <= 1e-12:
+            return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        x, y, z = [value / angle for value in vector]
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+        one_minus_cosine = 1.0 - cosine
+        return [
+            [
+                cosine + x * x * one_minus_cosine,
+                x * y * one_minus_cosine - z * sine,
+                x * z * one_minus_cosine + y * sine,
+            ],
+            [
+                y * x * one_minus_cosine + z * sine,
+                cosine + y * y * one_minus_cosine,
+                y * z * one_minus_cosine - x * sine,
+            ],
+            [
+                z * x * one_minus_cosine - y * sine,
+                z * y * one_minus_cosine + x * sine,
+                cosine + z * z * one_minus_cosine,
+            ],
+        ]
+    return None
+
+
+def _finite_numeric_vector(value: object, *, length: int) -> bool:
+    return (
+        isinstance(value, list | tuple)
+        and len(value) == length
+        and all(_finite_number(item) for item in value)
+    )
+
+
+def _xyz_euler_degrees_to_rotation_matrix(values: object) -> list[list[float]]:
+    if not _finite_numeric_vector(values, length=3):
+        raise ValueError("xyz Euler orientation requires three finite values")
+    numeric_values = values if isinstance(values, list | tuple) else ()
+    roll, pitch, yaw = [
+        math.radians(float(value)) for value in numeric_values
+    ]
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return [
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ]
+
+
+def _proper_rotation_matrix(matrix: list[list[float]]) -> bool:
+    for row in range(3):
+        for column in range(3):
+            dot = sum(matrix[index][row] * matrix[index][column] for index in range(3))
+            expected = 1.0 if row == column else 0.0
+            if abs(dot - expected) > 1e-3:
+                return False
+    determinant = (
+        matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+        - matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
+        + matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0])
+    )
+    return abs(determinant - 1.0) <= 1e-3
+
+
+def _ik_target_signature(parameters: JsonDict) -> str:
+    target_pose = parameters.get("target_pose")
+    if not isinstance(target_pose, dict) or not _finite_xyz(
+        target_pose.get("xyz", target_pose.get("translation_xyz"))
+    ):
+        return ""
+    orientation_fields = _ik_orientation_fields(target_pose)
+    canonical = {
+        "target_xyz": target_pose.get("xyz", target_pose.get("translation_xyz")),
+        "orientation_policy": _ik_orientation_policy(parameters),
+        "orientation": orientation_fields,
+        "position_tolerance_m": parameters.get(
+            "position_tolerance_m", parameters.get("tolerance")
+        ),
+        "orientation_tolerance_rad": parameters.get(
+            "orientation_tolerance_rad", parameters.get("ori_tolerance")
+        ),
+        "check_endpoint_collision": parameters.get("check_endpoint_collision"),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def _ik_pose_policy_signature(parameters: JsonDict) -> str:
+    """Hash only the endpoint and orientation policy shared by preview and move."""
+
+    target_pose = parameters.get("target_pose")
+    if not isinstance(target_pose, dict) or not _finite_xyz(
+        target_pose.get("xyz", target_pose.get("translation_xyz"))
+    ):
+        return ""
+    orientation_fields = _ik_orientation_fields(target_pose)
+    canonical = {
+        "target_xyz": target_pose.get("xyz", target_pose.get("translation_xyz")),
+        "orientation_policy": _ik_orientation_policy(parameters),
+        "orientation": orientation_fields,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def _target_pose_has_no_orientation(target_pose: JsonDict) -> bool:
+    return not any(
+        target_pose.get(key) is not None
+        for key in (
+            "rotation_matrix",
+            "quat_xyzw",
+            "quaternion",
+            "rotvec",
+            "roll",
+            "pitch",
+            "yaw",
+        )
+    )
+
+
+def _ik_reachability_classification(reachability: JsonDict) -> str:
+    status = str(reachability.get("status") or "unknown").lower()
+    if status == "reachable":
+        return "feasible"
+    if (
+        status == "unknown"
+        and str(reachability.get("reason_code") or "")
+        == "endpoint_collision_check_unavailable"
+        and isinstance(reachability.get("best_candidate"), dict)
+    ):
+        return "kinematically_feasible_collision_deferred"
+    if status == "unknown":
+        return "inconclusive"
+    collision = reachability.get("collision")
+    if isinstance(collision, dict) and collision.get("detected") is True:
+        return "hard_infeasible"
+    reason = str(reachability.get("reason_code") or "").lower()
+    hard_markers = (
+        "outside_workspace",
+        "joint_limit",
+        "endpoint_collision",
+        "self_collision",
+        "invalid_target",
+    )
+    if any(marker in reason for marker in hard_markers):
+        return "hard_infeasible"
+    if (
+        reachability.get("position_only_reachable") is True
+        or reachability.get("orientation_only_reachable") is True
+        or isinstance(reachability.get("best_candidate"), dict)
+        or bool(reachability.get("suggestions"))
+    ):
+        return "repairable"
+    return "hard_infeasible"
 
 
 def _successful_tool_call(action: EnvAction, name: str) -> JsonDict | None:
@@ -5502,6 +8029,120 @@ def _tool_call_outputs(call: JsonDict) -> JsonDict:
         return {}
     outputs = details.get("outputs")
     return dict(outputs) if isinstance(outputs, dict) else dict(details)
+
+
+def _motion_call_changed_pose(call: JsonDict) -> bool:
+    """Return whether a successful motion receipt proves robot/camera motion.
+
+    Missing legacy receipts remain conservatively mutating. A modern receipt with
+    zero executed steps and identical start/end poses is an acknowledged no-op and
+    must not invalidate visual evidence or IK receipts by advancing the robot epoch.
+    """
+
+    result = call.get("result")
+    details = result.get("details") if isinstance(result, dict) else None
+    if not isinstance(details, dict):
+        return True
+    outputs = details.get("outputs")
+    outputs = outputs if isinstance(outputs, dict) else {}
+    response = outputs.get("response")
+    response = response if isinstance(response, dict) else {}
+    state_delta = details.get("state_delta")
+    state_delta = state_delta if isinstance(state_delta, dict) else {}
+    candidates = (
+        outputs.get("motion_summary"),
+        response.get("motion_summary"),
+        details.get("motion_summary"),
+        state_delta.get("motion"),
+    )
+    for motion in candidates:
+        if not isinstance(motion, dict):
+            continue
+        steps = motion.get("steps_executed")
+        if isinstance(steps, int | float) and not isinstance(steps, bool):
+            if float(steps) > 0:
+                return True
+            start = motion.get("start")
+            end = motion.get("end")
+            start = start if isinstance(start, dict) else {}
+            end = end if isinstance(end, dict) else {}
+            if _poses_materially_differ(start, end):
+                return True
+            return False
+    return True
+
+
+def _motion_call_receipt_proves_pose_change(call: JsonDict) -> bool:
+    """Require positive execution evidence before mutating state on failure.
+
+    Successful legacy calls remain conservatively mutating via
+    ``_motion_call_changed_pose``. Failed or blocked calls are different: only a
+    structured receipt with executed steps or materially different start/end poses
+    may advance ``robot_motion_epoch``.
+    """
+
+    result = call.get("result")
+    details = result.get("details") if isinstance(result, dict) else None
+    if not isinstance(details, dict):
+        return False
+    outputs = details.get("outputs")
+    outputs = outputs if isinstance(outputs, dict) else {}
+    response = outputs.get("response")
+    response = response if isinstance(response, dict) else {}
+    state_delta = details.get("state_delta")
+    state_delta = state_delta if isinstance(state_delta, dict) else {}
+    candidates = (
+        outputs.get("motion_summary"),
+        response.get("motion_summary"),
+        details.get("motion_summary"),
+        state_delta.get("motion"),
+    )
+    for motion in candidates:
+        if not isinstance(motion, dict):
+            continue
+        steps = motion.get("steps_executed")
+        if (
+            isinstance(steps, int | float)
+            and not isinstance(steps, bool)
+            and float(steps) > 0
+        ):
+            return True
+        start = motion.get("start")
+        end = motion.get("end")
+        if isinstance(start, dict) and isinstance(end, dict) and _poses_materially_differ(
+            start, end
+        ):
+            return True
+    return False
+
+
+def _poses_materially_differ(start: JsonDict, end: JsonDict) -> bool:
+    start_xyz = start.get("xyz")
+    end_xyz = end.get("xyz")
+    if _finite_xyz(start_xyz) and _finite_xyz(end_xyz):
+        if math.sqrt(
+            sum(
+                (float(start_xyz[index]) - float(end_xyz[index])) ** 2
+                for index in range(3)
+            )
+        ) > 1e-6:
+            return True
+    start_quat = start.get("quat_xyzw")
+    end_quat = end.get("quat_xyzw")
+    if (
+        isinstance(start_quat, list | tuple)
+        and isinstance(end_quat, list | tuple)
+        and len(start_quat) >= 4
+        and len(end_quat) >= 4
+    ):
+        try:
+            return min(
+                sum((float(start_quat[i]) - float(end_quat[i])) ** 2 for i in range(4)),
+                sum((float(start_quat[i]) + float(end_quat[i])) ** 2 for i in range(4)),
+            ) ** 0.5 > 1e-6
+        except (TypeError, ValueError):
+            return False
+    return False
 
 
 def _assigned_task_from_tool_call(call: JsonDict) -> tuple[str, str] | None:
@@ -5560,106 +8201,6 @@ def _transition_call_verdict(call: JsonDict | None) -> str:
     return "PASS"
 
 
-def _action_matches(action: EnvAction, required: JsonDict) -> bool:
-    command = action.command if isinstance(action.command, dict) else {}
-    request = command.get("request")
-    if not isinstance(request, dict):
-        return False
-    return str(request.get("name") or "") == str(required.get("name") or "") and request.get(
-        "parameters"
-    ) == required.get("parameters")
-
-
-def grasp_reference_action_error(
-    *,
-    stage: str,
-    tool_name: str,
-    parameters: JsonDict,
-    required_action: JsonDict,
-) -> str | None:
-    """Validate one staged action against a reference pose safety envelope."""
-
-    required_name = str(required_action.get("name") or "")
-    required_parameters = required_action.get("parameters")
-    if tool_name != required_name or not isinstance(required_parameters, dict):
-        return f"Grasp stage {stage!r} requires tool {required_name!r}."
-    if required_name != "move_to":
-        if parameters == required_parameters:
-            return None
-        return (
-            f"Grasp stage {stage!r} requires the host-generated {required_name!r} "
-            "parameters unchanged."
-        )
-
-    reference_pose = required_parameters.get("target_pose")
-    target_pose = parameters.get("target_pose")
-    if not isinstance(reference_pose, dict) or not isinstance(target_pose, dict):
-        return f"Grasp stage {stage!r} requires a concrete move_to target_pose."
-    if str(target_pose.get("frame") or "") != "world":
-        return "Adjusted grasp poses must remain in the world frame."
-    reference_xyz = reference_pose.get("xyz")
-    target_xyz = target_pose.get("xyz")
-    if not _finite_xyz(reference_xyz) or not _finite_xyz(target_xyz):
-        return "Adjusted grasp poses require finite target_pose.xyz values."
-    distance = math.sqrt(
-        sum((float(target_xyz[index]) - float(reference_xyz[index])) ** 2 for index in range(3))
-    )
-    if distance > GRASP_REFERENCE_POSITION_TOLERANCE_M:
-        return (
-            f"Adjusted grasp pose is {distance:.4f} m from the reference, exceeding "
-            f"the {GRASP_REFERENCE_POSITION_TOLERANCE_M:.3f} m closed-loop envelope."
-        )
-
-    reference_rotation = reference_pose.get("rotation_matrix")
-    target_rotation = target_pose.get("rotation_matrix")
-    if reference_rotation is not None:
-        angle_deg = _rotation_delta_deg(reference_rotation, target_rotation)
-        if angle_deg is None:
-            return (
-                "Adjusted grasp poses must preserve a finite 3x3 rotation_matrix "
-                "when the reference pose provides one."
-            )
-        if angle_deg > GRASP_REFERENCE_ORIENTATION_TOLERANCE_DEG:
-            return (
-                f"Adjusted grasp orientation is {angle_deg:.2f} deg from the reference, "
-                "exceeding the "
-                f"{GRASP_REFERENCE_ORIENTATION_TOLERANCE_DEG:.1f} deg envelope."
-            )
-
-    reference_candidate = _parameters_grasp_candidate_id(required_parameters)
-    target_candidate = _parameters_grasp_candidate_id(parameters)
-    if target_candidate and reference_candidate and target_candidate != reference_candidate:
-        return (
-            f"Adjusted grasp pose references candidate {target_candidate!r}, but stage "
-            f"{stage!r} belongs to {reference_candidate!r}."
-        )
-    return None
-
-
-def _grasp_stage_action_matches(
-    action: EnvAction,
-    required: JsonDict,
-    *,
-    stage: str,
-) -> bool:
-    command = action.command if isinstance(action.command, dict) else {}
-    request = command.get("request")
-    if not isinstance(request, dict):
-        return False
-    parameters = request.get("parameters")
-    if not isinstance(parameters, dict):
-        return False
-    return (
-        grasp_reference_action_error(
-            stage=stage,
-            tool_name=str(request.get("name") or ""),
-            parameters=parameters,
-            required_action=required,
-        )
-        is None
-    )
-
-
 def _rotation_delta_deg(reference: object, target: object) -> float | None:
     if not _finite_rotation_matrix(reference) or not _finite_rotation_matrix(target):
         return None
@@ -5690,12 +8231,6 @@ def _finite_rotation_matrix(value: object) -> bool:
     )
 
 
-def _pose_for_epoch(pose: JsonDict, epoch: int) -> JsonDict:
-    updated = dict(pose)
-    updated["scene_epoch"] = epoch
-    return updated
-
-
 def _optional_int(value: Any, *, default: int) -> int:
     try:
         return int(value)
@@ -5703,12 +8238,13 @@ def _optional_int(value: Any, *, default: int) -> int:
         return default
 
 
-def _is_anyplace_pose(parameters: JsonDict) -> bool:
-    pose = parameters.get("camera_pose")
-    if not isinstance(pose, dict):
-        return False
-    pose_id = str(pose.get("id") or "")
-    return pose_id.startswith("place_grasp_") or str(pose.get("source_tool") or "") == "anyplace"
+def _normalize_sam3_evidence_role(value: object) -> str:
+    role = str(value or DEFAULT_SAM3_EVIDENCE_ROLE).strip().lower()
+    if role not in SAM3_EVIDENCE_ROLES:
+        raise ValueError(
+            "evidence_role must be one of " + ", ".join(sorted(SAM3_EVIDENCE_ROLES)) + "."
+        )
+    return role
 
 
 def _reconcile_gripper_position(position: object, state: JsonDict) -> str:
@@ -5729,31 +8265,6 @@ def _reconcile_gripper_position(position: object, state: JsonDict) -> str:
     return "unresolved"
 
 
-def _gripper_attachment_evidence(
-    state: JsonDict,
-    *,
-    command_state: JsonDict | None,
-) -> tuple[str, JsonDict]:
-    if not isinstance(command_state, dict) or command_state.get("position") != 0:
-        return "UNKNOWN", {}
-    object_detection = str(state.get("object_detection") or "").strip().lower()
-    if object_detection == "object_detected_closing":
-        return "PASS", {
-            "object_detection": object_detection,
-            "position": state.get("position"),
-            "position_normalized": state.get("position_normalized"),
-            "requested_position": state.get("requested_position"),
-        }
-    if object_detection == "at_position_no_object":
-        return "FAIL", {
-            "object_detection": object_detection,
-            "position": state.get("position"),
-            "position_normalized": state.get("position_normalized"),
-            "requested_position": state.get("requested_position"),
-        }
-    return "UNKNOWN", {}
-
-
 def _binary_gripper_position(value: object) -> int | None:
     if isinstance(value, bool):
         return int(value)
@@ -5765,187 +8276,6 @@ def _binary_gripper_position(value: object) -> int | None:
     return int(numeric)
 
 
-def _action_grasp_outcome(action: EnvAction) -> str:
-    command = action.command if isinstance(action.command, dict) else {}
-    for call in command.get("tool_calls", []) or []:
-        if not isinstance(call, dict):
-            continue
-        supervision = _call_supervision(call)
-        review = supervision.get("details") if isinstance(supervision, dict) else None
-        if not isinstance(review, dict):
-            continue
-        outcome = str(review.get("grasp_outcome") or "").strip().lower()
-        aliases = {"failed": "fail", "passed": "pass", "uncertain": "unknown"}
-        return aliases.get(outcome, outcome)
-    return ""
-
-
-def _action_host_obligation(action: EnvAction) -> JsonDict:
-    command = action.command if isinstance(action.command, dict) else {}
-    metadata = command.get("metadata")
-    planner_metadata = metadata.get("planner_metadata") if isinstance(metadata, dict) else None
-    obligation = (
-        planner_metadata.get("host_obligation") if isinstance(planner_metadata, dict) else None
-    )
-    return obligation if isinstance(obligation, dict) else {}
-
-
-def _safety_call_rejects_candidate(call: JsonDict) -> bool:
-    if _call_result_success(call):
-        return False
-    result = call.get("result")
-    if not isinstance(result, dict):
-        return False
-    details = result.get("details")
-    if isinstance(details, dict):
-        outputs = details.get("outputs")
-        for source in (outputs, details):
-            if not isinstance(source, dict):
-                continue
-            if source.get("feasible") is False or source.get("clear") is False:
-                return True
-            verdict = str(source.get("verdict") or "").strip().lower()
-            if verdict in {"unsafe", "infeasible", "rejected", "collision", "blocked"}:
-                return True
-    return _failure_text_rejects_candidate(call)
-
-
-def _independent_precontact_review_rejects_candidate(call: JsonDict) -> bool:
-    """Treat any fail-closed pre-contact review as a candidate rejection.
-
-    The independent reviewer uses ``abstain`` when visual evidence is too
-    ambiguous to approve a candidate-specific motion.  At this boundary an
-    abstention still means that the active grasp candidate cannot be executed,
-    so it must consume the same bounded candidate budget as an explicit reject.
-    """
-
-    if _call_result_success(call):
-        return False
-    supervision = _call_supervision(call)
-    if not isinstance(supervision, dict):
-        return False
-    review = supervision.get("details")
-    if not isinstance(review, dict):
-        return False
-    return (
-        supervision.get("allowed") is False
-        and str(supervision.get("source") or "") == "independent_reviewer"
-        and str(review.get("decision") or "").strip().lower() in {"reject", "abstain"}
-        and str(review.get("grasp_outcome") or "not_assessed").strip().lower() == "not_assessed"
-    )
-
-
-def _independent_review_recovery_metadata(call: JsonDict) -> JsonDict:
-    supervision = _call_supervision(call)
-    review = supervision.get("details") if isinstance(supervision, dict) else None
-    if not isinstance(review, dict):
-        return {}
-    recovery_class = str(
-        review.get("recovery_class") or review.get("rejection_class") or ""
-    ).strip()
-    if recovery_class not in {"perception_refinable", "uncertain_review"}:
-        return {}
-    return {"recovery_class": recovery_class}
-
-
-def _grasp_seed_compile_rejects_candidate(call: JsonDict) -> bool:
-    if _call_result_success(call):
-        return False
-    result = call.get("result")
-    if not isinstance(result, dict):
-        return False
-    details = result.get("details")
-    if not isinstance(details, dict):
-        return False
-    diagnostics = details.get("diagnostics")
-    if not isinstance(diagnostics, list):
-        return False
-    for diagnostic in diagnostics:
-        if not isinstance(diagnostic, dict):
-            continue
-        if diagnostic.get("candidate_rejection") is True:
-            return True
-        if str(diagnostic.get("code") or "") != "grasp_seed_compile_failed":
-            continue
-        message = str(diagnostic.get("message") or "").lower()
-        if "candidate width" in message and (
-            "restricted bounds" in message or "strategy bounds" in message
-        ):
-            return True
-    return False
-
-
-def _grasp_seed_compile_recovery_metadata(call: JsonDict) -> JsonDict:
-    outputs = _tool_call_outputs(call)
-    recovery_class = str(outputs.get("recovery_class") or "")
-    rejection_code = str(outputs.get("rejection_code") or "")
-    result = call.get("result")
-    details = result.get("details") if isinstance(result, dict) else None
-    diagnostics = details.get("diagnostics") if isinstance(details, dict) else None
-    if isinstance(diagnostics, list):
-        for diagnostic in diagnostics:
-            if not isinstance(diagnostic, dict):
-                continue
-            recovery_class = recovery_class or str(diagnostic.get("recovery_class") or "")
-            rejection_code = rejection_code or str(diagnostic.get("rejection_code") or "")
-    if recovery_class not in {"perception_refinable", "uncertain_review"}:
-        return {}
-    return {
-        "recovery_class": recovery_class,
-        "rejection_code": rejection_code,
-    }
-
-
-def _grasp_estimation_recovery_class(rejection: JsonDict) -> str:
-    structured = str(rejection.get("recovery_class") or "")
-    if structured in {"perception_refinable", "uncertain_review"}:
-        return structured
-    source = str(rejection.get("source") or "")
-    if source in {
-        "physical_gripper_width_filter",
-        "wrist_reference_localization_rejected",
-    }:
-        return "perception_refinable"
-    if source in {
-        "uncertain_review",
-        "main_vlm_high_hover_uncertain",
-    }:
-        return "uncertain_review"
-    return "none"
-
-
-def _is_grasp_estimation_recovery_action(
-    tool_name: str,
-    parameters: JsonDict,
-    *,
-    recovery: JsonDict | None,
-) -> bool:
-    if (
-        not isinstance(recovery, dict)
-        or recovery.get("status") != "required"
-        or tool_name not in {"ik_preview_check", "obstacle_avoidance", "move_to"}
-    ):
-        return False
-    recovery_id = str(recovery.get("recovery_id") or "")
-    if not recovery_id:
-        return False
-    if tool_name == "obstacle_avoidance":
-        path = parameters.get("path")
-        return isinstance(path, dict) and str(path.get("recovery_id") or "") == recovery_id
-    target_pose = parameters.get("target_pose")
-    return (
-        isinstance(target_pose, dict)
-        and target_pose.get("grasp_stage") == "grasp_estimation_refinement_hover"
-        and str(target_pose.get("recovery_id") or "") == recovery_id
-    )
-
-
-def _camera_frame_for_source_image(policy: JsonDict, source_image: str) -> str:
-    if str(policy.get("source_rgb") or "") == source_image:
-        return str(policy.get("camera_frame_id") or "")
-    return ""
-
-
 def _motion_call_rejects_candidate(call: JsonDict) -> bool:
     result = call.get("result")
     if not isinstance(result, dict):
@@ -5954,7 +8284,7 @@ def _motion_call_rejects_candidate(call: JsonDict) -> bool:
     if not isinstance(details, dict):
         return False
     if _structured_motion_reached_target(details) is False:
-        if _safe_precontact_pose_is_near_target(details):
+        if _safe_clearance_pose_is_near_target(details):
             return False
         return True
     if _call_result_success(call):
@@ -5989,11 +8319,17 @@ def _motion_call_rejects_candidate(call: JsonDict) -> bool:
     return False
 
 
-def _safe_precontact_pose_is_near_target(details: JsonDict) -> bool:
+def _safe_clearance_pose_is_near_target(details: JsonDict) -> bool:
     parameters = details.get("parameters")
     target_pose = parameters.get("target_pose") if isinstance(parameters, dict) else None
-    stage = str(target_pose.get("grasp_stage") or "") if isinstance(target_pose, dict) else ""
-    if stage not in {"hover", "align"}:
+    waypoint_role = (
+        str(target_pose.get("waypoint_role") or "") if isinstance(target_pose, dict) else ""
+    )
+    if waypoint_role not in {
+        "grasp_clearance",
+        "grasp_refinement_clearance",
+        "grasp_alignment_reference",
+    }:
         return False
     outputs = details.get("outputs")
     response = outputs.get("response") if isinstance(outputs, dict) else None
@@ -6022,45 +8358,6 @@ def _safe_precontact_pose_is_near_target(details: JsonDict) -> bool:
     return position_error_m <= 0.04
 
 
-def _near_receptacle_release_pose(
-    call: JsonDict,
-    *,
-    target_pose: JsonDict,
-) -> JsonDict | None:
-    """Accept a collision-free descend that stalls slightly above a receptacle."""
-
-    outputs = _tool_call_outputs(call)
-    response = outputs.get("response") if isinstance(outputs, dict) else None
-    motion = response.get("motion_summary") if isinstance(response, dict) else None
-    if not isinstance(motion, dict):
-        motion = outputs.get("motion_summary") if isinstance(outputs, dict) else None
-    if not isinstance(motion, dict) or motion.get("reached_target") is not False:
-        return None
-    collision = motion.get("collision")
-    if isinstance(collision, dict) and collision.get("detected") is True:
-        return None
-    end = motion.get("end")
-    end_xyz = end.get("xyz") if isinstance(end, dict) else None
-    target_xyz = target_pose.get("xyz")
-    if not _finite_xyz(end_xyz) or not _finite_xyz(target_xyz):
-        return None
-    xy_error_m = math.hypot(
-        float(end_xyz[0]) - float(target_xyz[0]),
-        float(end_xyz[1]) - float(target_xyz[1]),
-    )
-    height_error_m = float(end_xyz[2]) - float(target_xyz[2])
-    if xy_error_m > 0.04 or not 0.0 <= height_error_m <= 0.06:
-        return None
-    release_pose = dict(target_pose)
-    release_pose["xyz"] = [float(value) for value in end_xyz[:3]]
-    release_pose["adaptive_release"] = {
-        "reason": "controller_stalled_safely_above_receptacle",
-        "xy_error_m": round(xy_error_m, 6),
-        "height_above_requested_m": round(height_error_m, 6),
-    }
-    return release_pose
-
-
 def _structured_motion_reached_target(details: JsonDict) -> bool | None:
     outputs = details.get("outputs")
     response = outputs.get("response") if isinstance(outputs, dict) else None
@@ -6077,132 +8374,28 @@ def _structured_motion_reached_target(details: JsonDict) -> bool | None:
     return None
 
 
-def _failure_text_rejects_candidate(call: JsonDict) -> bool:
-    text_parts = [str(call.get("reason") or "")]
-    result = call.get("result")
-    if isinstance(result, dict):
-        text_parts.append(str(result.get("content") or ""))
-        details = result.get("details")
-        if isinstance(details, dict):
-            text_parts.extend(
-                str(details.get(key) or "") for key in ("reason", "verdict", "diagnostic")
-            )
-            outputs = details.get("outputs")
-            if isinstance(outputs, dict):
-                text_parts.extend(
-                    str(outputs.get(key) or "") for key in ("reason", "verdict", "diagnostic")
-                )
-            diagnostics = details.get("diagnostics")
-            if isinstance(diagnostics, list):
-                text_parts.extend(str(item) for item in diagnostics if isinstance(item, dict))
-    text = " ".join(text_parts).lower()
-    non_pose_failures = (
-        "timeout",
-        "transport",
-        "connection",
-        "mcp_call_failed",
-        "not configured",
-        "missing_",
-        "invalid_",
-        "malformed",
-        "schema",
-        "operator_denied",
-        "user denied",
-        "session",
-        "backend unavailable",
-    )
-    if any(marker in text for marker in non_pose_failures):
-        return False
-    pose_rejections = (
-        "unsafe",
-        "infeasible",
-        "unreachable",
-        "outside_workspace",
-        "outside workspace",
-        "ik failed",
-        "ik target",
-        "joint limit",
-        "path blocked",
-        "target not reached",
-        "motion rejected",
-        "pose rejected",
-    )
-    return any(marker in text for marker in pose_rejections)
+def _structured_motion_summary(details: JsonDict) -> JsonDict:
+    outputs = details.get("outputs")
+    outputs = outputs if isinstance(outputs, dict) else {}
+    response = outputs.get("response")
+    response = response if isinstance(response, dict) else {}
+    state_delta = details.get("state_delta")
+    state_delta = state_delta if isinstance(state_delta, dict) else {}
+    for source in (
+        outputs.get("motion_summary"),
+        response.get("motion_summary"),
+        details.get("motion_summary"),
+        state_delta.get("motion"),
+    ):
+        if isinstance(source, dict):
+            return dict(source)
+    return {}
 
 
-def _call_failure_reason(call: JsonDict) -> str:
-    result = call.get("result")
-    if isinstance(result, dict):
-        details = result.get("details")
-        if isinstance(details, dict):
-            if _structured_motion_reached_target(details) is False:
-                return "Simulator motion summary reports that the target was not reached."
-            outputs = details.get("outputs")
-            for source in (outputs, details):
-                if not isinstance(source, dict):
-                    continue
-                for key in ("reason", "verdict", "diagnostic"):
-                    value = source.get(key)
-                    if isinstance(value, str) and value:
-                        return value
-        content = result.get("content")
-        if isinstance(content, str) and content:
-            return content
-    reason = call.get("reason")
-    return str(reason or "candidate-linked tool rejected the grasp pose")
 
 
-def _matching_latest_world_pose_candidate(
-    parameters: JsonDict,
-    artifacts: dict[str, JsonDict],
-) -> str:
-    target_xyz = _parameters_target_xyz(parameters)
-    if target_xyz is None:
-        target_parameters = parameters.get("target_parameters")
-        if isinstance(target_parameters, dict):
-            target_xyz = _parameters_target_xyz(target_parameters)
-    if target_xyz is None:
-        return ""
-    latest: tuple[float, JsonDict] | None = None
-    for entry in artifacts.values():
-        if not isinstance(entry, dict):
-            continue
-        value = entry.get("value")
-        if not isinstance(value, dict) or value.get("type") != "world_pose":
-            continue
-        source_grasp_id = value.get("source_grasp_id")
-        world_xyz = value.get("translation_xyz")
-        if not isinstance(source_grasp_id, str) or not _xyz_equal(target_xyz, world_xyz):
-            continue
-        try:
-            timestamp = float(entry.get("timestamp_s") or 0.0)
-        except (TypeError, ValueError):
-            timestamp = 0.0
-        if latest is None or timestamp >= latest[0]:
-            latest = (timestamp, value)
-    return str(latest[1].get("source_grasp_id") or "") if latest else ""
 
 
-def _parameters_target_xyz(parameters: JsonDict) -> list[float] | None:
-    pose = parameters.get("target_pose") or parameters.get("pose") or parameters.get("eef_pose")
-    if not isinstance(pose, dict):
-        return None
-    xyz = pose.get("xyz") or pose.get("translation_xyz") or pose.get("position")
-    if not isinstance(xyz, list | tuple) or len(xyz) < 3:
-        return None
-    try:
-        return [float(xyz[0]), float(xyz[1]), float(xyz[2])]
-    except (TypeError, ValueError):
-        return None
-
-
-def _xyz_equal(left: list[float], right: Any, *, tolerance: float = 1e-8) -> bool:
-    if not isinstance(right, list | tuple) or len(right) < 3:
-        return False
-    try:
-        return all(abs(left[idx] - float(right[idx])) <= tolerance for idx in range(3))
-    except (TypeError, ValueError):
-        return False
 
 
 def _select_memory(items: dict[str, JsonDict], key: str | None) -> dict[str, JsonDict]:
@@ -6224,35 +8417,177 @@ def _memory_fact_value(entry: JsonDict | None) -> JsonDict | None:
     return dict(value) if isinstance(value, dict) else None
 
 
-def _grasp_fallback_attempts(policy: JsonDict | None) -> list[JsonDict]:
-    if not isinstance(policy, dict):
-        return []
-    value = policy.get("fallback_attempts")
-    if not isinstance(value, list):
-        return []
-    return [dict(attempt) for attempt in value if isinstance(attempt, dict)]
+def _fact_epoch(entry: JsonDict | None) -> int:
+    value = _memory_fact_value(entry) or {}
+    try:
+        return max(0, int(value.get("epoch") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
-def _append_grasp_fallback_attempt(
-    attempts: list[JsonDict],
-    attempt: JsonDict,
-) -> None:
-    identity = (
-        str(attempt.get("backend") or ""),
-        str(attempt.get("source_rgb") or ""),
-        str(attempt.get("outcome") or ""),
-    )
-    if any(
-        (
-            str(existing.get("backend") or ""),
-            str(existing.get("source_rgb") or ""),
-            str(existing.get("outcome") or ""),
+def _fact_epoch_value(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _same_memory_artifact_path(left: object, right: object) -> bool:
+    if not isinstance(left, str) or not left or not isinstance(right, str) or not right:
+        return False
+    try:
+        return Path(left).expanduser().resolve(strict=False) == Path(right).expanduser().resolve(
+            strict=False
         )
-        == identity
-        for existing in attempts
+    except (OSError, RuntimeError):
+        return left == right
+
+
+def _same_memory_artifact_content(left: object, right: object) -> bool:
+    """Return true only when two distinct session files are byte-identical."""
+
+    if not isinstance(left, str) or not left or not isinstance(right, str) or not right:
+        return False
+    try:
+        left_path = Path(left).expanduser().resolve(strict=True)
+        right_path = Path(right).expanduser().resolve(strict=True)
+        if not left_path.is_file() or not right_path.is_file():
+            return False
+        if left_path.stat().st_size != right_path.stat().st_size:
+            return False
+        left_digest = hashlib.sha256()
+        right_digest = hashlib.sha256()
+        with left_path.open("rb") as left_handle, right_path.open("rb") as right_handle:
+            while True:
+                left_chunk = left_handle.read(1024 * 1024)
+                right_chunk = right_handle.read(1024 * 1024)
+                if left_chunk != right_chunk:
+                    return False
+                if not left_chunk:
+                    break
+                left_digest.update(left_chunk)
+                right_digest.update(right_chunk)
+        return left_digest.digest() == right_digest.digest()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _same_grasp_candidate(left: JsonDict, right: JsonDict) -> bool:
+    # Candidate payloads make a JSON round-trip through the planner before the
+    # Agent explicitly compiles one. Requiring bit-identical floats makes a
+    # harmless representation change (observed at ~8e-14 in a rotation-matrix
+    # element) look like forged geometry and leaves the previous grasp branch
+    # active. Keep identity/frame fields exact and accept only machine-noise
+    # numeric drift; meaningful Agent-authored geometry edits still fail.
+    if any(
+        left.get(field) != right.get(field)
+        for field in ("id", "frame", "camera_frame")
     ):
-        return
-    attempts.append(dict(attempt))
+        return False
+    return all(
+        _same_numeric_candidate_field(left.get(field), right.get(field))
+        for field in (
+            "translation_xyz",
+            "rotation_matrix",
+            "gripper_tip_position_xyz",
+            "depth",
+            "width",
+            "height",
+        )
+    )
+
+
+def _same_numeric_candidate_field(left: object, right: object) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left is right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        left_value = float(left)
+        right_value = float(right)
+        return math.isfinite(left_value) and math.isfinite(right_value) and math.isclose(
+            left_value,
+            right_value,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(
+            _same_numeric_candidate_field(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return left == right
+
+
+def _placement_evidence_id(selected: JsonDict) -> str:
+    result_id = str(selected.get("result_id") or "unknown")
+    detection_id = str(selected.get("id") or "unknown")
+    return f"placement:{result_id}:{detection_id}"
+
+
+def _reusable_fixed_camera_placement(
+    bundles: JsonDict,
+    *,
+    placement_evidence_id: str,
+    expected_source: JsonDict,
+) -> JsonDict | None:
+    """Return prior placement evidence reusable on an unchanged fixed camera.
+
+    AnyPlace still receives RGB-D from the new grasp source.  Only the stable
+    receptacle mask is reused, and the decision is restricted to matching
+    intrinsics and a non-wrist camera identity.  Wrist/hand cameras can move and
+    therefore always require fresh aligned placement evidence.
+    """
+
+    expected_rgb = expected_source.get("rgb")
+    expected_frame = _camera_frame_hint(expected_source, expected_rgb)
+    expected_intrinsics = expected_source.get("intrinsics")
+    if (
+        not expected_frame
+        or _is_moving_camera_frame(expected_frame)
+        or not isinstance(expected_intrinsics, dict)
+    ):
+        return None
+    for bundle_id, candidate in reversed(list(bundles.items())):
+        if (
+            not isinstance(candidate, dict)
+            or candidate.get("placement_evidence_id") != placement_evidence_id
+        ):
+            continue
+        parameters = candidate.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        prior_rgb = parameters.get("rgb")
+        selected_grasp = parameters.get("selected_grasp")
+        prior_source = (
+            selected_grasp.get("source")
+            if isinstance(selected_grasp, dict)
+            else {}
+        )
+        prior_frame = _camera_frame_hint(
+            prior_source if isinstance(prior_source, dict) else {},
+            prior_rgb,
+        )
+        if prior_frame != expected_frame:
+            continue
+        if parameters.get("intrinsics") != expected_intrinsics:
+            continue
+        return {"bundle_id": bundle_id, "bundle": candidate}
+    return None
+
+
+def _camera_frame_hint(source: JsonDict, rgb_path: object) -> str:
+    for key in ("camera_frame_id", "frame_id", "camera_name"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    if not isinstance(rgb_path, str):
+        return ""
+    match = re.search(r"cameras\.\d+\.([A-Za-z0-9_-]+)\.(?:rgb|depth)\b", rgb_path)
+    return match.group(1).lower() if match else ""
+
+
+def _is_moving_camera_frame(frame_id: str) -> bool:
+    lowered = frame_id.lower()
+    return any(token in lowered for token in ("wrist", "hand", "gripper"))
 
 
 def _extract_action_artifacts(action: EnvAction) -> list[JsonDict]:
@@ -6285,6 +8620,7 @@ def _extract_action_artifacts(action: EnvAction) -> list[JsonDict]:
         artifacts.extend(_extract_depth_enhancement_artifacts(call, details))
         artifacts.extend(_extract_sensor_safety_check_artifacts(call, details))
         artifacts.extend(_extract_grasp_candidate_artifacts(call, details))
+        artifacts.extend(_extract_compiled_grasp_artifacts(call, details))
         artifacts.extend(_extract_placement_candidate_artifacts(call, details))
         artifacts.extend(_extract_world_pose_artifacts(call, details))
     return artifacts
@@ -6451,9 +8787,11 @@ def _extract_depth_prior_artifacts(call: JsonDict, details: JsonDict) -> list[Js
             "raw_output_ref": outputs.get("raw_output_ref"),
             "next_tool_hint": outputs.get("next_tool_hint")
             or (
-                "Call enhance_depth with the same rgb/depth/intrinsics and this "
-                "prior_depth path."
+                "Call enhance_depth with the same source_packet_id and camera_frame_id; "
+                "the host resolves this matching prior."
             ),
+            "source_packet_id": outputs.get("source_packet_id"),
+            "camera_frame_id": outputs.get("camera_frame_id"),
         }
     ]
 
@@ -6596,6 +8934,14 @@ def _extract_grasp_candidate_artifacts(call: JsonDict, details: JsonDict) -> lis
     grasp_source = source.get("source")
     if not isinstance(grasp_source, dict):
         grasp_source = {}
+    structured_artifact = details.get("structured_artifact")
+    if not isinstance(structured_artifact, dict):
+        structured_artifact = source.get("structured_artifact")
+    if not isinstance(structured_artifact, dict):
+        structured_artifact = {}
+    artifact_path = str(structured_artifact.get("path") or "")
+    preview_count = len(compact_candidates)
+    truncated = preview_count < len(candidates)
     return [
         {
             "type": "grasp_candidates",
@@ -6603,34 +8949,42 @@ def _extract_grasp_candidate_artifacts(call: JsonDict, details: JsonDict) -> lis
             "tool": tool_name,
             "index": "latest",
             "candidate_count": len(candidates),
+            "result_id": source.get("result_id"),
+            "preview_count": preview_count,
+            "truncated": truncated,
             "best_grasp_candidate": compact_candidates[0],
             "grasp_candidates": compact_candidates,
             "source_rgb": source.get("source_rgb") or grasp_source.get("rgb"),
             "source_depth": source.get("source_depth") or grasp_source.get("depth"),
             "target_mask": source.get("target_mask") or grasp_source.get("object_mask"),
             "selected_grasp_source": source.get("source"),
+            "grasp_selection_bundle": (
+                source.get("grasp_selection_bundle")
+                if isinstance(source.get("grasp_selection_bundle"), dict)
+                else None
+            ),
+            "grasp_selection_advice": (
+                source.get("grasp_selection_advice")
+                if isinstance(source.get("grasp_selection_advice"), dict)
+                else None
+            ),
             "source_tool": grasp_source.get("source_tool") or tool_name,
             "source_backend": grasp_source.get("source_backend")
             or source.get("selected_backend")
             or tool_name,
+            "scene_epoch": source.get("scene_epoch"),
             "gripper_name": grasp_source.get("gripper_name"),
-            "raw_output_ref": source.get("raw_output_ref"),
-            "next_tool_hint": (
-                "Call compile_grasp_seed with the active normalized candidate, "
-                "matching camera extrinsics/frame id, and current scene_epoch; "
-                "then follow host-generated grasp_execution stages."
+            "raw_output_ref": source.get("raw_output_ref") or artifact_path or None,
+            "complete_outputs_artifact": structured_artifact or None,
+            "query_hint": (
+                "Use python_exec artifacts.read_json(path) and inspect "
+                "payload['outputs']['grasp_candidates']; filter/rank the complete list "
+                "in code before asking a human."
+                if artifact_path and truncated
+                else None
             ),
         }
     ]
-
-
-def _grasp_backend_label(value: str) -> str:
-    return {
-        "anygrasp": "AnyGrasp",
-        "contact_graspnet": "Contact-GraspNet",
-        "graspgenx": "GraspGenX",
-        "grasp_pose_estimate": "grasp estimator",
-    }.get(value, value or "grasp estimator")
 
 
 def _extract_placement_candidate_artifacts(
@@ -6653,6 +9007,14 @@ def _extract_placement_candidate_artifacts(
     ]
     if not compact_candidates:
         return []
+    structured_artifact = details.get("structured_artifact")
+    if not isinstance(structured_artifact, dict):
+        structured_artifact = source.get("structured_artifact")
+    if not isinstance(structured_artifact, dict):
+        structured_artifact = {}
+    artifact_path = str(structured_artifact.get("path") or "")
+    preview_count = len(compact_candidates)
+    truncated = preview_count < len(candidates)
     return [
         {
             "type": "placement_candidates",
@@ -6660,15 +9022,45 @@ def _extract_placement_candidate_artifacts(
             "tool": "anyplace",
             "index": "latest",
             "candidate_count": len(candidates),
+            "preview_count": preview_count,
+            "truncated": truncated,
             "selected_grasp_id": source.get("selected_grasp_id"),
             "placement_candidates": compact_candidates,
             "source": source.get("source"),
-            "raw_output_ref": source.get("raw_output_ref"),
-            "next_tool_hint": (
-                "After pickup is visually verified, choose one complete "
-                "placement_candidates[i].place_grasp_pose and transform it with "
-                "camera_pose_to_world using the matching pre-grasp camera extrinsics."
+            "raw_output_ref": source.get("raw_output_ref") or artifact_path or None,
+            "complete_outputs_artifact": structured_artifact or None,
+            "query_hint": (
+                "Use python_exec artifacts.read_json(path) and inspect "
+                "payload['outputs']['placement_candidates']; filter/rank the complete list "
+                "in code before asking a human."
+                if artifact_path and truncated
+                else None
             ),
+        }
+    ]
+
+
+def _extract_compiled_grasp_artifacts(
+    call: JsonDict,
+    details: JsonDict,
+) -> list[JsonDict]:
+    """Retain compiled pose evidence without creating a task-stage obligation."""
+
+    if str(call.get("name") or "") != "compile_grasp_seed":
+        return []
+    outputs = details.get("outputs")
+    if (
+        not isinstance(outputs, dict)
+        or outputs.get("schema_version") != "openeta.compiled_grasp_seed.v1"
+    ):
+        return []
+    return [
+        {
+            **dict(outputs),
+            "type": "compiled_grasp",
+            "kind": "compiled_grasp",
+            "tool": "compile_grasp_seed",
+            "index": str(outputs.get("compiled_grasp_id") or "latest"),
         }
     ]
 
@@ -6685,20 +9077,6 @@ def _extract_world_pose_artifacts(call: JsonDict, details: JsonDict) -> list[Jso
     translation = world_pose.get("translation_xyz") or outputs.get("translation_xyz")
     if not isinstance(translation, list) or len(translation) != 3:
         return []
-    is_placement_reference = str(world_pose.get("id") or "").startswith("place_grasp_") and str(
-        world_pose.get("source_grasp_id") or ""
-    ).startswith("grasp_")
-    next_tool_hint = (
-        "Treat world_pose as the low AnyPlace release reference, not a one-step "
-        "carry target. Preserve the current EEF orientation, first move to a "
-        "pre-place hover at the same world X/Y and at least 0.10 m above its Z, "
-        "verify attachment from a fresh image, then descend vertically before release."
-        if is_placement_reference
-        else (
-            "Pass the complete world_pose to move_to.target_pose without changing "
-            "its world-frame translation or orientation."
-        )
-    )
     return [
         {
             "type": "world_pose",
@@ -6713,7 +9091,6 @@ def _extract_world_pose_artifacts(call: JsonDict, details: JsonDict) -> list[Jso
             "gripper_tip_position_xyz": world_pose.get("gripper_tip_position_xyz")
             or outputs.get("gripper_tip_position_xyz"),
             "source_grasp_id": world_pose.get("id"),
-            "next_tool_hint": next_tool_hint,
         }
     ]
 
@@ -6783,6 +9160,7 @@ def summarize_memory_artifact(artifact: JsonDict) -> JsonDict:
             "anygrasp_intrinsics",
             "extrinsics",
             "candidate_count",
+            "result_id",
             "best_grasp_candidate",
             "grasp_candidates",
             "selected_grasp_id",
@@ -6817,6 +9195,14 @@ def summarize_memory_artifact(artifact: JsonDict) -> JsonDict:
             "rotation_matrix",
             "gripper_tip_position_xyz",
             "source_grasp_id",
+            "schema_version",
+            "compiled_grasp_id",
+            "candidate_id",
+            "scene_epoch",
+            "hover_pose",
+            "contact_pose",
+            "retreat_pose",
+            "approach_world_xyz",
             "next_tool_hint",
         ):
             if field in value:
@@ -6832,6 +9218,10 @@ def summarize_memory_artifact(artifact: JsonDict) -> JsonDict:
                     "anygrasp_intrinsics",
                     "alignment",
                     "quality",
+                    "hover_pose",
+                    "contact_pose",
+                    "retreat_pose",
+                    "approach_world_xyz",
                 }
                 max_depth = 4 if field in structured_fields else 2
                 max_items = 16 if field in structured_fields else 8
@@ -7032,6 +9422,11 @@ def _compact_tool_call(call: JsonDict) -> JsonDict:
 def _compact_tool_result_details(details: JsonDict) -> JsonDict:
     compact: JsonDict = {}
     for key in (
+        "effect",
+        "operational_success",
+        "semantic_outcome",
+        "facts_produced",
+        "recovery_options",
         "candidate_count",
         "best_grasp_candidate",
         "grasp_candidates",
@@ -7040,6 +9435,8 @@ def _compact_tool_result_details(details: JsonDict) -> JsonDict:
         "selection_required",
         "selected_detection",
         "selection_bundle",
+        "grasp_selection_bundle",
+        "grasp_selection_advice",
         "source_rgb",
         "source_depth",
         "target_mask",
@@ -7061,6 +9458,8 @@ def _compact_tool_result_details(details: JsonDict) -> JsonDict:
                 "rotation_matrix",
                 "selected_detection",
                 "selection_bundle",
+                "grasp_selection_bundle",
+                "grasp_selection_advice",
                 "observation_summary",
                 "motion_summary",
             }
@@ -7086,6 +9485,8 @@ def _compact_tool_result_details(details: JsonDict) -> JsonDict:
             "selection_required",
             "selected_detection",
             "selection_bundle",
+            "grasp_selection_bundle",
+            "grasp_selection_advice",
             "source_rgb",
             "source_depth",
             "target_mask",
@@ -7123,12 +9524,15 @@ def _compact_tool_result_details(details: JsonDict) -> JsonDict:
                     useful_outputs[key] = _compact_web_text(outputs[key])
                     continue
                 structured = {
+                    "result",
                     "best_grasp_candidate",
                     "grasp_candidates",
                     "world_pose",
                     "rotation_matrix",
                     "selected_detection",
                     "selection_bundle",
+                    "grasp_selection_bundle",
+                    "grasp_selection_advice",
                     "observation_summary",
                     "motion_summary",
                     "results",
@@ -7140,6 +9544,19 @@ def _compact_tool_result_details(details: JsonDict) -> JsonDict:
                     max_depth=max_depth,
                     max_items=max_items,
                 )
+        # Unknown output fields are often the most important part of a newly
+        # introduced tool contract. Keep every remaining field under the same
+        # structural bound instead of silently reducing it to an output-key
+        # list; otherwise a tool can execute successfully while its consumer
+        # never receives the value needed for the next call.
+        for key, value in outputs.items():
+            if key in useful_outputs:
+                continue
+            useful_outputs[str(key)] = _compact_value(
+                value,
+                max_depth=5,
+                max_items=16,
+            )
         if useful_outputs:
             compact["outputs"] = useful_outputs
     state_delta = details.get("state_delta")
@@ -7284,6 +9701,69 @@ def _looks_like_inline_blob_key(key: str) -> bool:
         "array",
         "raw_payload",
     }
+
+
+def _observation_visual_signature(observation: EnvObservation) -> str:
+    """Hash current RGB evidence independently of packet ids and file paths.
+
+    Runtime image artifacts are preferred because hashing encoded files avoids
+    expanding large pixel lists.  Unit/embedded adapters that do not materialize
+    files fall back to the typed camera RGB payload.  Frame identity is included
+    so swapping two camera feeds cannot look like an unchanged observation.
+    """
+
+    artifact_digests: list[JsonDict] = []
+    artifacts = observation.metadata.get("image_artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or artifact.get("kind") != "rgb":
+                continue
+            path_value = artifact.get("path")
+            if not isinstance(path_value, str) or not path_value:
+                continue
+            try:
+                path = Path(path_value)
+                if not path.is_file():
+                    continue
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                continue
+            artifact_digests.append(
+                {
+                    "frame_id": str(artifact.get("frame_id") or ""),
+                    "role": str(artifact.get("role") or ""),
+                    "sha256": digest,
+                }
+            )
+    if not artifact_digests:
+        for camera in observation.cameras:
+            try:
+                encoded = json.dumps(
+                    camera.rgb,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError):
+                continue
+            artifact_digests.append(
+                {
+                    "frame_id": camera.frame_id,
+                    "role": camera.role,
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                }
+            )
+    if not artifact_digests:
+        return ""
+    artifact_digests.sort(
+        key=lambda item: (str(item.get("frame_id") or ""), str(item.get("role") or ""))
+    )
+    return hashlib.sha256(
+        json.dumps(
+            artifact_digests,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:24]
 
 
 def summarize_observation(observation: EnvObservation) -> JsonDict:

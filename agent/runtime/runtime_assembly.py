@@ -7,13 +7,17 @@ from pathlib import Path
 from typing import Callable
 
 from adapter.protocol import JsonDict
-from agent.backends.planner import PlannerBackend
+from agent.backends.planner import (
+    REASONING_SUBAGENT_MAX_OUTPUT_TOKENS,
+    PlannerBackend,
+)
 from agent.backends.provider_config import PlannerProviderConfig
 from agent.runtime.calibration import (
     BackendCalibrationReviewer,
     CalibrationLifecycleConfig,
     CalibrationLifecycleManager,
 )
+from agent.runtime.calibration_registry import load_grasp_calibration_capabilities
 from agent.runtime.checkers import CheckerSubagentConfig
 from agent.runtime.grasp_strategy_lifecycle import (
     BackendGraspStrategyReviewer,
@@ -42,24 +46,34 @@ from agent.runtime.skill_authoring import (
     BackendSkillChangeReviewer,
     SkillAuthoringRequest,
 )
-from agent.runtime.skills import SkillSpec
+from agent.runtime.skills import SkillSpec, assert_skill_contracts
 from agent.runtime.supervision import (
     BackendActionReviewer,
     SupervisionGate,
     SupervisionPolicy,
     SupervisionProfile,
 )
+from agent.runtime.visual_history import VisualHistoryConfig, VisualHistoryManager
 from agent.tools.asset_references import (
     build_asset_reference_handler,
     build_object_memory_configuration_warning_handler,
     build_object_memory_reference_handler,
     load_configured_asset_reference_catalog,
 )
+from agent.tools.anygrasp_capabilities import (
+    AnyGraspCapabilityQuery,
+    check_anygrasp_compatibility,
+    query_anygrasp_capabilities,
+)
 from agent.tools.attachment_probe import (
     build_assess_attachment_probe_handler,
     build_prepare_attachment_probe_handler,
 )
 from agent.tools.coding import PythonExecConfig, PythonExecRuntime
+from agent.tools.contracts import (
+    ToolContractRuntimePolicy,
+    build_default_tool_contract_catalog,
+)
 from agent.tools.depth_prefetch import DepthPriorPrefetchCoordinator
 from agent.tools.handlers import (
     bind_dummy_tool_handlers,
@@ -78,7 +92,16 @@ from agent.tools.handlers import (
     build_sse_molmopoint_mcp_pointer,
     build_sse_sam3_mcp_segmenter,
 )
-from agent.tools.grasp_geometry import build_compile_grasp_seed_handler
+from agent.tools.grasp_geometry import (
+    build_compile_grasp_seed_handler,
+    build_wrist_alignment_handler,
+    build_wrist_viewpoint_proposal_handler,
+)
+from agent.tools.grasp_pose_advisor import (
+    GRASP_POSE_ADVISOR_MAX_OUTPUT_TOKENS,
+    GRASP_POSE_ADVISOR_MAX_VISION_IMAGES,
+    BackendGraspPoseAdvisor,
+)
 from agent.tools.mcp_registry import load_mcp_server_url
 from agent.tools.object_memory import (
     ObjectMemoryBankClient,
@@ -108,19 +131,29 @@ ApprovalCallback = Callable[[ToolExecutionContext], bool]
 PublicationApproval = Callable[[JsonDict], bool]
 SkillApproval = Callable[[str], bool]
 
+MAIN_PLANNER_AUX_IMAGE_RESERVE = 4
+# Strong reasoning models may account hidden reasoning tokens against the
+# OpenAI-compatible completion limit. Live DeepSeek V4 evidence showed a
+# planner turns consuming entire 4096- and 8192-token budgets as hidden
+# reasoning and returning no JSON content (finish_reason=length). Keep enough
+# headroom for the small structured action after reasoning; normal responses
+# still finish early and are charged only for tokens actually generated.
+MAIN_PLANNER_MAX_OUTPUT_TOKENS = 16384
+# VDM is also an isolated reasoning-capable VLM call.  Its response is compact,
+# but hidden reasoning shares the OpenAI-compatible completion budget.
+VDM_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_PERCEPTION_TOOL_TIMEOUT_S = 120.0
+# MolmoPoint deployments may need roughly three minutes to cold-load their
+# resident model after a service restart.  Keep that recovery budget separate
+# from the normal perception timeout so TUI and batch assembly do not
+# accidentally override the MCP pointer's established 600 second default.
+DEFAULT_MOLMOPOINT_TOOL_TIMEOUT_S = 600.0
+
 
 REMOTE_PLACEHOLDER_TOOLS = (
-    "scene_detector",
     "sam3",
-    "anygrasp",
     "grasp_pose_estimate",
-    "contact_graspnet",
-    "graspgenx",
-    "list_graspgenx_grippers",
-    "hand_pose_database",
     "ik_preview_check",
-    "obstacle_avoidance",
-    "lower_body_control_policy",
     "estimate_depth_prior",
 )
 
@@ -141,7 +174,6 @@ class RuntimeMcpEndpoints:
     anygrasp_url: str = ""
     anyplace_url: str = ""
     graspgenx_url: str = ""
-    contact_graspnet_url: str = ""
     molmopoint_url: str = ""
 
 
@@ -168,6 +200,15 @@ class RuntimeAssemblyConfig:
     pre_safety_checks: dict[str, str] = field(default_factory=dict)
     tool_listeners: tuple[ToolEventListener, ...] = ()
     max_validation_retries: int = 2
+    tool_contract_policy: ToolContractRuntimePolicy = field(
+        default_factory=ToolContractRuntimePolicy
+    )
+    visual_history: VisualHistoryConfig = field(default_factory=VisualHistoryConfig.from_env)
+    perception_capability_timeout_s: float = 10.0
+    perception_tool_timeout_s: float = DEFAULT_PERCEPTION_TOOL_TIMEOUT_S
+    molmopoint_tool_timeout_s: float = DEFAULT_MOLMOPOINT_TOOL_TIMEOUT_S
+    anygrasp_capability_query: AnyGraspCapabilityQuery | None = None
+    grasp_pose_advisor_enabled: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +218,7 @@ class RuntimeAssembly:
     runtime: OpenEtaAgentRuntime
     supervision_gate: SupervisionGate
     depth_prefetch: DepthPriorPrefetchCoordinator | None
+    perception_capabilities: JsonDict
 
 
 def resolve_runtime_mcp_endpoints(
@@ -201,11 +243,6 @@ def resolve_runtime_mcp_endpoints(
         or loader("openeta-anyplace", aliases=("anyplace",)),
         graspgenx_url=configured.graspgenx_url
         or loader("openeta-graspgenx", aliases=("graspgenx",)),
-        contact_graspnet_url=configured.contact_graspnet_url
-        or loader(
-            "openeta-contact-graspnet",
-            aliases=("contact-graspnet", "contact_graspnet"),
-        ),
         molmopoint_url=configured.molmopoint_url
         or loader(
             "openeta-molmopoint",
@@ -237,6 +274,16 @@ def assemble_runtime(config: RuntimeAssemblyConfig) -> RuntimeAssembly:
         replace=True,
     )
     tools.bind_handler(
+        "compute_wrist_alignment",
+        build_wrist_alignment_handler(workspace.grasp_profile_path),
+        replace=True,
+    )
+    tools.bind_handler(
+        "propose_wrist_viewpoints",
+        build_wrist_viewpoint_proposal_handler(),
+        replace=True,
+    )
+    tools.bind_handler(
         "prepare_attachment_probe",
         build_prepare_attachment_probe_handler(),
         replace=True,
@@ -244,7 +291,10 @@ def assemble_runtime(config: RuntimeAssemblyConfig) -> RuntimeAssembly:
     tools.bind_handler(
         "assess_attachment_probe",
         build_assess_attachment_probe_handler(
-            config.backend_factory(max_tokens=256, max_vision_images=4)
+            config.backend_factory(
+                max_tokens=REASONING_SUBAGENT_MAX_OUTPUT_TOKENS,
+                max_vision_images=4,
+            )
         ),
         replace=True,
     )
@@ -262,13 +312,13 @@ def assemble_runtime(config: RuntimeAssemblyConfig) -> RuntimeAssembly:
         "python_exec",
         PythonExecRuntime(
             PythonExecConfig(
-                mcp_transport=config.simulator_transport,
                 image_output_root=str(artifact_root / "images"),
                 text_output_root=str(artifact_root / "text"),
                 response_output_root=str(artifact_root / "responses"),
+                structured_output_root=str(artifact_root),
                 allow_outside_sandbox=config.allow_outside_sandbox,
                 approve_outside_sandbox=config.approve_outside_sandbox,
-                mcp_response_callback=config.mcp_response_callback,
+                session_root=str(workspace.root),
                 workspace_root=str(workspace.sandbox_dir),
             )
         ).handler,
@@ -285,7 +335,9 @@ def assemble_runtime(config: RuntimeAssemblyConfig) -> RuntimeAssembly:
             publication_mode=lambda: policy_provider().skill_change_mode,
             human_approval=config.calibration_approval,
         ),
-        reviewer=BackendCalibrationReviewer(config.backend_factory()),
+        reviewer=BackendCalibrationReviewer(
+            config.backend_factory(max_tokens=REASONING_SUBAGENT_MAX_OUTPUT_TOKENS)
+        ),
     )
     tools.bind_handler(
         "propose_calibration_profile",
@@ -309,7 +361,9 @@ def assemble_runtime(config: RuntimeAssemblyConfig) -> RuntimeAssembly:
             publication_mode=lambda: policy_provider().skill_change_mode,
             human_approval=config.strategy_approval,
         ),
-        reviewer=BackendGraspStrategyReviewer(config.backend_factory()),
+        reviewer=BackendGraspStrategyReviewer(
+            config.backend_factory(max_tokens=REASONING_SUBAGENT_MAX_OUTPUT_TOKENS)
+        ),
     )
     tools.bind_handler(
         "propose_grasp_strategy",
@@ -327,20 +381,54 @@ def assemble_runtime(config: RuntimeAssemblyConfig) -> RuntimeAssembly:
         config=config.web_access_config,
         provider_config=config.provider,
     )
+    perception_capabilities, effective_endpoints = _preflight_perception_capabilities(
+        config
+    )
     depth_prefetch = bind_runtime_perception_tools(
         tools,
-        endpoints=config.endpoints,
+        endpoints=effective_endpoints,
         backend_factory=config.backend_factory,
         artifact_root=artifact_root,
+        grasp_pose_advisor_enabled=config.grasp_pose_advisor_enabled,
+        timeout_s=config.perception_tool_timeout_s,
+        molmopoint_timeout_s=config.molmopoint_tool_timeout_s,
+        grasp_strategy_root=workspace.grasp_strategy_root,
+        grasp_calibration_id=str(staged_profile.get("calibration_id") or ""),
     )
+    tool_contract_catalog = build_default_tool_contract_catalog(tools.list())
+    config.tool_contract_policy.ensure_valid(tool_contract_catalog)
 
     planner = ToolCallingPlanner(
-        config.backend_factory(),
+        config.backend_factory(
+            max_tokens=MAIN_PLANNER_MAX_OUTPUT_TOKENS,
+            max_vision_images=(
+                config.visual_history.planner_raw_image_capacity
+                + MAIN_PLANNER_AUX_IMAGE_RESERVE
+                if config.visual_history.enabled
+                else None
+            )
+        ),
         max_validation_retries=config.max_validation_retries,
         context_config=PlannerContextConfig(
             context_window_tokens=config.provider.context_window_tokens,
             token_estimator_model=config.provider.model,
+            reserved_output_tokens=MAIN_PLANNER_MAX_OUTPUT_TOKENS,
+            visual_history=config.visual_history,
         ),
+        tool_contract_catalog=tool_contract_catalog,
+        tool_contract_policy=config.tool_contract_policy,
+    )
+    visual_history = (
+        VisualHistoryManager(
+            config=config.visual_history,
+            backend=config.backend_factory(
+                max_tokens=VDM_MAX_OUTPUT_TOKENS,
+                max_vision_images=2,
+                enable_thinking=False,
+            ),
+        )
+        if config.visual_history.enabled
+        else None
     )
     skill_review_config = SelfImprovementConfig(
         proposal_root=workspace.working_dir / "skill_reviews" / "pending",
@@ -359,14 +447,27 @@ def assemble_runtime(config: RuntimeAssemblyConfig) -> RuntimeAssembly:
         tools,
         pre_safety_checks=config.pre_safety_checks,
     )
+    skill_registry = workspace.skill_registry()
+    assert_skill_contracts(skill_registry, tools)
     runtime = OpenEtaAgentRuntime(
         planner=planner,
         tools=tools,
-        memory=AgentMemory(store=JsonMemoryStore(root=workspace.memory_root)),
-        skills=workspace.skill_registry(),
-        pipeline=ActionPipeline(checker_subagents=checker_config),
+        memory=AgentMemory(
+            store=JsonMemoryStore(root=workspace.memory_root),
+            artifact_root=workspace.artifacts_dir,
+        ),
+        skills=skill_registry,
+        pipeline=ActionPipeline(
+            checker_subagents=checker_config,
+            tool_contract_catalog=tool_contract_catalog,
+            tool_contract_policy=config.tool_contract_policy,
+        ),
         self_improvement_reviewer=skill_reviewer,
         default_session_id=workspace.session_id,
+        visual_history=visual_history,
+        startup_facts={
+            "perception_backend_capabilities": perception_capabilities,
+        },
     )
     configure_runtime_self_improvement(
         runtime,
@@ -383,7 +484,9 @@ def assemble_runtime(config: RuntimeAssemblyConfig) -> RuntimeAssembly:
     gate = SupervisionGate(
         config.supervision_policy,
         human_approval=config.human_action_approval,
-        action_reviewer=BackendActionReviewer(config.backend_factory(max_tokens=512)),
+        action_reviewer=BackendActionReviewer(
+            config.backend_factory(max_tokens=REASONING_SUBAGENT_MAX_OUTPUT_TOKENS)
+        ),
     )
     tools.set_execution_gate(gate.authorize)
     for listener in config.tool_listeners:
@@ -392,7 +495,61 @@ def assemble_runtime(config: RuntimeAssemblyConfig) -> RuntimeAssembly:
         runtime=runtime,
         supervision_gate=gate,
         depth_prefetch=depth_prefetch,
+        perception_capabilities=perception_capabilities,
     )
+
+
+def _preflight_perception_capabilities(
+    config: RuntimeAssemblyConfig,
+) -> tuple[JsonDict, RuntimeMcpEndpoints]:
+    """Disable configured backends whose deployment geometry is unverifiable."""
+
+    report: JsonDict = {
+        "schema_version": "openeta.perception_capability_preflight.v1",
+        "backends": {},
+    }
+    effective = config.endpoints
+    if not config.endpoints.anygrasp_url:
+        report["backends"]["anygrasp"] = {
+            "backend": "anygrasp",
+            "configured": False,
+            "available": False,
+            "compatible": False,
+            "reason": "backend_not_configured",
+        }
+        return report, effective
+
+    try:
+        physical = load_grasp_calibration_capabilities(
+            config.workspace.grasp_profile_path
+        )["max_gripper_width_m"]
+        anygrasp = check_anygrasp_compatibility(
+            url=config.endpoints.anygrasp_url,
+            physical_max_gripper_width_m=float(physical),
+            timeout_s=config.perception_capability_timeout_s,
+            query=config.anygrasp_capability_query or query_anygrasp_capabilities,
+        )
+    except Exception as exc:  # noqa: BLE001 - assembly fails this backend closed.
+        anygrasp = {
+            "schema_version": "openeta.backend_compatibility.v1",
+            "backend": "anygrasp",
+            "configured": True,
+            "url": config.endpoints.anygrasp_url,
+            "available": False,
+            "compatible": False,
+            "reason": "host_capability_preflight_failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "message": (
+                "AnyGrasp is unavailable because host capability preflight failed. "
+                "Verify the calibration profile and redeploy AnyGrasp with matching "
+                "gripper geometry."
+            ),
+        }
+    report["backends"]["anygrasp"] = anygrasp
+    if anygrasp.get("compatible") is not True:
+        effective = replace(config.endpoints, anygrasp_url="")
+    return report, effective
 
 
 def configure_runtime_self_improvement(
@@ -416,7 +573,9 @@ def configure_runtime_self_improvement(
         author=BackendSkillAuthoringSubagent(
             backend_factory(max_tokens=SKILL_AUTHORING_MAX_OUTPUT_TOKENS)
         ),
-        reviewer=BackendSkillChangeReviewer(backend_factory()),
+        reviewer=BackendSkillChangeReviewer(
+            backend_factory(max_tokens=REASONING_SUBAGENT_MAX_OUTPUT_TOKENS)
+        ),
         executable_tools=_skill_authoring_tools(runtime.tools),
     )
 
@@ -427,7 +586,16 @@ def bind_runtime_perception_tools(
     endpoints: RuntimeMcpEndpoints,
     backend_factory: BackendFactory,
     artifact_root: Path,
+    grasp_pose_advisor_enabled: bool = True,
+    timeout_s: float = DEFAULT_PERCEPTION_TOOL_TIMEOUT_S,
+    molmopoint_timeout_s: float = DEFAULT_MOLMOPOINT_TOOL_TIMEOUT_S,
+    grasp_strategy_root: str | Path | None = None,
+    grasp_calibration_id: str = "",
 ) -> DepthPriorPrefetchCoordinator | None:
+    if timeout_s <= 0:
+        raise ValueError("perception tool timeout must be positive")
+    if molmopoint_timeout_s <= 0:
+        raise ValueError("MolmoPoint tool timeout must be positive")
     object_memory_configuration_error = ""
     try:
         object_memory_config = load_configured_object_memory_bank()
@@ -471,7 +639,10 @@ def bind_runtime_perception_tools(
     depth_prefetch: DepthPriorPrefetchCoordinator | None = None
     if endpoints.depth_prior_url:
         depth_handler = build_depth_prior_handler(
-            build_sse_depth_prior_mcp_estimator(url=endpoints.depth_prior_url),
+            build_sse_depth_prior_mcp_estimator(
+                url=endpoints.depth_prior_url,
+                timeout_seconds=timeout_s,
+            ),
             output_root=artifact_root / "depth_prior_results",
         )
         depth_prefetch = DepthPriorPrefetchCoordinator(
@@ -487,10 +658,14 @@ def bind_runtime_perception_tools(
         tools.bind_handler(
             "sam3",
             build_sam3_handler(
-                build_sse_sam3_mcp_segmenter(url=endpoints.sam3_url),
+                build_sse_sam3_mcp_segmenter(
+                    url=endpoints.sam3_url,
+                    timeout_seconds=timeout_s,
+                ),
                 segment_points=build_sse_sam3_mcp_segmenter(
                     url=endpoints.sam3_url,
                     tool_name="segment_points",
+                    timeout_seconds=timeout_s,
                 ),
                 depth_prior_prefetch=(
                     depth_prefetch.prefetch_for_sam3
@@ -506,7 +681,10 @@ def bind_runtime_perception_tools(
         tools.bind_handler(
             "molmopoint",
             build_molmopoint_handler(
-                build_sse_molmopoint_mcp_pointer(url=endpoints.molmopoint_url),
+                build_sse_molmopoint_mcp_pointer(
+                    url=endpoints.molmopoint_url,
+                    timeout_seconds=molmopoint_timeout_s,
+                ),
                 output_root=artifact_root / "molmopoint_results",
             ),
             replace=True,
@@ -515,7 +693,10 @@ def bind_runtime_perception_tools(
         tools.bind_handler(
             "anyplace",
             build_anyplace_handler(
-                build_sse_anyplace_mcp_placer(url=endpoints.anyplace_url),
+                build_sse_anyplace_mcp_placer(
+                    url=endpoints.anyplace_url,
+                    timeout_seconds=timeout_s,
+                ),
                 output_root=artifact_root / "anyplace_results",
             ),
             replace=True,
@@ -524,25 +705,45 @@ def bind_runtime_perception_tools(
     grasp_backends = {}
     if endpoints.anygrasp_url:
         grasp_backends["anygrasp"] = build_anygrasp_handler(
-            build_sse_anygrasp_mcp_grasper(url=endpoints.anygrasp_url),
+            build_sse_anygrasp_mcp_grasper(
+                url=endpoints.anygrasp_url,
+                timeout_seconds=timeout_s,
+            ),
             output_root=artifact_root / "anygrasp_results",
         )
     if endpoints.graspgenx_url:
         list_grippers = build_sse_graspgenx_mcp_gripper_lister(
-            url=endpoints.graspgenx_url
+            url=endpoints.graspgenx_url,
+            timeout_seconds=timeout_s,
         )
         grasp_backends["graspgenx"] = build_graspgenx_handler(
-            build_sse_graspgenx_mcp_predictor(url=endpoints.graspgenx_url),
+            build_sse_graspgenx_mcp_predictor(
+                url=endpoints.graspgenx_url,
+                timeout_seconds=timeout_s,
+            ),
             list_grippers,
             output_root=artifact_root / "graspgenx_results",
         )
-    # Contact-GraspNet is temporarily disabled for the simulator drawer track.
-    # Keep its endpoint/configuration and implementation available for a later
-    # re-enable, but do not expose it as an executable grasp backend here.
     if grasp_backends:
+        advisor = (
+            BackendGraspPoseAdvisor(
+                backend_factory(
+                    max_tokens=GRASP_POSE_ADVISOR_MAX_OUTPUT_TOKENS,
+                    max_vision_images=GRASP_POSE_ADVISOR_MAX_VISION_IMAGES,
+                )
+            )
+            if grasp_pose_advisor_enabled
+            else None
+        )
         tools.bind_handler(
             "grasp_pose_estimate",
-            build_grasp_pose_estimate_handler(grasp_backends),
+            build_grasp_pose_estimate_handler(
+                grasp_backends,
+                advisor=advisor,
+                selection_output_root=artifact_root / "grasp_selection",
+                grasp_strategy_root=grasp_strategy_root,
+                grasp_calibration_id=grasp_calibration_id,
+            ),
             replace=True,
         )
     return depth_prefetch
@@ -680,7 +881,9 @@ def _authorize_skill_change(
             "source": "runtime_policy",
             "reason": "Standard profile permits session-local registry changes.",
         }
-    reviewed = BackendSkillChangeReviewer(backend_factory()).review(
+    reviewed = BackendSkillChangeReviewer(
+        backend_factory(max_tokens=REASONING_SUBAGENT_MAX_OUTPUT_TOKENS)
+    ).review(
         request=request,
         skill=skill,
     )

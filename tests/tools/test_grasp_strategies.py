@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -7,13 +8,14 @@ import pytest
 from agent.runtime.calibration_registry import resolve_grasp_calibration_profile
 from agent.tools.grasp_strategies import (
     GraspStrategyError,
+    compatible_explicit_grasp_strategies,
     load_grasp_strategies,
     select_grasp_strategy,
     validate_grasp_strategy,
 )
 
 
-def test_default_strategy_matches_only_truthful_geometry_family() -> None:
+def test_candidate_strategies_require_explicit_selection() -> None:
     strategies = load_grasp_strategies()
 
     strategy, selection = select_grasp_strategy(
@@ -21,35 +23,51 @@ def test_default_strategy_matches_only_truthful_geometry_family() -> None:
         calibration_id="graspnet-eef-panda-p8",
         target_geometry_family="upright_can",
     )
-    assert strategy is not None
-    assert strategy["strategy_id"] == "top-down-vertical-panda-p8"
-    assert selection == "automatic_geometry_family"
+    assert strategy is None
+    assert selection == "generic_fallback"
 
-    bowl, bowl_selection = select_grasp_strategy(
+    explicit, explicit_selection = select_grasp_strategy(
         strategies,
         calibration_id="graspnet-eef-panda-p8",
-        target_geometry_family="bowl",
+        target_geometry_family="upright_can",
+        strategy_id="top-down-vertical-panda-p8",
     )
-    assert bowl is not None
-    assert bowl["strategy_id"] == "top-down-bowl-panda-p8"
-    assert bowl_selection == "automatic_geometry_family"
+    assert explicit is not None
+    assert explicit["strategy_id"] == "top-down-vertical-panda-p8"
+    assert explicit["candidate_filter"]["min_downward_alignment"] == 0.5
+    assert explicit_selection == "explicit"
 
-    generic, generic_selection = select_grasp_strategy(
-        strategies,
+    validated = dict(explicit)
+    validated["status"] = "validated"
+    automatic, automatic_selection = select_grasp_strategy(
+        [validated],
         calibration_id="graspnet-eef-panda-p8",
-        target_geometry_family="apple",
+        target_geometry_family="upright_can",
     )
-    assert generic is None
-    assert generic_selection == "generic_fallback"
+    assert automatic is not None
+    assert automatic["strategy_id"] == "top-down-vertical-panda-p8"
+    assert automatic_selection == "automatic_geometry_family"
 
-    handle, handle_selection = select_grasp_strategy(
-        strategies,
+
+def test_compatible_candidate_strategies_are_discovery_only() -> None:
+    options = compatible_explicit_grasp_strategies(
+        load_grasp_strategies(),
         calibration_id="graspnet-eef-panda-p8",
-        target_geometry_family="articulated_handle",
+        target_geometry_family="boxed_item",
     )
-    assert handle is not None
-    assert handle["strategy_id"] == "top-down-drawer-handle-panda-p8"
-    assert handle_selection == "automatic_geometry_family"
+
+    assert [item["strategy_id"] for item in options] == [
+        "top-down-vertical-panda-p8"
+    ]
+    assert options[0]["activation"] == "explicit_agent_choice_required"
+    assert "evidence_status" not in options[0]
+    assert "evidence_summary" not in options[0]
+    assert "milk" not in json.dumps(options[0]).lower()
+    assert compatible_explicit_grasp_strategies(
+        load_grasp_strategies(),
+        calibration_id="other-calibration",
+        target_geometry_family="boxed_item",
+    ) == []
 
 
 def test_explicit_incompatible_strategy_fails_closed() -> None:
